@@ -23,6 +23,6 @@ An app that helps confirm you’ve taken your medications for the day.
 ## Getting Started
 ```bash
 # clone
-git clone https://github.com/<you>/pillchecker.git
+git clone https://github.com/yadava17/pillchecker.git
 cd pillchecker
 ```
