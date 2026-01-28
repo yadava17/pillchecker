@@ -1,0 +1,7 @@
+﻿flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/icon/PillChecker_app_icon_temp.png
+
+  adaptive_icon_foreground: assets/icon/adaptive_foreground.png
+  adaptive_icon_background: assets/icon/adaptive_background.png
