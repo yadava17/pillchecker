@@ -13,6 +13,8 @@ class PillConfigScreen extends StatefulWidget {
 
 class _PillConfigScreenState extends State<PillConfigScreen> {
   int timesPerDay = 1;
+  int _newNotifId() => DateTime.now().microsecondsSinceEpoch.remainder(2000000000);
+
   TimeOfDay? singleDoseTime; // used only when timesPerDay == 1
 
   Future<void> _pickSingleTime() async {

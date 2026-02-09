@@ -26,7 +26,7 @@ class _PillCheckButtonState extends State<PillCheckButton>
   // Hold-to-fill controller (~2s)
   late final AnimationController _holdCtrl = AnimationController(
     vsync: this,
-    duration: const Duration(seconds: 1),
+    duration: const Duration(milliseconds: 900),
   );
 
   // Pop when completed

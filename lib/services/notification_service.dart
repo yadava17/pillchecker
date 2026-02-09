@@ -13,7 +13,7 @@ class NotificationService {
 
   static bool _initialized = false;
 
-  static const String _channelId = 'pill_reminders';
+  static const String _channelId = 'pill_reminders_v2';
   static const String _channelName = 'Pill Reminders';
   static const String _channelDesc = 'Daily pill reminder notifications';
 
@@ -94,18 +94,24 @@ const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
     }
   }
 
-  static NotificationDetails _details() {
-    return const NotificationDetails(
-      android: AndroidNotificationDetails(
-        _channelId,
-        _channelName,
-        channelDescription: _channelDesc,
-        importance: Importance.max,
-        priority: Priority.high,
-      ),
-      iOS: DarwinNotificationDetails(),
-    );
-  }
+static NotificationDetails _details() {
+  return const NotificationDetails(
+    android: AndroidNotificationDetails(
+      _channelId,
+      _channelName,
+      channelDescription: _channelDesc,
+      importance: Importance.max,
+      priority: Priority.high,
+      playSound: true,
+      sound: RawResourceAndroidNotificationSound('pillchecker_notification'),
+    ),
+    iOS: DarwinNotificationDetails(
+      presentSound: true,
+      sound: 'pillchecker_notification',
+    ),
+  );
+}
+
 
   // ---- DEBUG: schedule a one-shot test for N seconds/minutes from now ----
   static Future<void> scheduleTestIn(Duration fromNow) async {
@@ -149,6 +155,37 @@ const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
       matchDateTimeComponents: DateTimeComponents.time, // daily repeat
     );
   }
+
+static Future<void> scheduleDailyDoseReminder({
+  required int id,
+  required String pillName,
+  required int doseNumber1Based,
+  required TimeOfDay time,
+  int? totalDoses, // ✅ add this
+}) async {
+  await init();
+  await _requireExactAlarmsOnAndroid();
+
+  final scheduled = _nextInstanceOfTime(time);
+
+  final isSingleDose = (totalDoses != null && totalDoses <= 1);
+
+  final body = isSingleDose
+      ? "It's time to take $pillName!"
+      : "It's time to take dose $doseNumber1Based of $pillName!";
+
+  await _plugin.zonedSchedule(
+    id: id,
+    title: 'PillChecker',
+    body: body,
+    scheduledDate: scheduled,
+    notificationDetails: _details(),
+    androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+    matchDateTimeComponents: DateTimeComponents.time,
+  );
+}
+
+
 
   static Future<void> cancel(int id) async {
     await init();

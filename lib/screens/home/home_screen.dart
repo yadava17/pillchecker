@@ -1,10 +1,15 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:pillchecker/widgets/pill_wheel.dart';
+
 import 'package:pillchecker/widgets/pill_check_button.dart';
+import 'package:pillchecker/widgets/pill_wheel.dart';
 import 'package:pillchecker/services/notification_service.dart';
-import 'dart:convert';
-import 'dart:async';
+import 'package:pillchecker/widgets/daily_completion_circle.dart';
+import 'package:pillchecker/screens/settings/settings_screen.dart';
+import 'package:pillchecker/widgets/pill_info_panel.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -16,47 +21,606 @@ class HomeScreen extends StatefulWidget {
 enum _ConfigStep { name, config, doses }
 
 class _HomeScreenState extends State<HomeScreen> {
+  // -------- prefs keys --------
   static const _pillNamesKey = 'pill_names';
+  static const _pillTimesKey =
+      'pill_times'; // legacy: first dose "HH:mm" per pill
+  static const _pillCheckKey =
+      'pill_check_state'; // json map: pillIndex -> "cycleIso|mask"
   static const _seenPromptKey = 'seen_first_pill_prompt';
-  static const _pillCheckKey = 'pill_check_state'; // json map
-  static const _pillTimesKey = 'pill_times'; // "HH:MM" per pill index
-  Timer? _labelTimer;
-  String? _labelOverride;
 
-  bool _showPillLabel = true; // label visible when strip is in normal position
-  bool get _centerIsRealPill => _centerPillIndex != null;
+  static const _pillDoseTimesKey =
+      'pill_dose_times_v2'; // JSON: List<List<String>>
+  static const _pillDoseNotifIdsKey =
+      'pill_dose_notif_ids_v2'; // JSON: List<List<int>>
+
+  // -------- in-memory state --------
+  List<String> pillNames = [];
+  List<String> pillTimes = []; // legacy: first dose only
+  List<List<String>> pillDoseTimes =
+      []; // ["08:00","14:00"...] aligned with pillNames
+  List<List<int>> pillDoseNotifIds = []; // aligned with pillNames
+  Map<String, dynamic> _checkMapCache = {};
+  Future<Map<String, dynamic>> _checkMapFuture = Future.value(
+    <String, dynamic>{},
+  );
+
+  Map<String, dynamic> _lastCheckMapCache = {};
+
+  void _refreshCheckMapFuture() {
+    if (!mounted) return;
+    setState(() {
+      _checkMapFuture = _loadCheckMap();
+    });
+  }
 
   int _wheelSelectedIndex = 1;
-
-  List<String> pillNames = [];
-  List<String> pillTimes = []; // "HH:MM" per pill, same index as pillNames
 
   bool _pendingSlot = false;
 
   bool _configOpen = false;
   _ConfigStep _step = _ConfigStep.name;
 
+  bool _infoOpen = false;
+
+  // edit mode
+  int? _editingIndex;
+  bool get _isEditing => _editingIndex != null;
+
   final TextEditingController _nameController = TextEditingController();
   int _timesPerDay = 1;
   TimeOfDay? _singleDoseTime;
   List<TimeOfDay?> _doseTimes = [];
 
-  TimeOfDay _timeForPill(int pillIndex) {
-    if (pillIndex < 0 || pillIndex >= pillTimes.length) {
-      return const TimeOfDay(hour: 8, minute: 0);
-    }
-    return _strToTime(pillTimes[pillIndex]); // uses your existing helper
+  Timer? _labelTimer;
+  Timer? _doseBoundaryTimer;
+  Timer? _dayBoundaryTimer;
+  Timer? _globalBoundaryTimer;
+
+  String? _labelOverride;
+  bool _showPillLabel = true;
+
+  late final FixedExtentScrollController _wheelController =
+      FixedExtentScrollController(initialItem: 1);
+
+  bool get _centerIsRealPill => _centerPillIndex != null;
+
+  // stable-ish notification id generator
+  int _newNotifId() =>
+      DateTime.now().microsecondsSinceEpoch.remainder(2000000000);
+
+  // ---------------- lifecycle ----------------
+  @override
+  void initState() {
+    super.initState();
+    _loadAndMaybeAutoOpen();
+    _scheduleGlobalDayBoundaryRefresh();
+    _scheduleGlobalBoundaryRefresh();
+    _checkMapFuture = _loadCheckMap();
+    _scheduleCenteredDoseBoundaryRefresh();
+    _nameController.addListener(() => setState(() {}));
   }
 
+  @override
+  void dispose() {
+    _labelTimer?.cancel();
+    _doseBoundaryTimer?.cancel();
+    _dayBoundaryTimer?.cancel();
+    _nameController.dispose();
+    _wheelController.dispose();
+    _globalBoundaryTimer?.cancel();
+    super.dispose();
+  }
+
+  // ---------------- helpers: time ----------------
+  String _timeToStr(TimeOfDay t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  TimeOfDay _strToTime(String s) {
+    final parts = s.split(':');
+    return TimeOfDay(hour: int.parse(parts[0]), minute: int.parse(parts[1]));
+  }
+
+  String _fmt(TimeOfDay t) {
+    final hour12 = t.hourOfPeriod == 0 ? 12 : t.hourOfPeriod;
+    final mm = t.minute.toString().padLeft(2, '0');
+    final suffix = t.period == DayPeriod.am ? 'AM' : 'PM';
+    return '$hour12:$mm $suffix';
+  }
+
+  DateTime _atTime(DateTime day, TimeOfDay t) =>
+      DateTime(day.year, day.month, day.day, t.hour, t.minute);
+
+  DateTime _minusMinutes(DateTime dt, int m) =>
+      dt.subtract(Duration(minutes: m));
+
+  // ---------------- helpers: dose lists ----------------
+  List<TimeOfDay> _doseTimesForPill(int pillIndex) {
+    if (pillIndex < 0 || pillIndex >= pillDoseTimes.length) {
+      return [const TimeOfDay(hour: 8, minute: 0)];
+    }
+    final list = pillDoseTimes[pillIndex];
+    final times = list.map(_strToTime).toList();
+
+    times.sort(
+      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
+    );
+    return times;
+  }
+
+  ({
+    int doseIndex,
+    int totalDoses,
+    String cycleIso,
+    int mask,
+    int doneCount,
+    bool doseChecked,
+    bool dayComplete,
+  })
+  _getActiveDoseStateForPill(int pillIndex) {
+    final now = DateTime.now();
+
+    final doses = _doseTimesForPill(pillIndex); // sorted TimeOfDay list
+    final w = _computeDoseWindow(now: now, dosesSorted: doses);
+
+    final cycleIso = w.cycleStart.toIso8601String();
+
+    // read stored mask for this pill
+    final stored = _lastCheckMapCache?['$pillIndex'] as String?;
+    final parsed = _readCycleAndMask(stored);
+
+    final mask = (parsed.cycleIso == cycleIso) ? parsed.mask : 0;
+
+    final doseChecked = (mask & (1 << w.doseIndex)) != 0;
+    final doneCount = _bitCount(mask);
+    final dayComplete = doneCount >= doses.length;
+
+    return (
+      doseIndex: w.doseIndex,
+      totalDoses: doses.length,
+      cycleIso: cycleIso,
+      mask: mask,
+      doneCount: doneCount,
+      doseChecked: doseChecked,
+      dayComplete: dayComplete,
+    );
+  }
+
+  void _openInfoPanel() {
+    if (!_centerIsRealPill) return;
+
+    _hidePillLabelNow();
+    setState(() {
+      _infoOpen = true;
+      _configOpen = false; // don’t allow both open at once
+    });
+  }
+
+  void _closeInfoPanel() {
+    setState(() => _infoOpen = false);
+    _showPillLabelAfterSlide();
+  }
+
+  void _startEditFlow(int pillIndex) {
+    if (pillIndex < 0 || pillIndex >= pillNames.length) return;
+
+    final doses = _doseTimesForPill(pillIndex); // sorted list
+
+    _hidePillLabelNow();
+    setState(() {
+      _editingIndex = pillIndex;
+      _infoOpen = false;
+      _configOpen = true;
+
+      _nameController.text = pillNames[pillIndex];
+      _timesPerDay = doses.length;
+
+      if (doses.length == 1) {
+        _step = _ConfigStep.config;
+        _singleDoseTime = doses.first;
+        _doseTimes = [];
+      } else {
+        _step = _ConfigStep.doses;
+        _singleDoseTime = null;
+        _doseTimes = doses.map((t) => t as TimeOfDay?).toList();
+      }
+    });
+
+    _centerWheelOn(pillIndex + 1);
+  }
+
+  // ---------------- helpers: check map ----------------
   Future<Map<String, dynamic>> _loadCheckMap() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_pillCheckKey);
-    if (raw == null || raw.isEmpty) return {};
-    return jsonDecode(raw) as Map<String, dynamic>;
+    if (raw == null || raw.isEmpty) {
+      _lastCheckMapCache = {};
+      return {};
+    }
+    final decoded = jsonDecode(raw) as Map<String, dynamic>;
+    _lastCheckMapCache = decoded;
+    return decoded;
   }
 
+  Future<void> _saveCheckMap(Map<String, dynamic> map) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_pillCheckKey, jsonEncode(map));
+  }
+
+  ({String cycleIso, int mask}) _readCycleAndMask(String? stored) {
+    if (stored == null || stored.isEmpty) return (cycleIso: '', mask: 0);
+    final parts = stored.split('|');
+    if (parts.length != 2) return (cycleIso: '', mask: 0);
+    return (cycleIso: parts[0], mask: int.tryParse(parts[1]) ?? 0);
+  }
+
+  String _packCycleAndMask(String cycleIso, int mask) => '$cycleIso|$mask';
+
+  // Counts set bits (you already had this earlier; if missing, add it)
+  int _bitCount(int x) {
+    var n = 0;
+    while (x != 0) {
+      x &= (x - 1);
+      n++;
+    }
+    return n;
+  }
+
+  // Earliest "first dose" time across ALL pills (minutes since midnight)
+  int? _earliestFirstDoseMinutes() {
+    if (pillDoseTimes.isEmpty) return null;
+
+    int? best;
+    for (final doseList in pillDoseTimes) {
+      if (doseList.isEmpty) continue;
+
+      // doseList is ["HH:mm", ...] (not guaranteed sorted)
+      final times = doseList.map(_strToTime).toList();
+      times.sort(
+        (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
+      );
+      final first = times.first;
+      final m = first.hour * 60 + first.minute;
+
+      if (best == null || m < best) best = m;
+    }
+    return best;
+  }
+
+  // Global "day cycle" iso key: 2 hours before earliest first dose
+  String _globalCycleIso(DateTime now) {
+    final earliestMins = _earliestFirstDoseMinutes();
+    if (earliestMins == null) return '';
+
+    final earliest = TimeOfDay(
+      hour: earliestMins ~/ 60,
+      minute: earliestMins % 60,
+    );
+
+    final resetToday = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      earliest.hour,
+      earliest.minute,
+    ).subtract(const Duration(hours: 2));
+
+    final cycleStart = now.isBefore(resetToday)
+        ? resetToday.subtract(const Duration(days: 1))
+        : resetToday;
+
+    return cycleStart.toIso8601String();
+  }
+
+  // True if every pill is fully completed for this global cycle
+  bool _allPillsCompletedForCycle(Map<String, dynamic> checkMap, DateTime now) {
+    if (pillNames.isEmpty) return false;
+
+    final cycleIso = _globalCycleIso(now);
+    if (cycleIso.isEmpty) return false;
+
+    for (int i = 0; i < pillNames.length; i++) {
+      final totalDoses =
+          (i < pillDoseTimes.length && pillDoseTimes[i].isNotEmpty)
+          ? pillDoseTimes[i].length
+          : 1;
+
+      final stored = checkMap['$i'] as String?;
+      final parsed = _readCycleAndMask(stored);
+
+      // Must match this global cycle
+      if (parsed.cycleIso != cycleIso) return false;
+
+      // Must have all dose bits set
+      if (_bitCount(parsed.mask) < totalDoses) return false;
+    }
+
+    return true;
+  }
+
+  int _doneDoseCountForPill(Map<String, dynamic> map, int pillIndex) {
+    final doses = _doseTimesForPill(pillIndex);
+    final total = doses.length;
+
+    if (total == 0) return 0;
+
+    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final cycleIso = w.cycleStart.toIso8601String();
+
+    final stored = map['$pillIndex'] as String?;
+    final parsed = _readCycleAndMask(stored);
+
+    if (parsed.cycleIso != cycleIso) return 0;
+
+    final done = _bitCount(parsed.mask);
+    return done.clamp(0, total);
+  }
+
+  bool _isPillComplete(Map<String, dynamic> map, int pillIndex) {
+    final doses = _doseTimesForPill(pillIndex);
+    if (doses.isEmpty) return false;
+    return _doneDoseCountForPill(map, pillIndex) >= doses.length;
+  }
+
+  bool _areAllPillsComplete(Map<String, dynamic> map) {
+    if (pillNames.isEmpty) return false;
+    for (int i = 0; i < pillNames.length; i++) {
+      if (!_isPillComplete(map, i)) return false;
+    }
+    return true;
+  }
+
+  bool _isDoseCheckedSync(
+    Map<String, dynamic> map,
+    int pillIndex,
+    String cycleIso,
+    int doseIndex,
+  ) {
+    final stored = map['$pillIndex'] as String?;
+    final parsed = _readCycleAndMask(stored);
+    if (parsed.cycleIso != cycleIso) return false;
+    return (parsed.mask & (1 << doseIndex)) != 0;
+  }
+
+  // ---------------- dose window logic ----------------
+  ({
+    int doseIndex,
+    DateTime windowStart,
+    DateTime windowEnd,
+    DateTime cycleStart,
+  })
+  _computeDoseWindow({
+    required DateTime now,
+    required List<TimeOfDay> dosesSorted,
+  }) {
+    final first = dosesSorted.first;
+    final day = DateTime(now.year, now.month, now.day);
+
+    // cycleStart = firstDose - 2 hours
+    final cycleStartToday = _atTime(
+      day,
+      first,
+    ).subtract(const Duration(hours: 2));
+
+    final cycleStart = now.isBefore(cycleStartToday)
+        ? cycleStartToday.subtract(const Duration(days: 1))
+        : cycleStartToday;
+
+    final cycleDay = DateTime(
+      cycleStart.year,
+      cycleStart.month,
+      cycleStart.day,
+    );
+
+    final doseInstants = dosesSorted
+        .map((t) => _atTime(cycleDay, t))
+        .toList(growable: false);
+
+    // Each window begins 30m before its dose time
+    final windowStarts = doseInstants.map((d) => _minusMinutes(d, 30)).toList();
+
+    final nextCycleStart = cycleStart.add(const Duration(days: 1));
+    final windowEnds = <DateTime>[
+      for (int i = 0; i < windowStarts.length - 1; i++) windowStarts[i + 1],
+      nextCycleStart,
+    ];
+
+    for (int i = 0; i < windowStarts.length; i++) {
+      if (!now.isBefore(windowStarts[i]) && now.isBefore(windowEnds[i])) {
+        return (
+          doseIndex: i,
+          windowStart: windowStarts[i],
+          windowEnd: windowEnds[i],
+          cycleStart: cycleStart,
+        );
+      }
+    }
+
+    return (
+      doseIndex: 0,
+      windowStart: windowStarts[0],
+      windowEnd: windowEnds[0],
+      cycleStart: cycleStart,
+    );
+  }
+
+  DateTime? _globalCycleStartForNow(DateTime now) {
+    if (pillNames.isEmpty) return null;
+
+    DateTime? earliest;
+    for (int i = 0; i < pillNames.length; i++) {
+      final doses = _doseTimesForPill(i);
+      if (doses.isEmpty) continue;
+
+      final first = doses.first; // doses are sorted in _doseTimesForPill
+      final day = DateTime(now.year, now.month, now.day);
+      final cycleStartToday = DateTime(
+        day.year,
+        day.month,
+        day.day,
+        first.hour,
+        first.minute,
+      ).subtract(const Duration(hours: 2));
+
+      final cycleStart = now.isBefore(cycleStartToday)
+          ? cycleStartToday.subtract(const Duration(days: 1))
+          : cycleStartToday;
+
+      if (earliest == null || cycleStart.isBefore(earliest)) {
+        earliest = cycleStart;
+      }
+    }
+
+    return earliest;
+  }
+
+  void _scheduleGlobalBoundaryRefresh() {
+    _globalBoundaryTimer?.cancel();
+    _globalBoundaryTimer = null;
+
+    if (pillNames.isEmpty) return;
+
+    final now = DateTime.now();
+    DateTime? soonest;
+
+    for (int i = 0; i < pillNames.length; i++) {
+      final doses = _doseTimesForPill(i);
+      if (doses.isEmpty) continue;
+
+      final w = _computeDoseWindow(now: now, dosesSorted: doses);
+      final candidate = w.windowEnd;
+
+      // windowEnd can be "now-ish" if we're right on the boundary
+      if (candidate.isAfter(now)) {
+        if (soonest == null || candidate.isBefore(soonest)) soonest = candidate;
+      }
+    }
+
+    if (soonest == null) return;
+
+    final diff = soonest.difference(now);
+    if (diff.inMilliseconds <= 50) {
+      if (!mounted) return;
+      _refreshCheckMapFuture();
+      _scheduleGlobalBoundaryRefresh();
+      return;
+    }
+
+    _globalBoundaryTimer = Timer(diff, () {
+      if (!mounted) return;
+
+      // Reload map so ANY pill that reset/changed window shows correct state
+      _refreshCheckMapFuture();
+
+      // Reschedule for the next soonest boundary
+      _scheduleGlobalBoundaryRefresh();
+    });
+  }
+
+  void _scheduleGlobalDayBoundaryRefresh() {
+    _dayBoundaryTimer?.cancel();
+    _dayBoundaryTimer = null;
+
+    final now = DateTime.now();
+    final cycleStart = _globalCycleStartForNow(now);
+    if (cycleStart == null) return;
+
+    final nextCycleStart = cycleStart.add(const Duration(days: 1));
+    final diff = nextCycleStart.difference(now);
+
+    if (diff.inMilliseconds <= 50) {
+      if (!mounted) return;
+      _checkMapFuture = _loadCheckMap();
+      setState(() {});
+      return;
+    }
+
+    _dayBoundaryTimer = Timer(diff, () {
+      if (!mounted) return;
+
+      // Day reset moment hit (2h before earliest first dose)
+      _checkMapFuture = _loadCheckMap();
+      setState(() {});
+
+      // reschedule for the next day
+      _scheduleGlobalDayBoundaryRefresh();
+    });
+  }
+
+  void _scheduleCenteredDoseBoundaryRefresh() {
+    _doseBoundaryTimer?.cancel();
+    _doseBoundaryTimer = null;
+
+    final pillIndex = _centerPillIndex;
+    if (pillIndex == null) return;
+
+    final doses = _doseTimesForPill(pillIndex);
+    if (doses.isEmpty) return;
+
+    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+
+    // Next time the UI should change for this centered pill:
+    // (this is the "reset" moment: 30 min before next dose, or cycle reset after final)
+    final next = w.windowEnd;
+
+    // If it's already passed or basically now, rebuild immediately
+    final diff = next.difference(DateTime.now());
+    if (diff.inMilliseconds <= 50) {
+      if (!mounted) return;
+      setState(() {});
+      return;
+    }
+
+    _doseBoundaryTimer = Timer(diff, () {
+      if (!mounted) return;
+
+      // Refresh check state + label "(dose X)" immediately at the boundary
+      _checkMapFuture = _loadCheckMap();
+      setState(() {});
+
+      // Schedule the NEXT boundary too (because now we're in the next window)
+      _scheduleCenteredDoseBoundaryRefresh();
+    });
+  }
+
+  // ---------------- selection helpers ----------------
+  int? get _centerPillIndex {
+    final idx = _wheelSelectedIndex - 1; // wheel->pill
+    if (_wheelSelectedIndex <= 0) return null;
+    if (idx < 0 || idx >= pillNames.length) return null;
+    return idx;
+  }
+
+  String _centerPillName() {
+    if (_wheelSelectedIndex <= 0) return '';
+    final slot = _wheelSelectedIndex - 1;
+    if (slot < 0) return '';
+    if (slot >= pillNames.length) return '';
+    return pillNames[slot];
+  }
+
+  // ---------------- UI label helpers ----------------
+  void _hidePillLabelNow() {
+    if (_showPillLabel) setState(() => _showPillLabel = false);
+  }
+
+  void _showPillLabelAfterSlide() {
+    Future.delayed(const Duration(milliseconds: 320), () {
+      if (!mounted) return;
+      if (!_configOpen) setState(() => _showPillLabel = true);
+    });
+  }
+
+  void _clearCheckedMessage() {
+    if (_labelOverride == null) return;
+    _labelTimer?.cancel();
+    _labelTimer = null;
+    if (!mounted) return;
+    setState(() => _labelOverride = null);
+  }
+
+  // ---------------- onboarding ----------------
   Future<void> _showWelcomeThenOpenConfig(SharedPreferences prefs) async {
-    // Don’t show twice
     final alreadySeen = prefs.getBool(_seenPromptKey) ?? false;
     if (alreadySeen) return;
 
@@ -75,160 +639,88 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
 
-    // Mark seen AFTER they actually saw it
     await prefs.setBool(_seenPromptKey, true);
 
     if (!mounted) return;
     _startAddFlow(createNewSlot: true);
   }
 
-  Future<void> _saveCheckMap(Map<String, dynamic> map) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_pillCheckKey, jsonEncode(map));
+  // ---------------- decode helpers ----------------
+  List<List<String>> _decodeListOfStringLists(String? raw) {
+    if (raw == null || raw.isEmpty) return [];
+    final decoded = jsonDecode(raw);
+    return (decoded as List)
+        .map((e) => (e as List).map((x) => x.toString()).toList())
+        .toList();
   }
 
-  bool _isPillCheckedNowSync(Map<String, dynamic> map, int pillIndex) {
-    final pillTime = _timeForPill(pillIndex);
-    final cycleKey = _cycleKeyForNow(pillTime, DateTime.now());
-    final stored = map['$pillIndex'] as String?;
-    return stored == cycleKey;
+  List<List<int>> _decodeListOfIntLists(String? raw) {
+    if (raw == null || raw.isEmpty) return [];
+    final decoded = jsonDecode(raw);
+    return (decoded as List)
+        .map((e) => (e as List).map((x) => (x as num).toInt()).toList())
+        .toList();
   }
 
-  Future<void> _checkCenteredPill() async {
-    final pillIndex = _centerPillIndex;
-    if (pillIndex == null) return;
-
-    final map = await _loadCheckMap();
-    final pillTime = _timeForPill(pillIndex);
-    final cycleKey = _cycleKeyForNow(pillTime, DateTime.now());
-
-    map['$pillIndex'] = cycleKey;
-    await _saveCheckMap(map);
-
-    // show "Pill Checked!" for ~10 seconds
-    _labelTimer?.cancel();
-    setState(() => _labelOverride = 'Pill Checked!');
-    _labelTimer = Timer(const Duration(seconds: 10), () {
-      if (!mounted) return;
-      setState(() => _labelOverride = null);
-    });
-
-    // refresh UI (so the check button flips to checked)
-    if (mounted) setState(() {});
-  }
-
-  // returns the "cycle key" that defines whether it's considered checked
-  String _cycleKeyForNow(TimeOfDay pillTime, DateTime now) {
-    final resetToday = DateTime(
-      now.year,
-      now.month,
-      now.day,
-      pillTime.hour,
-      pillTime.minute,
-    ).subtract(const Duration(hours: 2));
-
-    // if we haven't reached today's reset boundary yet, we are still in yesterday's cycle
-    final cycleStart = now.isBefore(resetToday)
-        ? resetToday.subtract(const Duration(days: 1))
-        : resetToday;
-    return cycleStart.toIso8601String();
-  }
-
-  late final FixedExtentScrollController _wheelController =
-      FixedExtentScrollController(initialItem: 1);
-
-  void _clearCheckedMessage() {
-    if (_labelOverride == null) return;
-
-    _labelTimer?.cancel();
-    _labelTimer = null;
-
-    if (!mounted) return;
-    setState(() => _labelOverride = null);
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _loadAndMaybeAutoOpen();
-    _nameController.addListener(() => setState(() {}));
-  }
-
-  @override
-  void dispose() {
-    _nameController.dispose();
-    _wheelController.dispose();
-    super.dispose();
-  }
-
-  int? get _centerPillIndex {
-    final idx = _wheelSelectedIndex - 1; // wheel->pill
-    if (_wheelSelectedIndex <= 0) return null;
-    if (idx < 0 || idx >= pillNames.length) return null;
-    return idx;
-  }
-
-  // ONLY show a pill name when a real pill is centered.
-  String _centerPillName() {
-    // wheel index 0 is "+"
-    if (_wheelSelectedIndex <= 0) return '';
-    final slot = _wheelSelectedIndex - 1; // 0-based pill slot
-    if (slot < 0) return '';
-    if (slot >= pillNames.length) return ''; // pending/empty slot
-    return pillNames[slot];
-  }
-
-  void _hidePillLabelNow() {
-    if (_showPillLabel) setState(() => _showPillLabel = false);
-  }
-
-  void _showPillLabelAfterSlide() {
-    Future.delayed(const Duration(milliseconds: 320), () {
-      if (!mounted) return;
-      // Only show if we truly returned to normal (config closed)
-      if (!_configOpen) setState(() => _showPillLabel = true);
-    });
-  }
-
-  Future<void> _showWelcomeDialog() async {
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('Welcome!'),
-        content: const Text('Configure your first pill.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-    );
-  }
-
+  // ---------------- load ----------------
   Future<void> _loadAndMaybeAutoOpen() async {
     final prefs = await SharedPreferences.getInstance();
 
     final savedNames = prefs.getStringList(_pillNamesKey) ?? [];
     final savedTimes = prefs.getStringList(_pillTimesKey) ?? [];
-    final seen = prefs.getBool(_seenPromptKey) ?? false;
 
-    // Keep times aligned with names (so indexes always match)
+    // align legacy times to names
     final alignedTimes = List<String>.from(savedTimes);
     while (alignedTimes.length < savedNames.length) {
-      alignedTimes.add('08:00'); // default placeholder time
+      alignedTimes.add('08:00');
     }
     if (alignedTimes.length > savedNames.length) {
       alignedTimes.removeRange(savedNames.length, alignedTimes.length);
     }
-
-    // Persist alignment so it stays clean
     await prefs.setStringList(_pillTimesKey, alignedTimes);
+
+    // load v2
+    final rawDoseTimes = prefs.getString(_pillDoseTimesKey);
+    final rawDoseNotifIds = prefs.getString(_pillDoseNotifIdsKey);
+
+    var loadedDoseTimes = _decodeListOfStringLists(rawDoseTimes);
+    var loadedDoseNotifIds = _decodeListOfIntLists(rawDoseNotifIds);
+
+    // seed doseTimes from legacy if upgrading
+    if (loadedDoseTimes.isEmpty && savedNames.isNotEmpty) {
+      loadedDoseTimes = [
+        for (int i = 0; i < savedNames.length; i++) [alignedTimes[i]],
+      ];
+    }
+
+    while (loadedDoseTimes.length < savedNames.length) {
+      loadedDoseTimes.add(['08:00']);
+    }
+    if (loadedDoseTimes.length > savedNames.length) {
+      loadedDoseTimes.removeRange(savedNames.length, loadedDoseTimes.length);
+    }
+
+    while (loadedDoseNotifIds.length < savedNames.length) {
+      loadedDoseNotifIds.add(<int>[]);
+    }
+    if (loadedDoseNotifIds.length > savedNames.length) {
+      loadedDoseNotifIds.removeRange(
+        savedNames.length,
+        loadedDoseNotifIds.length,
+      );
+    }
+
+    await prefs.setString(_pillDoseTimesKey, jsonEncode(loadedDoseTimes));
+    await prefs.setString(_pillDoseNotifIdsKey, jsonEncode(loadedDoseNotifIds));
+    final loadedMap = await _loadCheckMap();
 
     setState(() {
       pillNames = savedNames;
       pillTimes = alignedTimes;
+      _checkMapCache = loadedMap;
+      _checkMapFuture = Future.value(loadedMap);
+      pillDoseTimes = loadedDoseTimes;
+      pillDoseNotifIds = loadedDoseNotifIds;
     });
 
     if (savedNames.isEmpty && mounted) {
@@ -239,6 +731,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  // ---------------- wheel counts ----------------
   int get _displayPillCount {
     final real = pillNames.length;
     final baselineEmpty = (real == 0 && !_pendingSlot) ? 1 : 0;
@@ -247,7 +740,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   int get _realPillCount => pillNames.length;
-
   int get _pendingWheelIndex => 1 + pillNames.length;
 
   void _centerWheelOn(int index) {
@@ -257,6 +749,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  // ---------------- config flow ----------------
   void _startAddFlow({required bool createNewSlot}) {
     _hidePillLabelNow();
     setState(() {
@@ -275,28 +768,20 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _cancelAddFlow() {
+    FocusManager.instance.primaryFocus?.unfocus();
     setState(() {
       _configOpen = false;
       _pendingSlot = false;
       _step = _ConfigStep.name;
     });
     _centerWheelOn(1);
-    _showPillLabelAfterSlide(); // <-- add
+    _showPillLabelAfterSlide();
   }
 
-  String _fmt(TimeOfDay t) {
-    final hour12 = t.hourOfPeriod == 0 ? 12 : t.hourOfPeriod;
-    final mm = t.minute.toString().padLeft(2, '0');
-    final suffix = t.period == DayPeriod.am ? 'AM' : 'PM';
-    return '$hour12:$mm $suffix';
-  }
-
-  String _timeToStr(TimeOfDay t) =>
-      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
-
-  TimeOfDay _strToTime(String s) {
-    final parts = s.split(':');
-    return TimeOfDay(hour: int.parse(parts[0]), minute: int.parse(parts[1]));
+  void _setCheckMapAndRebuild(Map<String, dynamic> map) {
+    _checkMapCache = map;
+    _checkMapFuture = Future.value(map);
+    if (mounted) setState(() {});
   }
 
   Future<void> _pickTimeSingle() async {
@@ -318,147 +803,6 @@ class _HomeScreenState extends State<HomeScreen> {
   bool get _allDoseTimesSet =>
       _doseTimes.isNotEmpty && _doseTimes.every((t) => t != null);
 
-  Future<void> _savePill() async {
-    _showPillLabelAfterSlide();
-
-    final name = _nameController.text.trim();
-    if (name.isEmpty) return;
-
-    if (_timesPerDay == 1 && _singleDoseTime == null) return;
-    if (_timesPerDay > 1 && !_allDoseTimesSet) return;
-
-    final prefs = await SharedPreferences.getInstance();
-    final updated = [...pillNames, name];
-    await prefs.setStringList(_pillNamesKey, updated);
-
-    // ---- Save pill time (single time for now) ----
-    final t = _singleDoseTime!; // safe because we checked above
-    final existingTimes = prefs.getStringList(_pillTimesKey) ?? [];
-    final updatedTimes = [...existingTimes, _timeToStr(t)];
-    await prefs.setStringList(_pillTimesKey, updatedTimes);
-    // --------------------------------------------
-
-    // ---- IMPORTANT: new pill should NEVER inherit old check state ----
-    final checkMap = await _loadCheckMap();
-    final newIndex = updated.length - 1;
-
-    checkMap.remove('$newIndex'); // clears any old state at this index
-    await _saveCheckMap(checkMap);
-    // ---------------------------------------------------------------
-
-    // ---- Notifications (TEST) ----
-    debugPrint(
-      'SAVE -> scheduling id=${1000 + newIndex} '
-      'name="$name" time=${_timeToStr(t)}',
-    );
-
-    await NotificationService.scheduleDailyPillReminder(
-      id: 1000 + newIndex,
-      pillName: name,
-      time: t,
-    );
-    // -----------------------------
-
-    setState(() {
-      pillNames = updated;
-      _pendingSlot = false;
-      _configOpen = false;
-      _step = _ConfigStep.name;
-    });
-
-    _showPillLabelAfterSlide();
-    _centerWheelOn(1 + (updated.length - 1));
-  }
-
-  Future<void> _deleteCenteredPill() async {
-    // wheel index 0 is "+"
-    if (_wheelSelectedIndex <= 0) return;
-
-    final slot = _wheelSelectedIndex - 1; // 0-based pill index
-    if (slot < 0 || slot >= pillNames.length) return; // empty/pending
-
-    final pillName = pillNames[slot];
-
-    final shouldDelete =
-        await showDialog<bool>(
-          context: context,
-          builder: (context) {
-            return AlertDialog(
-              title: const Text('Delete pill?'),
-              content: Text('Delete "$pillName"? This can’t be undone.'),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context, false),
-                  child: const Text('Cancel'),
-                ),
-                TextButton(
-                  onPressed: () => Navigator.pop(context, true),
-                  child: const Text('Delete'),
-                ),
-              ],
-            );
-          },
-        ) ??
-        false;
-
-    if (!shouldDelete) return;
-    // later: cancel notification for this pill (safe no-op right now)
-    await NotificationService.cancel(1000 + slot);
-
-    // Remove from list + persist
-    // Remove from lists + persist (KEEP INDICES ALIGNED)
-    final updatedNames = [...pillNames]..removeAt(slot);
-
-    // times list should remove at the same index if it exists
-    final updatedTimes = [...pillTimes];
-    if (slot < updatedTimes.length) {
-      updatedTimes.removeAt(slot);
-    }
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(_pillNamesKey, updatedNames);
-    await prefs.setStringList(_pillTimesKey, updatedTimes);
-
-    // --- FIX: also update the check-map so deleted index doesn't "stick" ---
-    final checkMap = await _loadCheckMap(); // Map<String, dynamic>
-
-    final Map<String, dynamic> shifted = {};
-    checkMap.forEach((k, v) {
-      final idx = int.tryParse(k);
-      if (idx == null) return;
-
-      if (idx < slot) {
-        shifted['$idx'] = v; // unchanged
-      } else if (idx > slot) {
-        shifted['${idx - 1}'] = v; // shift down
-      }
-      // if idx == slot -> dropped (deleted pill)
-    });
-
-    await _saveCheckMap(shifted);
-    // --- end FIX ---
-
-    setState(() {
-      pillNames = updatedNames;
-      pillTimes = updatedTimes;
-      _pendingSlot = false;
-    });
-
-    // Recenter on a safe item:
-    // wheel index 0 is "+", so pills start at 1.
-    final newPillCount = updatedNames.length;
-    if (newPillCount == 0) {
-      _wheelSelectedIndex = 1;
-      _centerWheelOn(1);
-    } else {
-      // Keep it near the same position
-      final newSlot = slot.clamp(0, newPillCount - 1);
-      final newWheelIndex = newSlot + 1;
-      _wheelSelectedIndex = newWheelIndex;
-      _centerWheelOn(newWheelIndex);
-    }
-  }
-
   void _handlePrimaryAction() {
     if (_step == _ConfigStep.name) {
       if (_nameController.text.trim().isEmpty) return;
@@ -469,28 +813,376 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_step == _ConfigStep.config) {
       if (_timesPerDay == 1) {
         if (_singleDoseTime == null) return;
-        _savePill();
+
+        // ✅ if editing, update; otherwise save new
+        if (_isEditing) {
+          _updatePill();
+        } else {
+          _savePill();
+        }
       } else {
         setState(() {
           _step = _ConfigStep.doses;
-          _doseTimes = List<TimeOfDay?>.filled(_timesPerDay, null);
+
+          // ✅ if editing, prefill the existing times (so they can tweak them)
+          // otherwise create empty slots
+          if (_isEditing) {
+            final idx = _editingIndex;
+            final existing = (idx == null)
+                ? <TimeOfDay>[]
+                : _doseTimesForPill(idx);
+            _doseTimes = List<TimeOfDay?>.from(existing);
+          } else {
+            _doseTimes = List<TimeOfDay?>.filled(_timesPerDay, null);
+          }
         });
+
+        _scheduleGlobalDayBoundaryRefresh();
       }
       return;
     }
 
     if (_step == _ConfigStep.doses) {
       if (!_allDoseTimesSet) return;
-      _savePill();
+
+      // ✅ if editing, update; otherwise save new
+      if (_isEditing) {
+        _updatePill();
+      } else {
+        _savePill();
+      }
     }
   }
 
+  // ---------------- SAVE pill (multi-dose) ----------------
+  Future<void> _savePill() async {
+    _showPillLabelAfterSlide();
+
+    final name = _nameController.text.trim();
+    if (name.isEmpty) return;
+
+    if (_timesPerDay == 1 && _singleDoseTime == null) return;
+    if (_timesPerDay > 1 && !_allDoseTimesSet) return;
+
+    // build sorted doses
+    final List<TimeOfDay> doses = (_timesPerDay == 1)
+        ? <TimeOfDay>[_singleDoseTime!]
+        : _doseTimes.map((t) => t!).toList();
+
+    doses.sort(
+      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
+    );
+
+    final doseStrings = doses.map(_timeToStr).toList();
+    final firstDose = doses.first;
+
+    final prefs = await SharedPreferences.getInstance();
+
+    // persist names
+    final updatedNames = [...pillNames, name];
+    await prefs.setStringList(_pillNamesKey, updatedNames);
+
+    // persist legacy first-dose times (for now)
+    final existingTimes = prefs.getStringList(_pillTimesKey) ?? [];
+    final updatedTimes = [...existingTimes, _timeToStr(firstDose)];
+    await prefs.setStringList(_pillTimesKey, updatedTimes);
+
+    // persist dose times list-of-lists
+    final existingDoseTimes = _decodeListOfStringLists(
+      prefs.getString(_pillDoseTimesKey),
+    );
+    final updatedDoseTimes = [...existingDoseTimes, doseStrings];
+    await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
+
+    // schedule + persist notif ids per dose
+    final existingDoseNotifIds = _decodeListOfIntLists(
+      prefs.getString(_pillDoseNotifIdsKey),
+    );
+
+    final List<int> notifIdsForThisPill = <int>[];
+    for (int i = 0; i < doses.length; i++) {
+      final id = _newNotifId();
+      notifIdsForThisPill.add(id);
+
+      await NotificationService.scheduleDailyDoseReminder(
+        id: id,
+        pillName: name,
+        doseNumber1Based: i + 1,
+        time: doses[i],
+        totalDoses: doses.length,
+      );
+    }
+
+    final updatedDoseNotifIds = [...existingDoseNotifIds, notifIdsForThisPill];
+    await prefs.setString(
+      _pillDoseNotifIdsKey,
+      jsonEncode(updatedDoseNotifIds),
+    );
+
+    // clear stale check state for new pill index
+    final checkMap = await _loadCheckMap();
+    final newIndex = updatedNames.length - 1;
+    checkMap.remove('$newIndex');
+    await _saveCheckMap(checkMap);
+    _setCheckMapAndRebuild(checkMap);
+    _refreshCheckMapFuture();
+
+    setState(() {
+      pillNames = updatedNames;
+      pillTimes = updatedTimes;
+      pillDoseTimes = updatedDoseTimes;
+      pillDoseNotifIds = updatedDoseNotifIds;
+
+      _pendingSlot = false;
+      _configOpen = false;
+      _step = _ConfigStep.name;
+    });
+
+    _showPillLabelAfterSlide();
+    _centerWheelOn(1 + (updatedNames.length - 1));
+    _scheduleGlobalBoundaryRefresh();
+  }
+
+  Future<void> _updatePill() async {
+    final pillIndex = _editingIndex;
+    if (pillIndex == null) return;
+
+    final name = _nameController.text.trim();
+    if (name.isEmpty) return;
+
+    if (_timesPerDay == 1 && _singleDoseTime == null) return;
+    if (_timesPerDay > 1 && !_allDoseTimesSet) return;
+
+    // build sorted doses
+    final List<TimeOfDay> doses = (_timesPerDay == 1)
+        ? <TimeOfDay>[_singleDoseTime!]
+        : _doseTimes.map((t) => t!).toList();
+
+    doses.sort(
+      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
+    );
+    final doseStrings = doses.map(_timeToStr).toList();
+    final firstDose = doses.first;
+
+    final prefs = await SharedPreferences.getInstance();
+
+    // Cancel existing notifications for this pill
+    if (pillIndex < pillDoseNotifIds.length) {
+      for (final id in pillDoseNotifIds[pillIndex]) {
+        await NotificationService.cancel(id);
+      }
+    }
+
+    // Schedule new notifications
+    final List<int> notifIdsForThisPill = <int>[];
+    for (int i = 0; i < doses.length; i++) {
+      final id = _newNotifId();
+      notifIdsForThisPill.add(id);
+
+      await NotificationService.scheduleDailyDoseReminder(
+        id: id,
+        pillName: name,
+        doseNumber1Based: i + 1,
+        time: doses[i],
+        totalDoses: doses.length,
+      );
+    }
+
+    // Update in-memory lists
+    final updatedNames = [...pillNames];
+    updatedNames[pillIndex] = name;
+
+    final updatedTimes = [...pillTimes];
+    if (pillIndex < updatedTimes.length) {
+      updatedTimes[pillIndex] = _timeToStr(firstDose);
+    }
+
+    final updatedDoseTimes = [...pillDoseTimes];
+    if (pillIndex < updatedDoseTimes.length) {
+      updatedDoseTimes[pillIndex] = doseStrings;
+    }
+
+    final updatedDoseNotifIds = [...pillDoseNotifIds];
+    if (pillIndex < updatedDoseNotifIds.length) {
+      updatedDoseNotifIds[pillIndex] = notifIdsForThisPill;
+    }
+
+    // Persist prefs
+    await prefs.setStringList(_pillNamesKey, updatedNames);
+    await prefs.setStringList(_pillTimesKey, updatedTimes);
+    await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
+    await prefs.setString(
+      _pillDoseNotifIdsKey,
+      jsonEncode(updatedDoseNotifIds),
+    );
+
+    // Clear THIS pill’s check state (safe, avoids weird mismatches after edits)
+    final checkMap = await _loadCheckMap();
+    checkMap.remove('$pillIndex');
+    await _saveCheckMap(checkMap);
+    _setCheckMapAndRebuild(checkMap);
+    _refreshCheckMapFuture();
+
+    setState(() {
+      pillNames = updatedNames;
+      pillTimes = updatedTimes;
+      pillDoseTimes = updatedDoseTimes;
+      pillDoseNotifIds = updatedDoseNotifIds;
+
+      _editingIndex = null;
+      _configOpen = false;
+      _step = _ConfigStep.name;
+    });
+
+    _scheduleGlobalDayBoundaryRefresh();
+    _scheduleGlobalBoundaryRefresh();
+    _showPillLabelAfterSlide();
+  }
+
+  // ---------------- DELETE pill (cancel all doses) ----------------
+  Future<void> _deleteCenteredPill() async {
+    if (_wheelSelectedIndex <= 0) return;
+
+    final slot = _wheelSelectedIndex - 1;
+    if (slot < 0 || slot >= pillNames.length) return;
+
+    final pillName = pillNames[slot];
+
+    final shouldDelete =
+        await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Delete pill?'),
+            content: Text('Delete "$pillName"? This can’t be undone.'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+
+    if (!shouldDelete) return;
+
+    // cancel ALL notifications for this pill (all doses)
+    if (slot < pillDoseNotifIds.length) {
+      for (final id in pillDoseNotifIds[slot]) {
+        await NotificationService.cancel(id);
+      }
+    }
+
+    final updatedNames = [...pillNames]..removeAt(slot);
+
+    final updatedTimes = [...pillTimes];
+    if (slot < updatedTimes.length) updatedTimes.removeAt(slot);
+
+    final updatedDoseTimes = [...pillDoseTimes];
+    if (slot < updatedDoseTimes.length) updatedDoseTimes.removeAt(slot);
+
+    final updatedDoseNotifIds = [...pillDoseNotifIds];
+    if (slot < updatedDoseNotifIds.length) updatedDoseNotifIds.removeAt(slot);
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_pillNamesKey, updatedNames);
+    await prefs.setStringList(_pillTimesKey, updatedTimes);
+    await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
+    await prefs.setString(
+      _pillDoseNotifIdsKey,
+      jsonEncode(updatedDoseNotifIds),
+    );
+
+    // shift check map indices down
+    final checkMap = await _loadCheckMap();
+    final Map<String, dynamic> shifted = {};
+    checkMap.forEach((k, v) {
+      final idx = int.tryParse(k);
+      if (idx == null) return;
+      if (idx < slot) {
+        shifted['$idx'] = v;
+      } else if (idx > slot) {
+        shifted['${idx - 1}'] = v;
+      }
+    });
+    await _saveCheckMap(shifted);
+    _setCheckMapAndRebuild(shifted);
+    _refreshCheckMapFuture();
+
+    setState(() {
+      pillNames = updatedNames;
+      pillTimes = updatedTimes;
+      pillDoseTimes = updatedDoseTimes;
+      pillDoseNotifIds = updatedDoseNotifIds;
+      _pendingSlot = false;
+    });
+
+    _scheduleGlobalDayBoundaryRefresh();
+    _scheduleGlobalBoundaryRefresh();
+
+    final newCount = updatedNames.length;
+    if (newCount == 0) {
+      _wheelSelectedIndex = 1;
+      _centerWheelOn(1);
+    } else {
+      final newSlot = slot.clamp(0, newCount - 1);
+      final newWheelIndex = newSlot + 1;
+      _wheelSelectedIndex = newWheelIndex;
+      _centerWheelOn(newWheelIndex);
+    }
+  }
+
+  // ---------------- CHECK current dose ----------------
+  Future<void> _checkCenteredPill() async {
+    final pillIndex = _centerPillIndex;
+    if (pillIndex == null) return;
+
+    // Ensure cache is fresh
+    final map = await _loadCheckMap();
+
+    final doses = _doseTimesForPill(pillIndex);
+    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+
+    final cycleIso = w.cycleStart.toIso8601String();
+    final doseIndex = w.doseIndex;
+
+    final stored = map['$pillIndex'] as String?;
+    final parsed = _readCycleAndMask(stored);
+
+    final baseMask = (parsed.cycleIso == cycleIso) ? parsed.mask : 0;
+    final newMask = baseMask | (1 << doseIndex);
+
+    map['$pillIndex'] = _packCycleAndMask(cycleIso, newMask);
+    await _saveCheckMap(map);
+    _setCheckMapAndRebuild(map);
+    _refreshCheckMapFuture(); // ✅ forces daily circle + button builders to see new map
+    _checkMapFuture = _loadCheckMap();
+    _scheduleCenteredDoseBoundaryRefresh();
+
+    // show "Pill Checked!" for ~9 seconds
+    _labelTimer?.cancel();
+    setState(() => _labelOverride = 'Pill Checked!');
+    _labelTimer = Timer(const Duration(seconds: 9), () {
+      if (!mounted) return;
+      setState(() => _labelOverride = null);
+    });
+
+    if (mounted) setState(() {});
+  }
+
+  // ---------------- config panel UI ----------------
   Widget _configPanel() {
     const cardColor = Color(0xFF98404F);
     const white = Color(0xFFFFFFFF);
     const green = Color(0xFF59FF56);
 
-    final titleText = (_step == _ConfigStep.name)
+    final titleText = _isEditing
+        ? 'Save'
+        : (_step == _ConfigStep.name)
         ? 'Continue'
         : (_timesPerDay > 1 && _step == _ConfigStep.config)
         ? 'Next'
@@ -504,520 +1196,879 @@ class _HomeScreenState extends State<HomeScreen> {
           borderRadius: BorderRadius.circular(26),
         ),
         padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Row(
-              children: [
-                Container(
-                  width: 44,
-                  height: 44,
-                  decoration: const BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: white,
-                  ),
-                  child: const Center(
-                    child: Icon(Icons.medication, color: cardColor),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: (_step == _ConfigStep.name)
-                      ? TextField(
-                          controller: _nameController,
-                          style: const TextStyle(color: white, fontSize: 18),
-                          decoration: const InputDecoration(
-                            hintText: 'Pill name...',
-                            hintStyle: TextStyle(color: Colors.white70),
-                            border: InputBorder.none,
-                          ),
-                        )
-                      : Text(
-                          _nameController.text.trim(),
-                          style: const TextStyle(
+
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return SingleChildScrollView(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                child: Column(
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          width: 52,
+                          height: 52,
+                          decoration: BoxDecoration(
                             color: white,
-                            fontSize: 22,
-                            fontWeight: FontWeight.w600,
+                            borderRadius: BorderRadius.circular(14),
                           ),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                ),
-                IconButton(
-                  onPressed: _cancelAddFlow,
-                  icon: const Icon(Icons.close, color: white),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-
-            Container(
-              width: double.infinity,
-              height: 140,
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.12),
-                borderRadius: BorderRadius.circular(18),
-              ),
-              alignment: Alignment.center,
-              child: const Text(
-                'Placeholder info area',
-                style: TextStyle(color: Colors.white70),
-              ),
-            ),
-
-            const SizedBox(height: 12),
-
-            if (_step == _ConfigStep.config) ...[
-              Row(
-                children: [
-                  const Icon(Icons.schedule, color: white),
-                  const SizedBox(width: 10),
-                  const Text('Times per day', style: TextStyle(color: white)),
-                  const Spacer(),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10),
-                    decoration: BoxDecoration(
-                      color: white,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: DropdownButton<int>(
-                      value: _timesPerDay,
-                      underline: const SizedBox.shrink(),
-                      items: List.generate(6, (i) => i + 1)
-                          .map(
-                            (n) =>
-                                DropdownMenuItem(value: n, child: Text('$n')),
-                          )
-                          .toList(),
-                      onChanged: (v) {
-                        if (v == null) return;
-                        setState(() {
-                          _timesPerDay = v;
-                          _singleDoseTime = null;
-                          _doseTimes = [];
-                        });
-                      },
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              if (_timesPerDay == 1)
-                Container(
-                  height: 48,
-                  decoration: BoxDecoration(
-                    color: white,
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(14),
-                    onTap: _pickTimeSingle,
-                    child: Center(
-                      child: Text(
-                        _singleDoseTime == null
-                            ? 'Pick time'
-                            : _fmt(_singleDoseTime!),
-                        style: const TextStyle(
-                          color: cardColor,
-                          fontWeight: FontWeight.w700,
-                          fontSize: 18,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-            ],
-
-            if (_step == _ConfigStep.doses)
-              Expanded(
-                child: ListView.separated(
-                  itemCount: _timesPerDay,
-                  separatorBuilder: (_, __) => const SizedBox(height: 10),
-                  itemBuilder: (context, i) {
-                    final t = _doseTimes[i];
-                    return Container(
-                      decoration: BoxDecoration(
-                        color: white,
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      child: ListTile(
-                        title: Text(
-                          'Dose ${i + 1}',
-                          style: const TextStyle(
-                            color: cardColor,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                        subtitle: Text(
-                          t == null ? 'Tap to set time' : _fmt(t),
-                          style: const TextStyle(color: cardColor),
-                        ),
-                        trailing: const Icon(Icons.schedule, color: cardColor),
-                        onTap: () => _pickDoseTime(i),
-                      ),
-                    );
-                  },
-                ),
-              )
-            else
-              const Spacer(),
-
-            SizedBox(
-              width: double.infinity,
-              height: 56,
-              child: Material(
-                color: green,
-                borderRadius: BorderRadius.circular(18),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(18),
-                  onTap: _handlePrimaryAction,
-                  child: Row(
-                    children: [
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Center(
-                          child: Text(
-                            titleText,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 22,
-                              fontWeight: FontWeight.w800,
+                          child: Center(
+                            child: Image.asset(
+                              'assets/images/pill_placeholder.png',
+                              width: 36,
+                              height: 36,
+                              fit: BoxFit.contain,
                             ),
                           ),
                         ),
+
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: (_step == _ConfigStep.name)
+                              ? TextField(
+                                  controller: _nameController,
+                                  style: const TextStyle(
+                                    color: white,
+                                    fontSize: 18,
+                                  ),
+                                  decoration: const InputDecoration(
+                                    hintText: 'Pill name...',
+                                    hintStyle: TextStyle(color: Colors.white70),
+                                    border: InputBorder.none,
+                                  ),
+                                )
+                              : Text(
+                                  _nameController.text.trim(),
+                                  style: const TextStyle(
+                                    color: white,
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                        ),
+                        IconButton(
+                          onPressed: _cancelAddFlow,
+                          icon: const Icon(Icons.close, color: white),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+
+                    Container(
+                      width: double.infinity,
+                      height: 140,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.12),
+                        borderRadius: BorderRadius.circular(18),
                       ),
-                      const SizedBox(
-                        width: 56,
-                        height: 56,
-                        child: Icon(Icons.add, color: Colors.white, size: 34),
+                      alignment: Alignment.center,
+                      child: const Text(
+                        'Placeholder info area',
+                        style: TextStyle(color: Colors.white70),
                       ),
+                    ),
+
+                    const SizedBox(height: 12),
+
+                    if (_step == _ConfigStep.config) ...[
+                      Row(
+                        children: [
+                          const Icon(Icons.schedule, color: white),
+                          const SizedBox(width: 10),
+                          const Text(
+                            'Times per day',
+                            style: TextStyle(color: white),
+                          ),
+                          const Spacer(),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            decoration: BoxDecoration(
+                              color: white,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: DropdownButton<int>(
+                              value: _timesPerDay,
+                              underline: const SizedBox.shrink(),
+                              items: List.generate(6, (i) => i + 1)
+                                  .map(
+                                    (n) => DropdownMenuItem(
+                                      value: n,
+                                      child: Text('$n'),
+                                    ),
+                                  )
+                                  .toList(),
+                              onChanged: (v) {
+                                if (v == null) return;
+                                setState(() {
+                                  _timesPerDay = v;
+                                  _singleDoseTime = null;
+                                  _doseTimes = [];
+                                });
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      if (_timesPerDay == 1)
+                        Container(
+                          height: 48,
+                          decoration: BoxDecoration(
+                            color: white,
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(14),
+                            onTap: _pickTimeSingle,
+                            child: Center(
+                              child: Text(
+                                _singleDoseTime == null
+                                    ? 'Pick time'
+                                    : _fmt(_singleDoseTime!),
+                                style: const TextStyle(
+                                  color: cardColor,
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 18,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
                     ],
-                  ),
+
+                    if (_step == _ConfigStep.doses)
+                      SizedBox(
+                        height: 220,
+                        child: ListView.separated(
+                          itemCount: _timesPerDay,
+                          separatorBuilder: (_, __) =>
+                              const SizedBox(height: 10),
+                          itemBuilder: (context, i) {
+                            final t = _doseTimes[i];
+                            return Container(
+                              decoration: BoxDecoration(
+                                color: white,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: ListTile(
+                                title: Text(
+                                  'Dose ${i + 1}',
+                                  style: const TextStyle(
+                                    color: cardColor,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  t == null ? 'Tap to set time' : _fmt(t),
+                                  style: const TextStyle(color: cardColor),
+                                ),
+                                trailing: const Icon(
+                                  Icons.schedule,
+                                  color: cardColor,
+                                ),
+                                onTap: () => _pickDoseTime(i),
+                              ),
+                            );
+                          },
+                        ),
+                      )
+                    else
+                      const SizedBox(height: 12),
+
+                    SizedBox(
+                      width: double.infinity,
+                      height: 56,
+                      child: Material(
+                        color: green,
+                        borderRadius: BorderRadius.circular(18),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(18),
+                          onTap: _handlePrimaryAction,
+                          child: Row(
+                            children: [
+                              const SizedBox(width: 16),
+                              Expanded(
+                                child: Center(
+                                  child: Text(
+                                    titleText,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 22,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(
+                                width: 56,
+                                height: 56,
+                                child: Icon(
+                                  Icons.add,
+                                  color: Colors.white,
+                                  size: 34,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-            ),
-          ],
+            );
+          },
         ),
       ),
     );
   }
 
+  // ---------------- build ----------------
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
 
-    // Your design reference (phone you built on)
     const designW = 411.0;
     const designH = 914.0;
 
     final scaleW = size.width / designW;
     final scaleH = size.height / designH;
-
-    // Use the smaller one so it fits both directions
     final scale = (scaleW < scaleH ? scaleW : scaleH).clamp(0.8, 1.3);
 
     double s(double v) => v * scale;
-    double fs(double v) => v * scale; // font size scale
+    double fs(double v) => v * scale;
 
-    // ---- CENTERING HELPERS (keeps sizes, fixes offset on tablets) ----
-    // use your existing sizes, just center them in X
+    final configH = _step == _ConfigStep.doses ? s(560) : s(480);
+
     final double stripW = s(800);
     final double stripH = s(1383);
 
-    // keep the wheel size you already had; just center it
     final double wheelBoxH = s(1000);
-    final double wheelBoxW = size.width; // since you were using left+right=0
+    final double wheelBoxW = size.width;
 
     double cx(double w) => (size.width - w) / 2;
 
-    final bottomSlide = _configOpen ? const Offset(0, 0.30) : Offset.zero;
-    final wheelLocked = _pendingSlot;
-    final plusIsCentered = _wheelSelectedIndex == 0;
-    final checkDisabled = plusIsCentered || _configOpen || _pendingSlot;
+    final bottomSlide = (_configOpen || _infoOpen)
+        ? const Offset(0, 0.30)
+        : Offset.zero;
 
-    final labelText = _labelOverride ?? _centerPillName();
+    final wheelLocked = _pendingSlot;
 
     double leftFromDesignRight(double baseW, double baseRight) {
-      // baseW/baseRight are the ORIGINAL numbers you used on the phone design (411 wide)
       final elementW = s(baseW);
-
-      // where the element's center was on the 411-wide design:
       final designCenterX = designW / 2;
       final elementCenterX = designW - baseRight - (baseW / 2);
       final offsetFromCenter = elementCenterX - designCenterX;
-
-      // keep that same offset-from-center on any screen
       return (size.width / 2) + s(offsetFromCenter) - (elementW / 2);
     }
 
-    final logoSize = s(
-      150,
-    ).clamp(80.0, 150.0); // min on small screens, max like your phone
-
     return Scaffold(
+      resizeToAvoidBottomInset: false,
       backgroundColor: const Color(0xFFC75469),
-      body: Stack(
-        children: [
-          // ---- TOP / STATIC UI ----
-          Positioned(
-            right: 0,
-            left: 0,
-            top: s(0),
-            child: Container(
-              height: s(140), // important: use height here, not SizedBox.square
-              color: const Color(0xFFFF6D87),
+      body: MediaQuery.removeViewInsets(
+        context: context,
+        removeBottom: true,
+        child: Stack(
+          children: [
+            // --- TOP BAR ---
+            Positioned(
+              right: 0,
+              left: 0,
+              top: s(0),
+              child: Container(height: s(140), color: const Color(0xFFFF6D87)),
             ),
-          ),
-          Positioned(
-            right: 0,
-            left: 0,
-            top: s(140),
-            child: Container(
-              height: s(5),
-              color: const Color.fromARGB(255, 158, 52, 69),
-            ),
-          ),
-
-          // Logo (left)
-          Positioned(
-            top: s(24),
-            left: s(0),
-            right: s(185),
-            child: Opacity(
-              opacity: 0.75,
-              child: Image.asset(
-                'assets/images/pillchecker_logo.png',
-                width: s(150),
-                height: s(150),
+            Positioned(
+              right: 0,
+              left: 0,
+              top: s(140),
+              child: Container(
+                height: s(5),
+                color: const Color.fromARGB(255, 158, 52, 69),
               ),
             ),
-          ),
 
-          // Title (centered)
-          Positioned(
-            top: s(40),
-            left: 35,
-            right: 0,
-            child: Center(
-              child: Transform.scale(
-                scale: 0.5, // back to original
-                child: Text(
-                  'PillChecker',
-                  style: TextStyle(
-                    fontSize: fs(77.9),
-                    fontFamily: 'Amaranth',
-                    color: const Color(0xFF98404F),
-                    fontWeight: FontWeight.w400,
-                  ),
+            // --- LOGO (left) ---
+            Positioned(
+              top: s(24),
+              left: s(0),
+              right: s(185),
+              child: Opacity(
+                opacity: 0.75,
+                child: Image.asset(
+                  'assets/images/pillchecker_logo.png',
+                  width: s(150),
+                  height: s(150),
                 ),
               ),
             ),
-          ),
 
-          // ---- BOTTOM SECTION (centered wheel + centered strip) ----
-          IgnorePointer(
-            ignoring: _configOpen,
-            child: AnimatedSlide(
-              duration: const Duration(milliseconds: 320),
-              curve: Curves.easeInOut,
-              offset: bottomSlide,
-              child: Stack(
-                children: [
-                  // pill strip (WAS right: -195) -> now truly centered
-                  Positioned(
-                    left: cx(stripW),
-                    bottom: s(-900),
-                    child: ClipOval(
-                      child: Container(
-                        width: stripW,
-                        height: stripH,
-                        color: const Color(0xFFE72447),
-                      ),
-                    ),
-                  ),
-
-                  // wheel (keep your sizing, just explicitly centered)
-                  Positioned(
-                    left: cx(wheelBoxW),
-                    width: wheelBoxW,
-                    bottom: s(-85),
-                    height: wheelBoxH,
-                    child: PillWheel(
-                      onDeleteCentered: _deleteCenteredPill,
-                      controller: _wheelController,
-                      displayPillCount: _displayPillCount,
-                      realPillCount: _realPillCount,
-                      scrollEnabled: !wheelLocked,
-                      addEnabled: !wheelLocked,
-                      onSelectedChanged: (i) {
-                        // If selection changed, kill the "Pill Checked!" message immediately
-                        if (i != _wheelSelectedIndex) {
-                          _clearCheckedMessage();
-                        }
-
-                        setState(() => _wheelSelectedIndex = i);
-                      },
-
-                      onAddPressed: () {
-                        _startAddFlow(createNewSlot: true);
-                      },
-                    ),
-                  ),
-
-                  Positioned(
-                    left: leftFromDesignRight(400, 5),
-                    bottom: s(-1045),
-                    child: ClipOval(
-                      child: Container(
-                        width: s(400),
-                        height: s(1383),
-                        color: const Color(0xFFFF6D87),
-                      ),
-                    ),
-                  ),
-
-                  Positioned(
-                    left: leftFromDesignRight(175, 118),
-                    bottom: s(90),
-                    child: ClipOval(
-                      child: Container(
-                        width: s(175),
-                        height: s(175),
-                        color: const Color(0xFF0CF000),
-                      ),
-                    ),
-                  ),
-
-                  Positioned(
-                    left: leftFromDesignRight(155, 127.5),
-                    bottom: s(100),
-                    child: ClipOval(
-                      child: Container(
-                        width: s(155),
-                        height: s(155),
-                        color: const Color(0xFF8C1C2F),
-                      ),
-                    ),
-                  ),
-
-                  Positioned(
-                    left: leftFromDesignRight(135, 137),
-                    bottom: s(110),
-                    child: FutureBuilder<Map<String, dynamic>>(
-                      future: _loadCheckMap(),
-                      builder: (context, snap) {
-                        final pillIndex = _centerPillIndex;
-                        final map = snap.data ?? {};
-                        final checked = (pillIndex != null)
-                            ? _isPillCheckedNowSync(map, pillIndex)
-                            : false;
-
-                        final checkDisabled =
-                            !_centerIsRealPill || _configOpen || _pendingSlot;
-
-                        return AbsorbPointer(
-                          absorbing: checkDisabled,
-                          child: PillCheckButton(
-                            checked: checked,
-                            onChecked: _checkCenteredPill,
-                            size: s(135),
-                            baseColor: const Color(0xFFFF002E),
-                            fillColor: const Color(0xFF59FF56),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-
-                  // Bottom-left oval
-                  Positioned(
-                    left: s(-85),
-                    bottom: s(-100),
-                    child: ClipOval(
-                      child: Container(
-                        width: s(200),
-                        height: s(200),
-                        color: const Color(0xFF59FF56),
-                      ),
-                    ),
-                  ),
-
-                  // Bottom-right oval
-                  Positioned(
-                    right: s(-85),
-                    bottom: s(-100),
-                    child: ClipOval(
-                      child: Container(
-                        width: s(200),
-                        height: s(200),
-                        color: const Color(0xFFFFDF59),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-
-          // ---- CENTER PILL NAME (ON TOP OF STRIP) ----
-          Positioned(
-            left: s(0),
-            right: s(0),
-            bottom: s(490),
-            child: IgnorePointer(
-              child: AnimatedOpacity(
-                duration: const Duration(milliseconds: 120),
-                curve: Curves.easeInOut,
-                opacity: _showPillLabel ? 1.0 : 0.0,
-                child: Center(
+            // --- TITLE (center) ---
+            Positioned(
+              top: s(40),
+              left: 35,
+              right: 0,
+              child: Center(
+                child: Transform.scale(
+                  scale: 0.5,
                   child: Text(
-                    _labelOverride ?? _centerPillName(),
-                    textAlign: TextAlign.center,
+                    'PillChecker',
                     style: TextStyle(
+                      fontSize: fs(77.9),
                       fontFamily: 'Amaranth',
-                      fontSize: fs(25),
-                      color: const Color.fromARGB(255, 237, 179, 189),
+                      color: const Color(0xFF98404F),
                       fontWeight: FontWeight.w400,
                     ),
                   ),
                 ),
               ),
             ),
-          ),
 
-          // ---- TOP OVALS ----
-          Positioned(
-            left: s(-75),
-            top: s(40),
-            child: ClipOval(
-              child: Container(
-                width: s(150),
-                height: s(85),
-                color: const Color(0xFFFFFFFF),
+            // --- BOTTOM ZONE ---
+            IgnorePointer(
+              ignoring: _configOpen || _infoOpen,
+              child: AnimatedSlide(
+                duration: const Duration(milliseconds: 320),
+                curve: Curves.easeInOut,
+                offset: bottomSlide,
+                child: Stack(
+                  children: [
+                    // --- RED STRIP (background) ---
+                    Positioned(
+                      left: cx(stripW),
+                      bottom: s(-910),
+                      child: ClipOval(
+                        child: Container(
+                          width: stripW,
+                          height: stripH,
+                          color: const Color(0xFFE72447),
+                        ),
+                      ),
+                    ),
+
+                    // --- DAILY COMPLETION CIRCLE (auto fill animation) ---
+                    Positioned(
+                      left: cx(s(120)),
+                      bottom: s(600),
+                      child: FutureBuilder<Map<String, dynamic>>(
+                        future: _checkMapFuture,
+                        builder: (context, snap) {
+                          final map = snap.data ?? {};
+                          final done = _areAllPillsComplete(map);
+
+                          return DailyCompletionCircle(
+                            done: done,
+                            size: s(120),
+                            baseColor: const Color(0xFFE72447),
+                            fillColor: const Color(0xFF59FF56),
+                          );
+                        },
+                      ),
+                    ),
+
+                    // --- PILLBOX PLACEHOLDER PINK OVAL (big interior area) ---
+                    Positioned(
+                      left: leftFromDesignRight(400, 5),
+                      bottom: s(-1055),
+                      child: ClipOval(
+                        child: Container(
+                          width: s(400),
+                          height: s(1383),
+                          color: const Color(0xFFFF6D87),
+                        ),
+                      ),
+                    ),
+
+                    // --- WHEEL (below button/rings so it doesn't steal touches) ---
+                    Positioned(
+                      left: cx(wheelBoxW),
+                      width: wheelBoxW,
+                      bottom: s(-95),
+                      height: wheelBoxH,
+                      child: PillWheel(
+                        onDeleteCentered: _deleteCenteredPill,
+                        controller: _wheelController,
+                        displayPillCount: _displayPillCount,
+                        realPillCount: _realPillCount,
+                        scrollEnabled: !wheelLocked,
+                        addEnabled: !wheelLocked,
+                        onSelectedChanged: (i) {
+                          if (i != _wheelSelectedIndex) _clearCheckedMessage();
+                          setState(() => _wheelSelectedIndex = i);
+                          _scheduleCenteredDoseBoundaryRefresh();
+                        },
+                        onAddPressed: () => _startAddFlow(createNewSlot: true),
+                      ),
+                    ),
+
+                    // --- GREEN OUTER RING ---
+                    Positioned(
+                      left: leftFromDesignRight(175, 118),
+                      bottom: s(80),
+                      child: ClipOval(
+                        child: Container(
+                          width: s(175),
+                          height: s(175),
+                          color: const Color(0xFF0CF000),
+                        ),
+                      ),
+                    ),
+
+                    // --- DARK RED RING ---
+                    Positioned(
+                      left: leftFromDesignRight(155, 127.5),
+                      bottom: s(90),
+                      child: ClipOval(
+                        child: Container(
+                          width: s(155),
+                          height: s(155),
+                          color: const Color(0xFF8C1C2F),
+                        ),
+                      ),
+                    ),
+
+                    // --- CHECK BUTTON (last so it gets touches) ---
+                    Positioned(
+                      left: leftFromDesignRight(135, 137),
+                      bottom: s(100),
+                      child: FutureBuilder<Map<String, dynamic>>(
+                        future: _checkMapFuture,
+                        builder: (context, snap) {
+                          final pillIndex = _centerPillIndex;
+                          final map = snap.data ?? {};
+
+                          // only keep this line if you actually declared _lastCheckMapCache
+                          _lastCheckMapCache = map;
+
+                          bool checked = false;
+                          if (pillIndex != null) {
+                            final doses = _doseTimesForPill(pillIndex);
+                            final w = _computeDoseWindow(
+                              now: DateTime.now(),
+                              dosesSorted: doses,
+                            );
+                            final cycleIso = w.cycleStart.toIso8601String();
+
+                            checked = _isDoseCheckedSync(
+                              map,
+                              pillIndex,
+                              cycleIso,
+                              w.doseIndex,
+                            );
+                          }
+
+                          final bool disable =
+                              _configOpen ||
+                              _pendingSlot ||
+                              (_wheelSelectedIndex == 0) ||
+                              (pillIndex == null);
+
+                          return AbsorbPointer(
+                            absorbing: disable,
+                            child: PillCheckButton(
+                              checked: checked,
+                              onChecked: _checkCenteredPill,
+                              size: s(135),
+                              baseColor: const Color(0xFFFF002E),
+                              fillColor: const Color(0xFF59FF56),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+
+                    // --- Bottom-left oval ---
+                    Positioned(
+                      left: s(-85),
+                      bottom: s(-100),
+                      child: ClipOval(
+                        child: Container(
+                          width: s(200),
+                          height: s(200),
+                          color: const Color(0xFF59FF56),
+                        ),
+                      ),
+                    ),
+
+                    // --- INFO BUTTON (bottom-left green i) ---
+                    Positioned(
+                      left: s(5),
+                      bottom: s(5),
+                      child: IgnorePointer(
+                        ignoring:
+                            _configOpen || _pendingSlot || !_centerIsRealPill,
+                        child: Opacity(
+                          opacity:
+                              (_configOpen ||
+                                  _pendingSlot ||
+                                  !_centerIsRealPill)
+                              ? 0.45
+                              : 1.0,
+                          child: GestureDetector(
+                            onTap: _openInfoPanel,
+                            child: SizedBox(
+                              width: s(82),
+                              height: s(82),
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  // green base
+                                  Container(
+                                    decoration: const BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      color: Color(0xFF59FF56),
+                                    ),
+                                  ),
+
+                                  // dark ring
+                                  Container(
+                                    width: s(74),
+                                    height: s(74),
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      border: Border.all(
+                                        width: s(5),
+                                        color: const Color.fromARGB(
+                                          255,
+                                          255,
+                                          255,
+                                          255,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+
+                                  // "i" (dot + stem) built from shapes
+                                  Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Container(
+                                        width: s(10),
+                                        height: s(10),
+                                        decoration: const BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          color: Color.fromARGB(
+                                            255,
+                                            255,
+                                            255,
+                                            255,
+                                          ),
+                                        ),
+                                      ),
+                                      SizedBox(height: s(6)),
+                                      Container(
+                                        width: s(10),
+                                        height: s(30),
+                                        decoration: BoxDecoration(
+                                          color: const Color.fromARGB(
+                                            255,
+                                            255,
+                                            255,
+                                            255,
+                                          ),
+                                          borderRadius: BorderRadius.circular(
+                                            s(8),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    // --- Bottom-right oval ---
+                    Positioned(
+                      right: s(-85),
+                      bottom: s(-100),
+                      child: ClipOval(
+                        child: Container(
+                          width: s(200),
+                          height: s(200),
+                          color: const Color(0xFFFFDF59),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-          Positioned(
-            right: s(-75),
-            top: s(40),
-            child: ClipOval(
-              child: Container(
-                width: s(150),
-                height: s(85),
-                color: const Color(0xFFB4B4B4),
+
+            // --- WARNING ICON (bottom-right) ---
+            Positioned(
+              right: s(5),
+              bottom: s(5),
+              child: IgnorePointer(
+                ignoring: _configOpen || _infoOpen,
+                child: Opacity(
+                  opacity: (_configOpen || _infoOpen) ? 0.45 : 1.0,
+                  child: GestureDetector(
+                    onTap: () {
+                      // TODO: override button functionality later
+                    },
+                    child: ClipOval(
+                      child: Container(
+                        width: s(82),
+                        height: s(82),
+                        color: const Color(0xFFFFDF59),
+                        child: Center(
+                          child: Icon(
+                            Icons.warning_rounded,
+                            size: s(75),
+                            color: const Color(0xFFE72447),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               ),
             ),
-          ),
 
-          // ---- CONFIG PANEL LAST (ON TOP) ----
-          AnimatedPositioned(
-            duration: const Duration(milliseconds: 320),
-            curve: Curves.easeInOut,
-            left: s(18),
-            right: s(18),
-            top: _configOpen
-                ? s(160)
-                : MediaQuery.of(context).size.height + s(50),
-            height: s(420),
-            child: _configPanel(),
+            // --- CENTER PILL NAME ---
+            Positioned(
+              left: s(0),
+              right: s(0),
+              bottom: s(480),
+              child: IgnorePointer(
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 120),
+                  curve: Curves.easeInOut,
+                  opacity: _showPillLabel ? 1.0 : 0.0,
+                  child: Center(
+                    child: Builder(
+                      builder: (context) {
+                        final pillIndex = _centerPillIndex;
+
+                        String displayName =
+                            _labelOverride ?? _centerPillName();
+
+                        if (_labelOverride == null && pillIndex != null) {
+                          final doses = _doseTimesForPill(pillIndex);
+                          if (doses.length > 1) {
+                            final w = _computeDoseWindow(
+                              now: DateTime.now(),
+                              dosesSorted: doses,
+                            );
+                            displayName =
+                                '${_centerPillName()} (Dose ${w.doseIndex + 1})';
+                          }
+                        }
+
+                        return Text(
+                          displayName,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontFamily: 'Amaranth',
+                            fontSize: fs(25),
+                            color: const Color.fromARGB(255, 237, 179, 189),
+                            fontWeight: FontWeight.w400,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            // --- TOP OVALS ---
+            Positioned(
+              left: s(-75),
+              top: s(40),
+              child: ClipOval(
+                child: Container(
+                  width: s(150),
+                  height: s(85),
+                  color: const Color(0xFFFFFFFF),
+                ),
+              ),
+            ),
+
+            // --- DIRECTORY ICON (top-left) ---
+            Positioned(
+              left: s(-10),
+              top: s(45),
+              child: IgnorePointer(
+                ignoring: _configOpen || _infoOpen,
+                child: Opacity(
+                  opacity: (_configOpen || _infoOpen) ? 0.45 : 1.0,
+                  child: SizedBox(
+                    width: s(88),
+                    height: s(70),
+                    child: Center(
+                      child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(s(999)),
+                          onTap: () {
+                            // TODO: directory button functionality later
+                          },
+                          child: SizedBox(
+                            width: s(80),
+                            height: s(65),
+                            child: Center(
+                              child: Icon(
+                                Icons
+                                    .format_list_bulleted, // ✅ closest to "dots + lines"
+                                size: s(56),
+                                color: const Color.fromARGB(
+                                  255,
+                                  60,
+                                  59,
+                                  59,
+                                ).withOpacity(0.70),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            Positioned(
+              right: s(-75),
+              top: s(40),
+              child: ClipOval(
+                child: Container(
+                  width: s(150),
+                  height: s(85),
+                  color: const Color(0xFFB4B4B4),
+                ),
+              ),
+            ),
+            Positioned(
+              right: s(-45),
+              top: s(40),
+              child: SizedBox(
+                width: s(150),
+                height: s(85),
+                child: Center(
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(
+                        s(999),
+                      ), // big soft circle
+                      onTap: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const SettingsScreen(),
+                          ),
+                        );
+                      },
+                      child: SizedBox(
+                        width: s(80), // ✅ use the whole oval area
+                        height: s(75),
+                        child: Center(
+                          child: Icon(
+                            Icons.settings,
+                            size: s(60), // ✅ this will actually look big now
+                            color: const Color.fromARGB(
+                              255,
+                              60,
+                              59,
+                              59,
+                            ).withOpacity(0.65),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            // --- INFO PANEL (topmost-ish) ---
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOut,
+              left: s(18),
+              right: s(18),
+              top: _infoOpen
+                  ? s(165)
+                  : MediaQuery.of(context).size.height + s(50),
+              height: s(520),
+              child: Builder(
+                builder: (_) {
+                  final idx = _centerPillIndex;
+                  final name = (idx == null) ? '' : pillNames[idx];
+
+                  final doses = (idx == null)
+                      ? <TimeOfDay>[]
+                      : _doseTimesForPill(idx);
+                  final doseLabels = doses.map(_fmt).toList();
+
+                  return PillInfoPanel(
+                    pillName: name,
+                    doseTimesLabel: doseLabels,
+                    onClose: _closeInfoPanel,
+                    onEdit: () {
+                      final pillIndex = _centerPillIndex;
+                      if (pillIndex == null) return;
+                      _startEditFlow(pillIndex);
+                    },
+                  );
+                },
+              ),
+            ),
+
+            // --- CONFIG PANEL (topmost) ---
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOut,
+              left: s(18),
+              right: s(18),
+              top: _configOpen
+                  ? s(160)
+                  : MediaQuery.of(context).size.height + s(50),
+              height: configH,
+              child: _configPanel(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class DayCompleteCircle extends StatelessWidget {
+  const DayCompleteCircle({super.key, required this.complete, this.size = 120});
+
+  final bool complete;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final baseRed = const Color(0xFFFF002E);
+    final green = const Color(0xFF59FF56);
+
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          ClipOval(
+            child: Container(
+              width: size,
+              height: size,
+              color: complete ? green : baseRed,
+            ),
+          ),
+          AnimatedOpacity(
+            duration: const Duration(milliseconds: 180),
+            opacity: complete ? 1.0 : 0.0,
+            child: Icon(Icons.check, color: Colors.white, size: size * 0.55),
           ),
         ],
       ),
