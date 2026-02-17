@@ -6,7 +6,9 @@ on:
     branches: [ dev ]
 
 jobs:
-  build:
+
+  android:
+    name: Android Build
     runs-on: ubuntu-latest
 
     steps:
@@ -17,6 +19,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          cache: true
 
       - name: Install Dependencies
         run: flutter pub get
@@ -27,11 +30,44 @@ jobs:
       - name: Run Tests
         run: flutter test
 
-      - name: Build Debug APK
-        run: flutter build apk --debug
+      - name: Build Release APK
+        run: flutter build apk --release
 
-      - name: Upload Debug APK
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: debug-apk
-          path: build/app/outputs/flutter-apk/app-debug.apk
+          name: android-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+
+  ios:
+    name: iOS Build
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Ensure iOS dependencies
+        run: |
+          cd ios
+          pod install
+          cd ..
+
+      - name: Build iOS IPA (no codesign)
+        run: flutter build ipa --no-codesign
+
+      - name: Upload iOS IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: build/ios/ipa/*.ipa
