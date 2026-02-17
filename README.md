@@ -26,3 +26,4 @@ An app that helps confirm you’ve taken your medications for the day.
 git clone https://github.com/yadava17/pillchecker.git
 cd pillchecker
 ```
+CI test update
