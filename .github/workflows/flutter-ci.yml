@@ -64,7 +64,7 @@ jobs:
           cd ..
 
       - name: Build iOS IPA (no codesign)
-        run: flutter build ipa --no-codesign
+        run: flutter build ipa --release --no-codesign
 
       - name: Upload iOS IPA
         uses: actions/upload-artifact@v4
