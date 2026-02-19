@@ -43,3 +43,11 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# CocoaPods (local only)
+ios/Podfile
+ios/Podfile.lock
+ios/Pods/
+macos/Podfile
+macos/Podfile.lock
+macos/Pods/
