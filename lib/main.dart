@@ -2,9 +2,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:pillchecker/app/app.dart';
 import 'package:pillchecker/services/notification_service.dart';
+import 'package:rive/rive.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  await RiveNative.init();
+
   runApp(const App());
 
   WidgetsBinding.instance.addPostFrameCallback((_) {

@@ -16,6 +16,8 @@ dependencies:
   flutter_timezone: ^4.1.1
   timezone: ^0.10.1
 
+  rive: ^0.14.2
+
   cupertino_icons: ^1.0.8
 
 dev_dependencies:
@@ -32,6 +34,7 @@ flutter:
     - assets/images/pillchecker_logo.png
     - assets/images/pill_placeholder.png
     - assets/images/pill_splash_banner.png
+    - assets/rive/pillbox.riv
 
   fonts:
     - family: Amaranth

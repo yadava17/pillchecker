@@ -10,6 +10,8 @@ import 'package:pillchecker/services/notification_service.dart';
 import 'package:pillchecker/widgets/daily_completion_circle.dart';
 import 'package:pillchecker/screens/settings/settings_screen.dart';
 import 'package:pillchecker/widgets/pill_info_panel.dart';
+import 'package:pillchecker/widgets/weekly_pillbox_organizer.dart';
+import 'package:pillchecker/constants/prefs_keys.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -20,7 +22,7 @@ class HomeScreen extends StatefulWidget {
 
 enum _ConfigStep { name, config, doses }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // -------- prefs keys --------
   static const _pillNamesKey = 'pill_names';
   static const _pillTimesKey =
@@ -80,10 +82,33 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _labelOverride;
   bool _showPillLabel = true;
 
+  final FocusNode _nameFocus = FocusNode();
+
   late final FixedExtentScrollController _wheelController =
       FixedExtentScrollController(initialItem: 1);
 
   bool get _centerIsRealPill => _centerPillIndex != null;
+
+  int _todayIndex = 3; // default Wed for safety
+  bool _allowDailyFillAnim = true; // will gate the DailyCompletionCircle fill
+  static const Duration _pillboxOpenAnim = Duration(milliseconds: 650);
+  int? _debugDayOverride; // null = real day
+  int _lastSeenDayKey = -1; // store last "day stamp"
+
+  int get _realTodayIndex => _debugDayOverride ?? (DateTime.now().weekday % 7);
+
+  final _pillboxKey = GlobalKey<WeeklyPillboxOrganizerState>();
+  int _pillboxResetToken = 0;
+
+  // what day the pillbox is CURRENTLY positioned to (for sliding)
+  int _pillboxVisualDay = 3; // default Wed so your current alignment is sane
+
+  // do we allow the pillbox to OPEN yet (we keep it closed during slide)
+  bool _allowPillboxOpen = false;
+
+  // slide timing
+  Duration _pillboxSlideDur = const Duration(milliseconds: 650);
+  Timer? _pillboxSlideTimer;
 
   // stable-ish notification id generator
   int _newNotifId() =>
@@ -93,7 +118,18 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _lastSeenDayKey =
+        DateTime.now().year * 10000 +
+        DateTime.now().month * 100 +
+        DateTime.now().day;
+    Timer(_pillboxOpenAnim, () {
+      if (!mounted) return;
+      setState(() => _allowDailyFillAnim = true);
+    });
     _loadAndMaybeAutoOpen();
+    _coldStartOpenToday();
     _scheduleGlobalDayBoundaryRefresh();
     _scheduleGlobalBoundaryRefresh();
     _checkMapFuture = _loadCheckMap();
@@ -103,13 +139,97 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _pillboxSlideTimer?.cancel();
+    _nameFocus.dispose();
+
     _labelTimer?.cancel();
     _doseBoundaryTimer?.cancel();
     _dayBoundaryTimer?.cancel();
+    _globalBoundaryTimer?.cancel();
+
     _nameController.dispose();
     _wheelController.dispose();
-    _globalBoundaryTimer?.cancel();
+
     super.dispose();
+  }
+
+  int _yesterdayOf(int day) => (day + 6) % 7; // 0..6
+
+  int _slideDistanceSteps(int from, int to) {
+    // Your special rule:
+    // Sunday should start on Saturday and slide "all the way back"
+    // (big distance). Since from=yesterday, only Sunday needs special.
+    if (from == 6 && to == 0) return 6;
+
+    // normal days: just 1 step
+    return (to - from).abs();
+  }
+
+  Duration _durationForSlideSteps(int steps) {
+    // Tune these if you want:
+    const minMs = 520;
+    const perStepMs = 180;
+    const maxMs = 1250;
+
+    final ms = (minMs + steps * perStepMs).clamp(minMs, maxMs);
+    return Duration(milliseconds: ms);
+  }
+
+  void _startNewDaySequence({required int today}) {
+    final from = _yesterdayOf(today);
+
+    // Reset Rive back to idle/closed (since no CLOSE triggers)
+    // so yesterday's flap doesn't remain open.
+    setState(() {
+      _todayIndex = today;
+
+      _pillboxResetToken++;
+      _allowPillboxOpen = false;
+
+      // start visually on yesterday
+      _pillboxVisualDay = from;
+
+      // gate daily fill too
+      _allowDailyFillAnim = false;
+
+      // compute slide duration
+      final steps = _slideDistanceSteps(from, today);
+      _pillboxSlideDur = _durationForSlideSteps(steps);
+    });
+
+    // 1 frame later: animate to today
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+
+      setState(() {
+        _pillboxVisualDay = today; // triggers AnimatedPositioned slide
+      });
+
+      // after slide completes: allow OPEN trigger + start daily fill gate
+      _pillboxSlideTimer?.cancel();
+      _pillboxSlideTimer = Timer(_pillboxSlideDur, () {
+        if (!mounted) return;
+
+        setState(() {
+          _allowPillboxOpen = true;
+        });
+
+        // now start your open-animation wait for the daily circle
+        Timer(_pillboxOpenAnim, () {
+          if (!mounted) return;
+          setState(() => _allowDailyFillAnim = true);
+        });
+      });
+    });
+  }
+
+  Future<void> _resyncNotifsAfterPillChange() async {
+    // Pull latest mode/early/late into NotificationService (optional but good)
+    await NotificationService.loadUserNotificationSettings();
+
+    // Rebuild schedules using the current prefs + current early/late values
+    await _syncDoseNotifications(forceReschedule: true);
   }
 
   // ---------------- helpers: time ----------------
@@ -133,6 +253,25 @@ class _HomeScreenState extends State<HomeScreen> {
 
   DateTime _minusMinutes(DateTime dt, int m) =>
       dt.subtract(Duration(minutes: m));
+
+  void _coldStartOpenToday() {
+    // DEBUG: set to 0..6 (Sun..Sat). Set to null to use real day.
+    // _debugDayOverride = 5; // example: Friday
+
+    // DateTime.weekday: Mon=1..Sun=7
+    final wd = DateTime.now().weekday;
+
+    // Convert to Sun=0..Sat=6, but allow override for testing
+    final today = _debugDayOverride ?? (wd % 7);
+
+    // first open of the day sequence:
+    // - reset pillbox to idle (closed)
+    // - start centered on yesterday
+    // - slide to today
+    // - THEN allow today's flap to open
+    // - THEN allow daily completion fill animation
+    _startNewDaySequence(today: today);
+  }
 
   // ---------------- helpers: dose lists ----------------
   List<TimeOfDay> _doseTimesForPill(int pillIndex) {
@@ -252,6 +391,161 @@ class _HomeScreenState extends State<HomeScreen> {
     final parts = stored.split('|');
     if (parts.length != 2) return (cycleIso: '', mask: 0);
     return (cycleIso: parts[0], mask: int.tryParse(parts[1]) ?? 0);
+  }
+
+  Future<void> _syncDoseNotifications({bool forceReschedule = false}) async {
+    final prefs = await SharedPreferences.getInstance();
+
+    //  ALWAYS pull latest notif settings into prefs->service memory
+    await NotificationService.loadUserNotificationSettings();
+
+    // Load latest from prefs (source of truth)
+    final names = prefs.getStringList(_pillNamesKey) ?? [];
+    final doseTimes = _decodeListOfStringLists(
+      prefs.getString(_pillDoseTimesKey),
+    );
+    final notifIds = _decodeListOfIntLists(
+      prefs.getString(_pillDoseNotifIdsKey),
+    );
+
+    // ---- Notification settings (read directly from prefs) ----
+    //  ONLY the v1 keys (remove old redundant keys)
+    final mode = prefs.getString(kNotifModeKey) ?? 'standard';
+    final earlyMin = prefs.getInt(kEarlyLeadMinKey) ?? 30;
+    final lateMin = prefs.getInt(kLateAfterMinKey) ?? 30;
+
+    debugPrint(
+      'SYNC NOTIFS: force=$forceReschedule mode=$mode earlyMin=$earlyMin lateMin=$lateMin names=${names.length}',
+    );
+
+    //  If forcing, do a clean wipe so edits ALWAYS apply (fixes your “edit pill after settings” bug)
+    if (forceReschedule) {
+      await NotificationService.cancelAll();
+      debugPrint('SYNC NOTIFS: cancelAll() done');
+    }
+
+    // Make lists align in length
+    while (doseTimes.length < names.length) doseTimes.add(['08:00']);
+    if (doseTimes.length > names.length) {
+      doseTimes.removeRange(names.length, doseTimes.length);
+    }
+
+    while (notifIds.length < names.length) notifIds.add(<int>[]);
+    if (notifIds.length > names.length) {
+      notifIds.removeRange(names.length, notifIds.length);
+    }
+
+    bool changed = false;
+
+    for (int pillIndex = 0; pillIndex < names.length; pillIndex++) {
+      final pillName = names[pillIndex];
+      final timesForPill = doseTimes[pillIndex];
+      final idsForPill = notifIds[pillIndex];
+
+      final doseCount = timesForPill.length;
+      final wantLen = doseCount * 3; // ✅ 3 notifications per dose
+
+      // MIGRATION: old format had 1 id per dose. Convert to 3 ids per dose.
+      // Old ID becomes MAIN, and we generate EARLY + LATE.
+      if (doseCount > 0 && idsForPill.length == doseCount) {
+        final expanded = <int>[];
+        for (int d = 0; d < doseCount; d++) {
+          final main = idsForPill[d];
+          expanded.add(_newNotifId()); // early
+          expanded.add(main); // main (keep old)
+          expanded.add(_newNotifId()); // late
+        }
+        notifIds[pillIndex] = expanded;
+        changed = true;
+      }
+
+      // Refresh local reference (might have been migrated)
+      final fixedIds = notifIds[pillIndex];
+
+      // If notifIds list is longer than needed, trim
+      if (fixedIds.length > wantLen) {
+        notifIds[pillIndex] = fixedIds.take(wantLen).toList();
+        changed = true;
+      }
+
+      // If notifIds list is shorter than needed, generate missing IDs
+      while (notifIds[pillIndex].length < wantLen) {
+        notifIds[pillIndex].add(_newNotifId());
+        changed = true;
+      }
+
+      // Now schedule each dose using the stored IDs so it never duplicates
+      for (int doseIndex = 0; doseIndex < doseCount; doseIndex++) {
+        final base = doseIndex * 3;
+        final earlyId = notifIds[pillIndex][base + 0];
+        final mainId = notifIds[pillIndex][base + 1];
+        final lateId = notifIds[pillIndex][base + 2];
+
+        final t = _strToTime(timesForPill[doseIndex]);
+
+        debugPrint(
+          'SYNC NOTIFS: pill="$pillName" dose=${doseIndex + 1}/$doseCount '
+          'time=${timesForPill[doseIndex]} ids=(E:$earlyId M:$mainId L:$lateId)',
+        );
+
+        if (mode == 'off') {
+          // make sure nothing lingers
+          await NotificationService.cancel(earlyId);
+          await NotificationService.cancel(mainId);
+          await NotificationService.cancel(lateId);
+          continue;
+        }
+
+        // MAIN always in basic + standard
+        await NotificationService.scheduleDailyDoseReminder(
+          id: mainId,
+          pillName: pillName,
+          doseNumber1Based: doseIndex + 1,
+          time: t,
+          totalDoses: doseCount,
+        );
+
+        if (mode == 'standard') {
+          // DAILY repeating early/late
+          await NotificationService.scheduleDailyDoseEarlyReminder(
+            id: earlyId,
+            pillName: pillName,
+            doseNumber1Based: doseIndex + 1,
+            time: t,
+            totalDoses: doseCount,
+          );
+
+          await NotificationService.scheduleDailyDoseLateReminder(
+            id: lateId,
+            pillName: pillName,
+            doseNumber1Based: doseIndex + 1,
+            time: t,
+            totalDoses: doseCount,
+          );
+        } else {
+          // basic mode => ensure early/late are not lingering
+          await NotificationService.cancel(earlyId);
+          await NotificationService.cancel(lateId);
+        }
+      }
+    }
+
+    // Persist any fixes to the ID structure
+    if (changed) {
+      await prefs.setString(_pillDoseNotifIdsKey, jsonEncode(notifIds));
+    }
+
+    //  Always update local state (even if no ID migration happened)
+    if (mounted) {
+      setState(() {
+        pillDoseNotifIds = notifIds;
+        pillDoseTimes = doseTimes;
+        pillNames = names;
+      });
+    }
+
+    // Optional: dump pending after scheduling (remove later)
+    await NotificationService.debugDumpPending('after_sync');
   }
 
   String _packCycleAndMask(String cycleIso, int mask) => '$cycleIso|$mask';
@@ -599,6 +893,75 @@ class _HomeScreenState extends State<HomeScreen> {
     return pillNames[slot];
   }
 
+  double _leftFromDesignRight(
+    double baseW,
+    double baseRight,
+    Size screenSize,
+    double Function(double) s,
+    double designW,
+  ) {
+    final elementW = s(baseW);
+    final designCenterX = designW / 2;
+    final elementCenterX = designW - baseRight - (baseW / 2);
+    final offsetFromCenter = elementCenterX - designCenterX;
+    return (screenSize.width / 2) + s(offsetFromCenter) - (elementW / 2);
+  }
+
+  double _pillboxLeftForDay({
+    required Size size,
+    required double Function(double) s,
+    required double designW,
+    required int todayIndex, // 0=Sun..6=Sat
+  }) {
+    final wedLeft = _leftFromDesignRight(400, 198, size, s, designW);
+
+    const base = 92.6;
+    const growth = 0.4;
+
+    double cumulative(int day) {
+      // sum_{k=0}^{day-1} (base + growth*k)
+      // = base*day + growth*(day-1)*day/2
+      return (base * day) + (growth * (day - 1) * day / 2.0);
+    }
+
+    const anchor = 3; // Wednesday
+    final shiftFromWed = cumulative(todayIndex) - cumulative(anchor);
+
+    const tweak = <double>[
+      -0.2, // Sun
+      -0.4, // Mon
+      0.0, // Tue
+      0.0, // Wed (anchor)
+      -0.4, // Thu
+      -1.1, // Fri
+      -2.3, // Sat
+    ];
+
+    final correctedShift = shiftFromWed + tweak[todayIndex];
+
+    return wedLeft - s(correctedShift);
+
+    // If it moves the wrong way, flip the sign:
+    // return wedLeft + s(shiftFromWed);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+
+    final now = DateTime.now();
+    final dayKey = now.year * 10000 + now.month * 100 + now.day;
+
+    if (dayKey == _lastSeenDayKey) return; // same day, nothing to do
+    _lastSeenDayKey = dayKey;
+
+    // new day → recompute day index (Sun=0..Sat=6, allow override)
+    final newToday = _debugDayOverride ?? (now.weekday % 7);
+
+    //run the full "yesterday -> slide -> open today" sequence
+    _startNewDaySequence(today: newToday);
+  }
+
   // ---------------- UI label helpers ----------------
   void _hidePillLabelNow() {
     if (_showPillLabel) setState(() => _showPillLabel = false);
@@ -617,6 +980,21 @@ class _HomeScreenState extends State<HomeScreen> {
     _labelTimer = null;
     if (!mounted) return;
     setState(() => _labelOverride = null);
+  }
+
+  void _editNameAgain() {
+    setState(() => _step = _ConfigStep.name);
+
+    // focus AFTER rebuild so the TextField exists
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _nameFocus.requestFocus();
+
+      // optional: put cursor at end
+      _nameController.selection = TextSelection.fromPosition(
+        TextPosition(offset: _nameController.text.length),
+      );
+    });
   }
 
   // ---------------- onboarding ----------------
@@ -668,6 +1046,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final savedNames = prefs.getStringList(_pillNamesKey) ?? [];
     final savedTimes = prefs.getStringList(_pillTimesKey) ?? [];
+
+    final early = prefs.getInt(kEarlyLeadMinKey) ?? 30;
+    final late = prefs.getInt(kLateAfterMinKey) ?? 30;
 
     // align legacy times to names
     final alignedTimes = List<String>.from(savedTimes);
@@ -722,6 +1103,9 @@ class _HomeScreenState extends State<HomeScreen> {
       pillDoseTimes = loadedDoseTimes;
       pillDoseNotifIds = loadedDoseNotifIds;
     });
+
+    // After loading pills, sync notifications to prevent old schedules / duplicates
+    await _syncDoseNotifications(forceReschedule: true);
 
     if (savedNames.isEmpty && mounted) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -814,7 +1198,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (_timesPerDay == 1) {
         if (_singleDoseTime == null) return;
 
-        // ✅ if editing, update; otherwise save new
+        //  if editing, update; otherwise save new
         if (_isEditing) {
           _updatePill();
         } else {
@@ -824,7 +1208,7 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _step = _ConfigStep.doses;
 
-          // ✅ if editing, prefill the existing times (so they can tweak them)
+          //  if editing, prefill the existing times (so they can tweak them)
           // otherwise create empty slots
           if (_isEditing) {
             final idx = _editingIndex;
@@ -854,7 +1238,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // ---------------- SAVE pill (multi-dose) ----------------
+  // ---------------- SAVE pill ----------------
   Future<void> _savePill() async {
     _showPillLabelAfterSlide();
 
@@ -927,6 +1311,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _setCheckMapAndRebuild(checkMap);
     _refreshCheckMapFuture();
 
+    await _resyncNotifsAfterPillChange();
+
+
     setState(() {
       pillNames = updatedNames;
       pillTimes = updatedTimes;
@@ -937,7 +1324,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _configOpen = false;
       _step = _ConfigStep.name;
     });
-
+    await _syncDoseNotifications(forceReschedule: true);
     _showPillLabelAfterSlide();
     _centerWheelOn(1 + (updatedNames.length - 1));
     _scheduleGlobalBoundaryRefresh();
@@ -1023,6 +1410,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _setCheckMapAndRebuild(checkMap);
     _refreshCheckMapFuture();
 
+    await _resyncNotifsAfterPillChange();
+
+
     setState(() {
       pillNames = updatedNames;
       pillTimes = updatedTimes;
@@ -1096,6 +1486,8 @@ class _HomeScreenState extends State<HomeScreen> {
       _pillDoseNotifIdsKey,
       jsonEncode(updatedDoseNotifIds),
     );
+
+    await _syncDoseNotifications(forceReschedule: true);
 
     // shift check map indices down
     final checkMap = await _loadCheckMap();
@@ -1227,6 +1619,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         Expanded(
                           child: (_step == _ConfigStep.name)
                               ? TextField(
+                                  focusNode: _nameFocus,
                                   controller: _nameController,
                                   style: const TextStyle(
                                     color: white,
@@ -1238,16 +1631,32 @@ class _HomeScreenState extends State<HomeScreen> {
                                     border: InputBorder.none,
                                   ),
                                 )
-                              : Text(
-                                  _nameController.text.trim(),
-                                  style: const TextStyle(
-                                    color: white,
-                                    fontSize: 22,
-                                    fontWeight: FontWeight.w600,
+                              : InkWell(
+                                  onTap: _editNameAgain, // tap name to edit
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          _nameController.text.trim(),
+                                          style: const TextStyle(
+                                            color: white,
+                                            fontSize: 22,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      const Icon(
+                                        Icons.edit,
+                                        color: Colors.white70,
+                                        size: 20,
+                                      ), // ✅ cue
+                                    ],
                                   ),
-                                  overflow: TextOverflow.ellipsis,
                                 ),
                         ),
+
                         IconButton(
                           onPressed: _cancelAddFlow,
                           icon: const Icon(Icons.close, color: white),
@@ -1456,14 +1865,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final wheelLocked = _pendingSlot;
 
-    double leftFromDesignRight(double baseW, double baseRight) {
-      final elementW = s(baseW);
-      final designCenterX = designW / 2;
-      final elementCenterX = designW - baseRight - (baseW / 2);
-      final offsetFromCenter = elementCenterX - designCenterX;
-      return (size.width / 2) + s(offsetFromCenter) - (elementW / 2);
-    }
-
     return Scaffold(
       resizeToAvoidBottomInset: false,
       backgroundColor: const Color(0xFFC75469),
@@ -1479,6 +1880,36 @@ class _HomeScreenState extends State<HomeScreen> {
               top: s(0),
               child: Container(height: s(140), color: const Color(0xFFFF6D87)),
             ),
+
+            // --- WEEKLY PILLBOX (Rive) ---
+            AnimatedPositioned(
+              duration: _pillboxSlideDur,
+              curve: Curves.easeInOutCubic,
+              left: _pillboxLeftForDay(
+                size: size,
+                s: s,
+                designW: designW,
+                todayIndex: _pillboxVisualDay, // ✅ slide uses visual day
+              ),
+              bottom: s(-70),
+              child: SizedBox(
+                width: s(800),
+                height: s(1383),
+                child: WeeklyPillboxOrganizer(
+                  key: ValueKey(
+                    'pillbox_${_pillboxResetToken}_day_${_todayIndex}',
+                  ),
+
+                  fit: BoxFit.contain,
+
+                  // keep closed during slide, only open AFTER slide finishes
+                  openDays: _allowPillboxOpen ? <int>{_todayIndex} : <int>{},
+
+                  stateMachineName: 'PillboxSM',
+                ),
+              ),
+            ),
+
             Positioned(
               right: 0,
               left: 0,
@@ -1525,6 +1956,30 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
 
+            // --- DAILY COMPLETION CIRCLE (auto fill animation) ---
+            Positioned(
+              left: cx(s(80.1)),
+              bottom: s(674),
+              child: FutureBuilder<Map<String, dynamic>>(
+                future: _checkMapFuture,
+                builder: (context, snap) {
+                  final map = snap.data ?? {};
+
+                  final actualDone = _areAllPillsComplete(map);
+
+                  // wait until pillbox open animation window is finished
+                  final doneForCircle = actualDone && _allowDailyFillAnim;
+
+                  return DailyCompletionCircle(
+                    done: doneForCircle,
+                    size: s(77.1),
+                    baseColor: const Color.fromARGB(0, 231, 36, 153),
+                    fillColor: const Color(0xFF59FF56),
+                  );
+                },
+              ),
+            ),
+
             // --- BOTTOM ZONE ---
             IgnorePointer(
               ignoring: _configOpen || _infoOpen,
@@ -1547,29 +2002,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ),
 
-                    // --- DAILY COMPLETION CIRCLE (auto fill animation) ---
                     Positioned(
-                      left: cx(s(120)),
-                      bottom: s(600),
-                      child: FutureBuilder<Map<String, dynamic>>(
-                        future: _checkMapFuture,
-                        builder: (context, snap) {
-                          final map = snap.data ?? {};
-                          final done = _areAllPillsComplete(map);
-
-                          return DailyCompletionCircle(
-                            done: done,
-                            size: s(120),
-                            baseColor: const Color(0xFFE72447),
-                            fillColor: const Color(0xFF59FF56),
-                          );
-                        },
-                      ),
-                    ),
-
-                    // --- PILLBOX PLACEHOLDER PINK OVAL (big interior area) ---
-                    Positioned(
-                      left: leftFromDesignRight(400, 5),
+                      left: _leftFromDesignRight(400, 5, size, s, designW),
                       bottom: s(-1055),
                       child: ClipOval(
                         child: Container(
@@ -1604,7 +2038,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
                     // --- GREEN OUTER RING ---
                     Positioned(
-                      left: leftFromDesignRight(175, 118),
+                      left: _leftFromDesignRight(175, 118, size, s, designW),
                       bottom: s(80),
                       child: ClipOval(
                         child: Container(
@@ -1617,7 +2051,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
                     // --- DARK RED RING ---
                     Positioned(
-                      left: leftFromDesignRight(155, 127.5),
+                      left: _leftFromDesignRight(155, 127.5, size, s, designW),
                       bottom: s(90),
                       child: ClipOval(
                         child: Container(
@@ -1630,7 +2064,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
                     // --- CHECK BUTTON (last so it gets touches) ---
                     Positioned(
-                      left: leftFromDesignRight(135, 137),
+                      left: _leftFromDesignRight(135, 137, size, s, designW),
                       bottom: s(100),
                       child: FutureBuilder<Map<String, dynamic>>(
                         future: _checkMapFuture,
@@ -1794,38 +2228,37 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
                     ),
-                  ],
-                ),
-              ),
-            ),
-
-            // --- WARNING ICON (bottom-right) ---
-            Positioned(
-              right: s(5),
-              bottom: s(5),
-              child: IgnorePointer(
-                ignoring: _configOpen || _infoOpen,
-                child: Opacity(
-                  opacity: (_configOpen || _infoOpen) ? 0.45 : 1.0,
-                  child: GestureDetector(
-                    onTap: () {
-                      // TODO: override button functionality later
-                    },
-                    child: ClipOval(
-                      child: Container(
-                        width: s(82),
-                        height: s(82),
-                        color: const Color(0xFFFFDF59),
-                        child: Center(
-                          child: Icon(
-                            Icons.warning_rounded,
-                            size: s(75),
-                            color: const Color(0xFFE72447),
+                    // --- WARNING ICON (bottom-right) ---
+                    Positioned(
+                      right: s(5),
+                      bottom: s(5),
+                      child: IgnorePointer(
+                        ignoring: _configOpen || _infoOpen,
+                        child: Opacity(
+                          opacity: (_configOpen || _infoOpen) ? 0.45 : 1.0,
+                          child: GestureDetector(
+                            onTap: () {
+                              // TODO: override button functionality later
+                            },
+                            child: ClipOval(
+                              child: Container(
+                                width: s(82),
+                                height: s(82),
+                                color: const Color(0xFFFFDF59),
+                                child: Center(
+                                  child: Icon(
+                                    Icons.warning_rounded,
+                                    size: s(75),
+                                    color: const Color(0xFFE72447),
+                                  ),
+                                ),
+                              ),
+                            ),
                           ),
                         ),
                       ),
                     ),
-                  ),
+                  ],
                 ),
               ),
             ),
@@ -1834,7 +2267,7 @@ class _HomeScreenState extends State<HomeScreen> {
             Positioned(
               left: s(0),
               right: s(0),
-              bottom: s(480),
+              bottom: s(477),
               child: IgnorePointer(
                 child: AnimatedOpacity(
                   duration: const Duration(milliseconds: 120),
@@ -1866,7 +2299,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           style: TextStyle(
                             fontFamily: 'Amaranth',
                             fontSize: fs(25),
-                            color: const Color.fromARGB(255, 237, 179, 189),
+                            color: const Color.fromARGB(225, 255, 255, 255),
                             fontWeight: FontWeight.w400,
                           ),
                         );
@@ -1958,13 +2391,28 @@ class _HomeScreenState extends State<HomeScreen> {
                       borderRadius: BorderRadius.circular(
                         s(999),
                       ), // big soft circle
-                      onTap: () {
-                        Navigator.push(
+                      onTap: () async {
+                        final changed = await Navigator.push<bool>(
                           context,
                           MaterialPageRoute(
                             builder: (_) => const SettingsScreen(),
                           ),
                         );
+
+                        if (!mounted) return;
+
+                        debugPrint('HOME: settings returned changed=$changed');
+
+                        if (changed == true) {
+                          // reload NotificationService settings + re-sync schedules
+                          await NotificationService.loadUserNotificationSettings();
+                          await _syncDoseNotifications(forceReschedule: true);
+
+                          // dump pending scheduled notifications so we can verify they're actually scheduled
+                          await NotificationService.debugDumpPending(
+                            'after_settings_resync',
+                          );
+                        }
                       },
                       child: SizedBox(
                         width: s(80), // ✅ use the whole oval area
