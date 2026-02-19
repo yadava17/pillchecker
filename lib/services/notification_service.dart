@@ -323,25 +323,6 @@ static Future<void> requestPermissions() async {
     }
   }
 
-Updated upstream
-  static NotificationDetails _details() {
-    return const NotificationDetails(
-      android: AndroidNotificationDetails(
-        _channelId,
-        _channelName,
-        channelDescription: _channelDesc,
-        importance: Importance.max,
-        priority: Priority.high,
-        playSound: true,
-        sound: RawResourceAndroidNotificationSound('pillchecker_notification'),
-      ),
-      iOS: DarwinNotificationDetails(
-        presentSound: true,
-        sound: 'pillchecker_notification.wav',
-      ),
-    );
-  }
-
 static NotificationDetails _details() {
   return const NotificationDetails(
     android: AndroidNotificationDetails(
@@ -359,8 +340,6 @@ static NotificationDetails _details() {
     ),
   );
 }
-
-Stashed changes
 
   // ---- DEBUG: schedule a one-shot test for N seconds/minutes from now ----
   static Future<void> scheduleTestIn(Duration fromNow) async {
