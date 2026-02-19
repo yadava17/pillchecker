@@ -79,6 +79,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Timer? _dayBoundaryTimer;
   Timer? _globalBoundaryTimer;
 
+  bool _delayDailyCircleOnce = true;
+  Timer? _dailyCircleDelayTimer;
+  bool _dailyCircleDelayPassed = false;
+  DateTime _lastSeenDay = DateTime.now(); // used to detect new-day resume
+
+  bool _needsDailyCircleDelay = false; // only true during pillbox open sequence
+
   String? _labelOverride;
   bool _showPillLabel = true;
 
@@ -114,11 +121,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _newNotifId() =>
       DateTime.now().microsecondsSinceEpoch.remainder(2000000000);
 
+  bool _coldStart = true; // first time screen shows after app launch
+
   // ---------------- lifecycle ----------------
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _lastSeenDay = DateTime.now();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      setState(() => _coldStart = false);
+    });
 
     _lastSeenDayKey =
         DateTime.now().year * 10000 +
@@ -144,6 +159,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _nameFocus.dispose();
 
     _labelTimer?.cancel();
+    _dailyCircleDelayTimer?.cancel();
     _doseBoundaryTimer?.cancel();
     _dayBoundaryTimer?.cancel();
     _globalBoundaryTimer?.cancel();
@@ -263,6 +279,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     // Convert to Sun=0..Sat=6, but allow override for testing
     final today = _debugDayOverride ?? (wd % 7);
+
+    _armDailyCircleDelay();
 
     // first open of the day sequence:
     // - reset pillbox to idle (closed)
@@ -955,11 +973,42 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (dayKey == _lastSeenDayKey) return; // same day, nothing to do
     _lastSeenDayKey = dayKey;
 
+    // NEW: coming back after midnight → re-arm the 1s delay
+    _rearmDailyCircleDelay();
+
     // new day → recompute day index (Sun=0..Sat=6, allow override)
     final newToday = _debugDayOverride ?? (now.weekday % 7);
 
-    //run the full "yesterday -> slide -> open today" sequence
+    _armDailyCircleDelay();
+    // run the full "yesterday -> slide -> open today" sequence
     _startNewDaySequence(today: newToday);
+  }
+
+  bool _isSameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
+  void _rearmDailyCircleDelay() {
+    _dailyCircleDelayTimer?.cancel();
+    _dailyCircleDelayTimer = null;
+
+    _dailyCircleDelayPassed = false;
+    _delayDailyCircleOnce = true;
+  }
+
+  void _armDailyCircleDelay({Duration delay = const Duration(seconds: 1)}) {
+    _dailyCircleDelayTimer?.cancel();
+
+    _needsDailyCircleDelay = true;
+    _allowDailyFillAnim = false;
+
+    _dailyCircleDelayTimer = Timer(delay, () {
+      if (!mounted) return;
+      setState(() {
+        _allowDailyFillAnim = true;
+        _needsDailyCircleDelay =
+            false; // IMPORTANT: only delay once per sequence
+      });
+    });
   }
 
   // ---------------- UI label helpers ----------------
@@ -1313,7 +1362,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     await _resyncNotifsAfterPillChange();
 
-
     setState(() {
       pillNames = updatedNames;
       pillTimes = updatedTimes;
@@ -1411,7 +1459,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _refreshCheckMapFuture();
 
     await _resyncNotifsAfterPillChange();
-
 
     setState(() {
       pillNames = updatedNames;
@@ -1968,10 +2015,36 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   final actualDone = _areAllPillsComplete(map);
 
                   // wait until pillbox open animation window is finished
-                  final doneForCircle = actualDone && _allowDailyFillAnim;
+                  final doneForCircle =
+                      actualDone &&
+                      (_allowDailyFillAnim || !_needsDailyCircleDelay);
+
+                  // 1s delay ONLY once (re-armed on cold start + resume-after-midnight)
+                  if (!doneForCircle) {
+                    _dailyCircleDelayTimer?.cancel();
+                    _dailyCircleDelayTimer = null;
+                    _dailyCircleDelayPassed = false;
+                  } else {
+                    if (_delayDailyCircleOnce) {
+                      _dailyCircleDelayTimer ??= Timer(
+                        const Duration(milliseconds: 1500),
+                        () {
+                          if (!mounted) return;
+                          setState(() {
+                            _dailyCircleDelayPassed = true;
+                            _delayDailyCircleOnce = false;
+                          });
+                        },
+                      );
+                    } else {
+                      _dailyCircleDelayPassed = true;
+                    }
+                  }
+
+                  final delayedDone = doneForCircle && _dailyCircleDelayPassed;
 
                   return DailyCompletionCircle(
-                    done: doneForCircle,
+                    done: delayedDone,
                     size: s(77.1),
                     baseColor: const Color.fromARGB(0, 231, 36, 153),
                     fillColor: const Color(0xFF59FF56),
