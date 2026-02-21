@@ -303,7 +303,8 @@ class NotificationService {
     required int doseNumber1Based,
     required TimeOfDay time,
     int? totalDoses,
-    tz.TZDateTime? firstFire, // ignored in horizon model (kept for compatibility)
+    tz.TZDateTime?
+    firstFire, // ignored in horizon model (kept for compatibility)
     int horizonDays = _defaultHorizonDays,
   }) async {
     await init();
@@ -335,7 +336,8 @@ class NotificationService {
     required int doseNumber1Based,
     required TimeOfDay time,
     required int totalDoses,
-    tz.TZDateTime? firstFire, // ignored in horizon model (kept for compatibility)
+    tz.TZDateTime?
+    firstFire, // ignored in horizon model (kept for compatibility)
     int horizonDays = _defaultHorizonDays,
   }) async {
     await init();
@@ -368,7 +370,8 @@ class NotificationService {
     required int doseNumber1Based,
     required TimeOfDay time,
     required int totalDoses,
-    tz.TZDateTime? firstFire, // ignored in horizon model (kept for compatibility)
+    tz.TZDateTime?
+    firstFire, // ignored in horizon model (kept for compatibility)
     int horizonDays = _defaultHorizonDays,
   }) async {
     await init();
@@ -857,14 +860,8 @@ class NotificationService {
         playSound: true,
         sound: RawResourceAndroidNotificationSound('pillchecker_notification'),
       ),
-
-      // ✅ iOS FIX:
-      // Without presentAlert=true, notifications often won't show banners/alerts
-      // while the app is in the foreground.
       iOS: DarwinNotificationDetails(
-        presentAlert: true,
         presentSound: true,
-        presentBadge: true, // optional
         sound: 'pillchecker_notification.wav',
       ),
     );
