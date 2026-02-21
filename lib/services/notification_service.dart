@@ -31,6 +31,7 @@ class NotificationService {
   static Duration get earlyLead => _earlyLead;
   static Duration get lateAfter => _lateAfter;
 
+
   // Default horizon if caller doesn't pass one.
   static const int _defaultHorizonDays = 7;
 
@@ -104,6 +105,39 @@ class NotificationService {
   }
 
   static DateTime _dayOnly(DateTime d) => DateTime(d.year, d.month, d.day);
+=======
+  static Future<void> init() {
+    // ✅ single-flight: if init is already running, everyone awaits the same Future
+    _initFuture ??= _initInternal();
+    return _initFuture!;
+  }
+
+  static Future<void> _initInternal() async {
+    if (_initialized) return;
+
+    await _configureLocalTimeZone();
+
+    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const darwinInit = DarwinInitializationSettings();
+
+    const initSettings = InitializationSettings(
+      android: androidInit,
+      iOS: darwinInit,
+      macOS: darwinInit,
+    );
+
+    await _plugin.initialize(
+      settings: initSettings,
+      onDidReceiveNotificationResponse: (NotificationResponse r) {},
+    );
+
+    await requestPermissions();
+
+    // Load saved notification mode + early/late timings
+    await loadUserNotificationSettings();
+
+    _initialized = true;
+  }
 
   static Future<void> loadUserNotificationSettings() async {
     final prefs = await SharedPreferences.getInstance();
@@ -123,6 +157,9 @@ class NotificationService {
   }
 
   static Future<void> requestPermissions() async {
+
+    // ✅ prevent double-request (Android will crash with permissionRequestInProgress)
+
     if (_permissionRequestInProgress) return;
     _permissionRequestInProgress = true;
 
@@ -605,6 +642,49 @@ class NotificationService {
   // ============================================================
   // Test helper
   // ============================================================
+
+    final android = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+
+    if (android == null) return;
+
+    final can =
+        await android.canScheduleExactNotifications() ??
+        false; // :contentReference[oaicite:1]{index=1}
+    if (can) return;
+
+    await android
+        .requestExactAlarmsPermission(); // :contentReference[oaicite:2]{index=2}
+
+    final canAfter = await android.canScheduleExactNotifications() ?? false;
+    if (!canAfter) {
+      throw StateError(
+        'Exact alarms are not permitted. Enable: Settings > Apps > Special access > Alarms & reminders (allow PillChecker).',
+      );
+    }
+  }
+
+  static NotificationDetails _details() {
+    return const NotificationDetails(
+      android: AndroidNotificationDetails(
+        _channelId,
+        _channelName,
+        channelDescription: _channelDesc,
+        importance: Importance.max,
+        priority: Priority.high,
+        playSound: true,
+        sound: RawResourceAndroidNotificationSound('pillchecker_notification'),
+      ),
+      iOS: DarwinNotificationDetails(
+        presentSound: true,
+        sound: 'pillchecker_notification.wav',
+      ),
+    );
+  }
+
+  // ---- DEBUG: schedule a one-shot test for N seconds/minutes from now ----
 
   static Future<void> scheduleTestIn(Duration fromNow) async {
     await init();
