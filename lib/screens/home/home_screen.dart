@@ -241,7 +241,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _resyncNotifsAfterPillChange() async {
-    // Pull latest mode/early/late into NotificationService (optional but good)
+    // Pull latest mode/early/late into NotificationService
     await NotificationService.loadUserNotificationSettings();
 
     // Rebuild schedules using the current prefs + current early/late values
@@ -281,14 +281,53 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final today = _debugDayOverride ?? (wd % 7);
 
     _armDailyCircleDelay();
-
-    // first open of the day sequence:
-    // - reset pillbox to idle (closed)
-    // - start centered on yesterday
-    // - slide to today
-    // - THEN allow today's flap to open
-    // - THEN allow daily completion fill animation
     _startNewDaySequence(today: today);
+  }
+
+  Future<void> _maybeResetForNewCycle() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final now = DateTime.now();
+    final cycleStart = _globalCycleStartForNow(now);
+    if (cycleStart == null) return;
+
+    final currentIso = cycleStart.toIso8601String();
+    final lastIso = prefs.getString(kLastCycleStartKey);
+
+    if (lastIso == currentIso) return; // same cycle, nothing to do
+
+    // New cycle/day → clear check state so notifications can schedule again
+    final cleared = <String, dynamic>{};
+    await _saveCheckMap(cleared);
+    _setCheckMapAndRebuild(cleared);
+    _refreshCheckMapFuture();
+
+    await prefs.setString(kLastCycleStartKey, currentIso);
+
+    debugPrint('CYCLE RESET: $lastIso -> $currentIso (cleared checkMap)');
+  }
+
+  ({String cycleIso, int mask}) _parsedForPill(
+    Map<String, dynamic> map,
+    int pillIndex,
+  ) {
+    final stored = map['$pillIndex'] as String?;
+    return _readCycleAndMask(stored);
+  }
+
+  bool _isDoseCheckedForNow(
+    Map<String, dynamic> map,
+    int pillIndex,
+    int doseIndex,
+  ) {
+    final doses = _doseTimesForPill(pillIndex);
+    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final cycleIsoNow = w.cycleStart.toIso8601String();
+
+    final parsed = _parsedForPill(map, pillIndex);
+    if (parsed.cycleIso != cycleIsoNow) return false;
+
+    return (parsed.mask & (1 << doseIndex)) != 0;
   }
 
   // ---------------- helpers: dose lists ----------------
@@ -323,7 +362,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final cycleIso = w.cycleStart.toIso8601String();
 
     // read stored mask for this pill
-    final stored = _lastCheckMapCache?['$pillIndex'] as String?;
+    final stored = _lastCheckMapCache['$pillIndex'] as String?;
     final parsed = _readCycleAndMask(stored);
 
     final mask = (parsed.cycleIso == cycleIso) ? parsed.mask : 0;
@@ -411,11 +450,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return (cycleIso: parts[0], mask: int.tryParse(parts[1]) ?? 0);
   }
 
+  // ===============================
+  // ✅ FIXED SYNC (HORIZON + checked-aware ALWAYS)
+  // - Schedules a rolling horizon (today + next N days) so “no check” still works.
+  // - If checked in current cycle: cancels TODAY only (keeps future days scheduled).
+  // - If not checked: rebuilds horizon schedules (cancel+schedule) so edits/settings apply.
+  // - Off/basic handled properly.
+  // ===============================
   Future<void> _syncDoseNotifications({bool forceReschedule = false}) async {
     final prefs = await SharedPreferences.getInstance();
+    const int horizonDays = 7;
 
-    //  ALWAYS pull latest notif settings into prefs->service memory
+    // ALWAYS pull latest notif settings into prefs->service memory
     await NotificationService.loadUserNotificationSettings();
+
+    // reset check map if the global cycle rolled over
+    await _maybeResetForNewCycle();
 
     // Load latest from prefs (source of truth)
     final names = prefs.getStringList(_pillNamesKey) ?? [];
@@ -426,8 +476,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       prefs.getString(_pillDoseNotifIdsKey),
     );
 
+    // needed for "checked-aware"
+    final checkMap = await _loadCheckMap();
+
     // ---- Notification settings (read directly from prefs) ----
-    //  ONLY the v1 keys (remove old redundant keys)
     final mode = prefs.getString(kNotifModeKey) ?? 'standard';
     final earlyMin = prefs.getInt(kEarlyLeadMinKey) ?? 30;
     final lateMin = prefs.getInt(kLateAfterMinKey) ?? 30;
@@ -436,10 +488,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       'SYNC NOTIFS: force=$forceReschedule mode=$mode earlyMin=$earlyMin lateMin=$lateMin names=${names.length}',
     );
 
-    //  If forcing, do a clean wipe so edits ALWAYS apply (fixes your “edit pill after settings” bug)
     if (forceReschedule) {
-      await NotificationService.cancelAll();
-      debugPrint('SYNC NOTIFS: cancelAll() done');
+      debugPrint('SYNC NOTIFS: forceReschedule=true (horizon rebuild)');
     }
 
     // Make lists align in length
@@ -461,7 +511,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final idsForPill = notifIds[pillIndex];
 
       final doseCount = timesForPill.length;
-      final wantLen = doseCount * 3; // ✅ 3 notifications per dose
+      final wantLen = doseCount * 3; // 3 notifications per dose
 
       // MIGRATION: old format had 1 id per dose. Convert to 3 ids per dose.
       // Old ID becomes MAIN, and we generate EARLY + LATE.
@@ -506,17 +556,80 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           'time=${timesForPill[doseIndex]} ids=(E:$earlyId M:$mainId L:$lateId)',
         );
 
+        // OFF => ensure nothing lingers (kill horizons)
         if (mode == 'off') {
-          // make sure nothing lingers
-          await NotificationService.cancel(earlyId);
-          await NotificationService.cancel(mainId);
-          await NotificationService.cancel(lateId);
+          await NotificationService.cancelHorizon(
+            baseId: earlyId,
+            horizonDays: horizonDays,
+          );
+          await NotificationService.cancelHorizon(
+            baseId: mainId,
+            horizonDays: horizonDays,
+          );
+          await NotificationService.cancelHorizon(
+            baseId: lateId,
+            horizonDays: horizonDays,
+          );
           continue;
         }
 
-        // MAIN always in basic + standard
+        // ✅ checked-aware ALWAYS (even during forceReschedule)
+        final alreadyChecked = _isDoseCheckedForNow(
+          checkMap,
+          pillIndex,
+          doseIndex,
+        );
+
+        if (alreadyChecked) {
+          await NotificationService.muteMainHorizonUntilTomorrow(
+            baseId: mainId,
+            pillName: pillName,
+            doseNumber1Based: doseIndex + 1,
+            time: t,
+            totalDoses: doseCount,
+            horizonDays: horizonDays,
+          );
+
+          if (mode == 'standard') {
+            // earlyId/lateId MUST be non-null ints here (your ID extraction should guarantee it)
+            await NotificationService.muteEarlyHorizonUntilTomorrow(
+              baseId: earlyId!,
+              pillName: pillName,
+              doseNumber1Based: doseIndex + 1,
+              time: t, // TimeOfDay
+              totalDoses: doseCount,
+              horizonDays: horizonDays,
+            );
+
+            await NotificationService.muteLateHorizonUntilTomorrow(
+              baseId: lateId!,
+              pillName: pillName,
+              doseNumber1Based: doseIndex + 1,
+              time: t, // TimeOfDay
+              totalDoses: doseCount,
+              horizonDays: horizonDays,
+            );
+          } else {
+            await NotificationService.cancelHorizon(
+              baseId: earlyId,
+              horizonDays: horizonDays,
+            );
+            await NotificationService.cancelHorizon(
+              baseId: lateId,
+              horizonDays: horizonDays,
+            );
+          }
+
+          continue;
+        }
+
+        // ===============================
+        // ✅ NOT CHECKED CASE
+        // Rebuild horizon so edits/settings apply:
+        // cancel+schedule across today + next N days
+        // ===============================
         await NotificationService.scheduleDailyDoseReminder(
-          id: mainId,
+          id: mainId, // <-- was baseId
           pillName: pillName,
           doseNumber1Based: doseIndex + 1,
           time: t,
@@ -524,36 +637,45 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         );
 
         if (mode == 'standard') {
-          // DAILY repeating early/late
           await NotificationService.scheduleDailyDoseEarlyReminder(
-            id: earlyId,
+            id: earlyId!, // NOTE: this param name is id, not baseId
             pillName: pillName,
             doseNumber1Based: doseIndex + 1,
-            time: t,
+            time: t, // TimeOfDay
             totalDoses: doseCount,
           );
 
           await NotificationService.scheduleDailyDoseLateReminder(
-            id: lateId,
+            id: lateId!,
             pillName: pillName,
             doseNumber1Based: doseIndex + 1,
-            time: t,
+            time: t, // TimeOfDay
             totalDoses: doseCount,
           );
         } else {
-          // basic mode => ensure early/late are not lingering
-          await NotificationService.cancel(earlyId);
-          await NotificationService.cancel(lateId);
+          // basic => ensure early/late aren't lingering
+          await NotificationService.cancelHorizon(
+            baseId: earlyId,
+            horizonDays: horizonDays,
+          );
+          await NotificationService.cancelHorizon(
+            baseId: lateId,
+            horizonDays: horizonDays,
+          );
         }
       }
     }
 
-    // Persist any fixes to the ID structure
+    // persist any migration/id fixes
     if (changed) {
-      await prefs.setString(_pillDoseNotifIdsKey, jsonEncode(notifIds));
+      await prefs.setString(
+        _pillDoseNotifIdsKey,
+        _encodeListOfIntLists(notifIds),
+      );
+      debugPrint('SYNC NOTIFS: saved updated notifIds (migration/fixes)');
     }
 
-    //  Always update local state (even if no ID migration happened)
+    // Always update local state
     if (mounted) {
       setState(() {
         pillDoseNotifIds = notifIds;
@@ -562,13 +684,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       });
     }
 
-    // Optional: dump pending after scheduling (remove later)
     await NotificationService.debugDumpPending('after_sync');
   }
 
   String _packCycleAndMask(String cycleIso, int mask) => '$cycleIso|$mask';
 
-  // Counts set bits (you already had this earlier; if missing, add it)
   int _bitCount(int x) {
     var n = 0;
     while (x != 0) {
@@ -586,7 +706,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     for (final doseList in pillDoseTimes) {
       if (doseList.isEmpty) continue;
 
-      // doseList is ["HH:mm", ...] (not guaranteed sorted)
       final times = doseList.map(_strToTime).toList();
       times.sort(
         (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
@@ -624,7 +743,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return cycleStart.toIso8601String();
   }
 
-  // True if every pill is fully completed for this global cycle
   bool _allPillsCompletedForCycle(Map<String, dynamic> checkMap, DateTime now) {
     if (pillNames.isEmpty) return false;
 
@@ -640,14 +758,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final stored = checkMap['$i'] as String?;
       final parsed = _readCycleAndMask(stored);
 
-      // Must match this global cycle
       if (parsed.cycleIso != cycleIso) return false;
-
-      // Must have all dose bits set
       if (_bitCount(parsed.mask) < totalDoses) return false;
     }
 
     return true;
+  }
+
+  Future<void> _cancelDoseNotifsNow(int pillIndex, int doseIndex) async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final notifIds = _decodeListOfIntLists(
+      prefs.getString(_pillDoseNotifIdsKey),
+    );
+
+    if (pillIndex < 0 || pillIndex >= notifIds.length) return;
+
+    final idsForPill = notifIds[pillIndex];
+
+    final base = doseIndex * 3;
+    if (base + 2 >= idsForPill.length) {
+      if (doseIndex >= 0 && doseIndex < idsForPill.length) {
+        await NotificationService.cancel(idsForPill[doseIndex]);
+      }
+      return;
+    }
+
+    final earlyId = idsForPill[base + 0];
+    final mainId = idsForPill[base + 1];
+    final lateId = idsForPill[base + 2];
+
+    debugPrint(
+      'CANCEL DOSE NOTIFS NOW: pill=$pillIndex dose=$doseIndex '
+      'ids=(E:$earlyId M:$mainId L:$lateId)',
+    );
+
+    await NotificationService.cancel(earlyId);
+    await NotificationService.cancel(mainId);
+    await NotificationService.cancel(lateId);
   }
 
   int _doneDoseCountForPill(Map<String, dynamic> map, int pillIndex) {
@@ -682,6 +830,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return true;
   }
 
+  String _doseKey(int pillIndex, int doseIndex) => '$pillIndex:$doseIndex';
+
+  bool _isDoseChecked(
+    Map<String, dynamic> checkMap,
+    int pillIndex,
+    int doseIndex,
+  ) {
+    final v = checkMap[_doseKey(pillIndex, doseIndex)];
+    if (v is bool) return v;
+    if (v is Map && v['checked'] == true) return true;
+    return false;
+  }
+
   bool _isDoseCheckedSync(
     Map<String, dynamic> map,
     int pillIndex,
@@ -692,6 +853,66 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final parsed = _readCycleAndMask(stored);
     if (parsed.cycleIso != cycleIso) return false;
     return (parsed.mask & (1 << doseIndex)) != 0;
+  }
+
+  Future<void> _cancelRemainingNotifsForDose({
+    required int pillIndex,
+    required int doseIndex,
+  }) async {
+    if (pillIndex < 0 || pillIndex >= pillDoseNotifIds.length) return;
+
+    await NotificationService.loadUserNotificationSettings();
+
+    final mode = NotificationService.mode;
+    final earlyLead = NotificationService.earlyLead;
+    final lateAfter = NotificationService.lateAfter;
+
+    final base = doseIndex * 3;
+
+    final ids = pillDoseNotifIds[pillIndex];
+    if (base + 2 >= ids.length) return;
+
+    final earlyId = ids[base + 0];
+    final mainId = ids[base + 1];
+    final lateId = ids[base + 2];
+
+    final doses = _doseTimesForPill(pillIndex); // sorted
+    if (doseIndex < 0 || doseIndex >= doses.length) return;
+
+    final t = doses[doseIndex];
+    final now = DateTime.now();
+
+    var doseDT = DateTime(now.year, now.month, now.day, t.hour, t.minute);
+    if (doseDT.isBefore(now)) {
+      doseDT = doseDT.add(const Duration(days: 1));
+    }
+
+    final earlyDT = doseDT.subtract(earlyLead);
+    final mainDT = doseDT;
+    final lateDT = doseDT.add(lateAfter);
+
+    Future<void> cancelIfFuture(int id, DateTime when) async {
+      if (when.isAfter(now.add(const Duration(seconds: 1)))) {
+        await NotificationService.cancel(id);
+      }
+    }
+
+    if (mode == 'off') return;
+
+    if (mode == 'basic') {
+      await cancelIfFuture(mainId, mainDT);
+      return;
+    }
+
+    await cancelIfFuture(earlyId, earlyDT);
+    await cancelIfFuture(mainId, mainDT);
+    await cancelIfFuture(lateId, lateDT);
+
+    debugPrint(
+      'CANCEL REMAINING: pill=$pillIndex dose=$doseIndex '
+      'mode=$mode (E:$earlyId M:$mainId L:$lateId) '
+      'early=${earlyDT.toIso8601String()} main=${mainDT.toIso8601String()} late=${lateDT.toIso8601String()}',
+    );
   }
 
   // ---------------- dose window logic ----------------
@@ -708,7 +929,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final first = dosesSorted.first;
     final day = DateTime(now.year, now.month, now.day);
 
-    // cycleStart = firstDose - 2 hours
     final cycleStartToday = _atTime(
       day,
       first,
@@ -728,7 +948,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         .map((t) => _atTime(cycleDay, t))
         .toList(growable: false);
 
-    // Each window begins 30m before its dose time
     final windowStarts = doseInstants.map((d) => _minusMinutes(d, 30)).toList();
 
     final nextCycleStart = cycleStart.add(const Duration(days: 1));
@@ -764,7 +983,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final doses = _doseTimesForPill(i);
       if (doses.isEmpty) continue;
 
-      final first = doses.first; // doses are sorted in _doseTimesForPill
+      final first = doses.first;
       final day = DateTime(now.year, now.month, now.day);
       final cycleStartToday = DateTime(
         day.year,
@@ -802,7 +1021,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final w = _computeDoseWindow(now: now, dosesSorted: doses);
       final candidate = w.windowEnd;
 
-      // windowEnd can be "now-ish" if we're right on the boundary
       if (candidate.isAfter(now)) {
         if (soonest == null || candidate.isBefore(soonest)) soonest = candidate;
       }
@@ -818,18 +1036,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    _globalBoundaryTimer = Timer(diff, () {
+    _globalBoundaryTimer = Timer(diff, () async {
       if (!mounted) return;
 
-      // Reload map so ANY pill that reset/changed window shows correct state
       _refreshCheckMapFuture();
 
-      // Reschedule for the next soonest boundary
+      // ✅ checked-aware sync prevents resurrecting today after mute
+      await _syncDoseNotifications(forceReschedule: true);
+
+      if (!mounted) return;
       _scheduleGlobalBoundaryRefresh();
     });
   }
 
-  void _scheduleGlobalDayBoundaryRefresh() {
+  Future<void> _scheduleGlobalDayBoundaryRefresh() async {
     _dayBoundaryTimer?.cancel();
     _dayBoundaryTimer = null;
 
@@ -842,20 +1062,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (diff.inMilliseconds <= 50) {
       if (!mounted) return;
-      _checkMapFuture = _loadCheckMap();
-      setState(() {});
+      setState(() {
+        _checkMapFuture = _loadCheckMap();
+      });
       return;
     }
 
-    _dayBoundaryTimer = Timer(diff, () {
+    _dayBoundaryTimer = Timer(diff, () async {
       if (!mounted) return;
 
-      // Day reset moment hit (2h before earliest first dose)
-      _checkMapFuture = _loadCheckMap();
-      setState(() {});
+      setState(() {
+        _checkMapFuture = _loadCheckMap();
+      });
 
-      // reschedule for the next day
-      _scheduleGlobalDayBoundaryRefresh();
+      await _syncDoseNotifications(forceReschedule: true);
+
+      if (!mounted) return;
+      unawaited(_scheduleGlobalDayBoundaryRefresh());
     });
   }
 
@@ -870,12 +1093,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (doses.isEmpty) return;
 
     final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
-
-    // Next time the UI should change for this centered pill:
-    // (this is the "reset" moment: 30 min before next dose, or cycle reset after final)
     final next = w.windowEnd;
 
-    // If it's already passed or basically now, rebuild immediately
     final diff = next.difference(DateTime.now());
     if (diff.inMilliseconds <= 50) {
       if (!mounted) return;
@@ -886,18 +1105,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _doseBoundaryTimer = Timer(diff, () {
       if (!mounted) return;
 
-      // Refresh check state + label "(dose X)" immediately at the boundary
       _checkMapFuture = _loadCheckMap();
       setState(() {});
 
-      // Schedule the NEXT boundary too (because now we're in the next window)
       _scheduleCenteredDoseBoundaryRefresh();
     });
   }
 
   // ---------------- selection helpers ----------------
   int? get _centerPillIndex {
-    final idx = _wheelSelectedIndex - 1; // wheel->pill
+    final idx = _wheelSelectedIndex - 1;
     if (_wheelSelectedIndex <= 0) return null;
     if (idx < 0 || idx >= pillNames.length) return null;
     return idx;
@@ -937,8 +1154,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     const growth = 0.4;
 
     double cumulative(int day) {
-      // sum_{k=0}^{day-1} (base + growth*k)
-      // = base*day + growth*(day-1)*day/2
       return (base * day) + (growth * (day - 1) * day / 2.0);
     }
 
@@ -958,9 +1173,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final correctedShift = shiftFromWed + tweak[todayIndex];
 
     return wedLeft - s(correctedShift);
-
-    // If it moves the wrong way, flip the sign:
-    // return wedLeft + s(shiftFromWed);
   }
 
   @override
@@ -970,17 +1182,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final now = DateTime.now();
     final dayKey = now.year * 10000 + now.month * 100 + now.day;
 
-    if (dayKey == _lastSeenDayKey) return; // same day, nothing to do
+    if (dayKey == _lastSeenDayKey) return;
     _lastSeenDayKey = dayKey;
 
-    // NEW: coming back after midnight → re-arm the 1s delay
     _rearmDailyCircleDelay();
 
-    // new day → recompute day index (Sun=0..Sat=6, allow override)
     final newToday = _debugDayOverride ?? (now.weekday % 7);
 
     _armDailyCircleDelay();
-    // run the full "yesterday -> slide -> open today" sequence
     _startNewDaySequence(today: newToday);
   }
 
@@ -1005,10 +1214,74 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() {
         _allowDailyFillAnim = true;
-        _needsDailyCircleDelay =
-            false; // IMPORTANT: only delay once per sequence
+        _needsDailyCircleDelay = false;
       });
     });
+  }
+
+  Future<void> _muteDoseNotifsUntilTomorrow({
+    int? earlyId,
+    int? mainId,
+    int? lateId,
+    required String pillName,
+    required int doseNumber1Based,
+    required TimeOfDay doseTime,
+    required int totalDoses,
+    required String mode, // 'standard' | 'basic' | 'off'
+  }) async {
+    debugPrint(
+      'MUTE: pill=$pillName dose=$doseNumber1Based mode=$mode '
+      'ids(main=$mainId early=$earlyId late=$lateId) '
+      'time=${doseTime.hour}:${doseTime.minute} total=$totalDoses',
+    );
+
+    await NotificationService.loadUserNotificationSettings();
+
+    if (mode == 'off') {
+      if (earlyId != null) await NotificationService.cancel(earlyId);
+      if (mainId != null) await NotificationService.cancel(mainId);
+      if (lateId != null) await NotificationService.cancel(lateId);
+
+      await NotificationService.debugDumpPending('after-mute(off)');
+      return;
+    }
+
+    if (mainId != null) {
+      await NotificationService.muteDailyMainUntilTomorrow(
+        id: mainId,
+        pillName: pillName,
+        doseNumber1Based: doseNumber1Based,
+        time: doseTime,
+        totalDoses: totalDoses,
+      );
+    }
+
+    if (mode == 'standard') {
+      if (earlyId != null) {
+        await NotificationService.muteDailyEarlyUntilTomorrow(
+          id: earlyId,
+          pillName: pillName,
+          doseNumber1Based: doseNumber1Based,
+          time: doseTime,
+          totalDoses: totalDoses,
+        );
+      }
+
+      if (lateId != null) {
+        await NotificationService.muteDailyLateUntilTomorrow(
+          id: lateId,
+          pillName: pillName,
+          doseNumber1Based: doseNumber1Based,
+          time: doseTime,
+          totalDoses: totalDoses,
+        );
+      }
+    } else {
+      if (earlyId != null) await NotificationService.cancel(earlyId);
+      if (lateId != null) await NotificationService.cancel(lateId);
+    }
+
+    await NotificationService.debugDumpPending('after-mute($mode)');
   }
 
   // ---------------- UI label helpers ----------------
@@ -1034,12 +1307,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _editNameAgain() {
     setState(() => _step = _ConfigStep.name);
 
-    // focus AFTER rebuild so the TextField exists
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _nameFocus.requestFocus();
-
-      // optional: put cursor at end
       _nameController.selection = TextSelection.fromPosition(
         TextPosition(offset: _nameController.text.length),
       );
@@ -1089,15 +1359,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         .toList();
   }
 
+  String _encodeListOfIntLists(List<List<int>> lists) {
+    return jsonEncode(lists);
+  }
+
   // ---------------- load ----------------
   Future<void> _loadAndMaybeAutoOpen() async {
     final prefs = await SharedPreferences.getInstance();
 
     final savedNames = prefs.getStringList(_pillNamesKey) ?? [];
     final savedTimes = prefs.getStringList(_pillTimesKey) ?? [];
-
-    final early = prefs.getInt(kEarlyLeadMinKey) ?? 30;
-    final late = prefs.getInt(kLateAfterMinKey) ?? 30;
 
     // align legacy times to names
     final alignedTimes = List<String>.from(savedTimes);
@@ -1153,7 +1424,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       pillDoseNotifIds = loadedDoseNotifIds;
     });
 
-    // After loading pills, sync notifications to prevent old schedules / duplicates
+    // After loading pills, sync notifications
     await _syncDoseNotifications(forceReschedule: true);
 
     if (savedNames.isEmpty && mounted) {
@@ -1247,7 +1518,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (_timesPerDay == 1) {
         if (_singleDoseTime == null) return;
 
-        //  if editing, update; otherwise save new
         if (_isEditing) {
           _updatePill();
         } else {
@@ -1257,8 +1527,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         setState(() {
           _step = _ConfigStep.doses;
 
-          //  if editing, prefill the existing times (so they can tweak them)
-          // otherwise create empty slots
           if (_isEditing) {
             final idx = _editingIndex;
             final existing = (idx == null)
@@ -1278,7 +1546,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_step == _ConfigStep.doses) {
       if (!_allDoseTimesSet) return;
 
-      // ✅ if editing, update; otherwise save new
       if (_isEditing) {
         _updatePill();
       } else {
@@ -1297,7 +1564,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_timesPerDay == 1 && _singleDoseTime == null) return;
     if (_timesPerDay > 1 && !_allDoseTimesSet) return;
 
-    // build sorted doses
     final List<TimeOfDay> doses = (_timesPerDay == 1)
         ? <TimeOfDay>[_singleDoseTime!]
         : _doseTimes.map((t) => t!).toList();
@@ -1311,48 +1577,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final prefs = await SharedPreferences.getInstance();
 
-    // persist names
     final updatedNames = [...pillNames, name];
     await prefs.setStringList(_pillNamesKey, updatedNames);
 
-    // persist legacy first-dose times (for now)
     final existingTimes = prefs.getStringList(_pillTimesKey) ?? [];
     final updatedTimes = [...existingTimes, _timeToStr(firstDose)];
     await prefs.setStringList(_pillTimesKey, updatedTimes);
 
-    // persist dose times list-of-lists
     final existingDoseTimes = _decodeListOfStringLists(
       prefs.getString(_pillDoseTimesKey),
     );
     final updatedDoseTimes = [...existingDoseTimes, doseStrings];
     await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
 
-    // schedule + persist notif ids per dose
     final existingDoseNotifIds = _decodeListOfIntLists(
       prefs.getString(_pillDoseNotifIdsKey),
     );
 
     final List<int> notifIdsForThisPill = <int>[];
     for (int i = 0; i < doses.length; i++) {
-      final id = _newNotifId();
-      notifIdsForThisPill.add(id);
-
-      await NotificationService.scheduleDailyDoseReminder(
-        id: id,
-        pillName: name,
-        doseNumber1Based: i + 1,
-        time: doses[i],
-        totalDoses: doses.length,
-      );
+      notifIdsForThisPill.add(_newNotifId()); // EARLY
+      notifIdsForThisPill.add(_newNotifId()); // MAIN
+      notifIdsForThisPill.add(_newNotifId()); // LATE
     }
 
     final updatedDoseNotifIds = [...existingDoseNotifIds, notifIdsForThisPill];
+
     await prefs.setString(
       _pillDoseNotifIdsKey,
       jsonEncode(updatedDoseNotifIds),
     );
 
-    // clear stale check state for new pill index
     final checkMap = await _loadCheckMap();
     final newIndex = updatedNames.length - 1;
     checkMap.remove('$newIndex');
@@ -1372,6 +1627,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _configOpen = false;
       _step = _ConfigStep.name;
     });
+
     await _syncDoseNotifications(forceReschedule: true);
     _showPillLabelAfterSlide();
     _centerWheelOn(1 + (updatedNames.length - 1));
@@ -1388,7 +1644,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_timesPerDay == 1 && _singleDoseTime == null) return;
     if (_timesPerDay > 1 && !_allDoseTimesSet) return;
 
-    // build sorted doses
     final List<TimeOfDay> doses = (_timesPerDay == 1)
         ? <TimeOfDay>[_singleDoseTime!]
         : _doseTimes.map((t) => t!).toList();
@@ -1396,34 +1651,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     doses.sort(
       (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
     );
+
     final doseStrings = doses.map(_timeToStr).toList();
     final firstDose = doses.first;
 
     final prefs = await SharedPreferences.getInstance();
 
-    // Cancel existing notifications for this pill
     if (pillIndex < pillDoseNotifIds.length) {
       for (final id in pillDoseNotifIds[pillIndex]) {
         await NotificationService.cancel(id);
       }
     }
 
-    // Schedule new notifications
     final List<int> notifIdsForThisPill = <int>[];
     for (int i = 0; i < doses.length; i++) {
-      final id = _newNotifId();
-      notifIdsForThisPill.add(id);
-
-      await NotificationService.scheduleDailyDoseReminder(
-        id: id,
-        pillName: name,
-        doseNumber1Based: i + 1,
-        time: doses[i],
-        totalDoses: doses.length,
-      );
+      notifIdsForThisPill.add(_newNotifId()); // EARLY
+      notifIdsForThisPill.add(_newNotifId()); // MAIN
+      notifIdsForThisPill.add(_newNotifId()); // LATE
     }
 
-    // Update in-memory lists
     final updatedNames = [...pillNames];
     updatedNames[pillIndex] = name;
 
@@ -1442,7 +1688,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       updatedDoseNotifIds[pillIndex] = notifIdsForThisPill;
     }
 
-    // Persist prefs
     await prefs.setStringList(_pillNamesKey, updatedNames);
     await prefs.setStringList(_pillTimesKey, updatedTimes);
     await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
@@ -1451,7 +1696,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       jsonEncode(updatedDoseNotifIds),
     );
 
-    // Clear THIS pill’s check state (safe, avoids weird mismatches after edits)
     final checkMap = await _loadCheckMap();
     checkMap.remove('$pillIndex');
     await _saveCheckMap(checkMap);
@@ -1507,12 +1751,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!shouldDelete) return;
 
-    // cancel ALL notifications for this pill (all doses)
+    // ✅ CANCEL all horizon notifications for this pill BEFORE removing it
+    const int horizonDays = 7;
+
     if (slot < pillDoseNotifIds.length) {
-      for (final id in pillDoseNotifIds[slot]) {
-        await NotificationService.cancel(id);
+      final ids = pillDoseNotifIds[slot];
+
+      for (final baseId in ids) {
+        await NotificationService.cancelHorizon(baseId: baseId, horizonDays: 7);
+      }
+      await NotificationService.cancelInactivityShutdownWarning(horizonDays: 7);
+
+      // ids are stored as [early, main, late] per dose
+      for (int i = 0; i + 2 < ids.length; i += 3) {
+        final earlyBaseId = ids[i + 0];
+        final mainBaseId = ids[i + 1];
+        final lateBaseId = ids[i + 2];
+
+        await NotificationService.cancelHorizon(
+          baseId: mainBaseId,
+          horizonDays: horizonDays,
+        );
+        await NotificationService.cancelHorizon(
+          baseId: earlyBaseId,
+          horizonDays: horizonDays,
+        );
+        await NotificationService.cancelHorizon(
+          baseId: lateBaseId,
+          horizonDays: horizonDays,
+        );
       }
     }
+
+    // ✅ Also cancel the inactivity warning notification (your new feature)
+    await NotificationService.cancelInactivityShutdownWarning();
 
     final updatedNames = [...pillNames]..removeAt(slot);
 
@@ -1534,9 +1806,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       jsonEncode(updatedDoseNotifIds),
     );
 
+    // rebuild horizons for remaining pills
     await _syncDoseNotifications(forceReschedule: true);
 
-    // shift check map indices down
     final checkMap = await _loadCheckMap();
     final Map<String, dynamic> shifted = {};
     checkMap.forEach((k, v) {
@@ -1580,14 +1852,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final pillIndex = _centerPillIndex;
     if (pillIndex == null) return;
 
-    // Ensure cache is fresh
-    final map = await _loadCheckMap();
-
+    // 1) Figure out which dose we’re checking (and the current cycle key)
     final doses = _doseTimesForPill(pillIndex);
     final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
 
     final cycleIso = w.cycleStart.toIso8601String();
     final doseIndex = w.doseIndex;
+
+    // 2) Update checkMap (cycle-aware bitmask)
+    final map = await _loadCheckMap();
 
     final stored = map['$pillIndex'] as String?;
     final parsed = _readCycleAndMask(stored);
@@ -1597,12 +1870,83 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     map['$pillIndex'] = _packCycleAndMask(cycleIso, newMask);
     await _saveCheckMap(map);
+
+    // keep your existing UI/cache refresh flow
     _setCheckMapAndRebuild(map);
-    _refreshCheckMapFuture(); // ✅ forces daily circle + button builders to see new map
+    _refreshCheckMapFuture();
     _checkMapFuture = _loadCheckMap();
+
+    // 3) Pull notif mode + base IDs for this pill/dose
+    final prefs = await SharedPreferences.getInstance();
+    final mode = prefs.getString(kNotifModeKey) ?? 'standard';
+
+    int? earlyBaseId;
+    int? mainBaseId;
+    int? lateBaseId;
+
+    final base = doseIndex * 3;
+    if (pillIndex >= 0 && pillIndex < pillDoseNotifIds.length) {
+      final ids = pillDoseNotifIds[pillIndex];
+      if (base + 2 < ids.length) {
+        earlyBaseId = ids[base + 0];
+        mainBaseId = ids[base + 1];
+        lateBaseId = ids[base + 2];
+      }
+    }
+
+    // 4) ✅ Horizon model fix:
+    // If they check at ANY point (even after missing a day),
+    // we must prevent main/late from firing later "today".
+    //
+    // With your revised NotificationService, the correct behavior is:
+    // - Cancel the entire horizon for each baseId
+    // - Rebuild starting TOMORROW (so nothing else can fire today)
+    //
+    // This matches the “first day mute” behavior, but for horizon.
+    final TimeOfDay doseTime = doses[doseIndex]; // <- NO _strToTime here
+
+    if (mainBaseId != null) {
+      await NotificationService.muteMainHorizonUntilTomorrow(
+        baseId: mainBaseId,
+        pillName: pillNames[pillIndex],
+        doseNumber1Based: doseIndex + 1,
+        time: doseTime,
+        totalDoses: doses.length,
+        horizonDays: 7,
+      );
+    }
+
+    if (mode == 'standard') {
+      if (earlyBaseId != null) {
+        await NotificationService.muteEarlyHorizonUntilTomorrow(
+          baseId: earlyBaseId,
+          pillName: pillNames[pillIndex],
+          doseNumber1Based: doseIndex + 1,
+          time: doseTime,
+          totalDoses: doses.length,
+          horizonDays: 7,
+        );
+      }
+      if (lateBaseId != null) {
+        await NotificationService.muteLateHorizonUntilTomorrow(
+          baseId: lateBaseId,
+          pillName: pillNames[pillIndex],
+          doseNumber1Based: doseIndex + 1,
+          time: doseTime,
+          totalDoses: doses.length,
+          horizonDays: 7,
+        );
+      }
+    }
+
+    // ✅ NEW: reschedule inactivity shutdown warning 7 days from this check
+    await NotificationService.rescheduleInactivityShutdownWarning(
+      doseTime: doseTime,
+    );
+
+    // 5) Everything else unchanged
     _scheduleCenteredDoseBoundaryRefresh();
 
-    // show "Pill Checked!" for ~9 seconds
     _labelTimer?.cancel();
     setState(() => _labelOverride = 'Pill Checked!');
     _labelTimer = Timer(const Duration(seconds: 9), () {
@@ -1614,6 +1958,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   // ---------------- config panel UI ----------------
+  // (UNCHANGED below this point)
+  // ------------------------------------------------------------------------
+  // Everything from here down is exactly what you had (UI/layout/etc).
+  // ------------------------------------------------------------------------
+
   Widget _configPanel() {
     const cardColor = Color(0xFF98404F);
     const white = Color(0xFFFFFFFF);
@@ -1635,7 +1984,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           borderRadius: BorderRadius.circular(26),
         ),
         padding: const EdgeInsets.all(16),
-
         child: LayoutBuilder(
           builder: (context, constraints) {
             return SingleChildScrollView(
@@ -1661,7 +2009,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             ),
                           ),
                         ),
-
                         const SizedBox(width: 12),
                         Expanded(
                           child: (_step == _ConfigStep.name)
@@ -1679,7 +2026,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                   ),
                                 )
                               : InkWell(
-                                  onTap: _editNameAgain, // tap name to edit
+                                  onTap: _editNameAgain,
                                   child: Row(
                                     children: [
                                       Expanded(
@@ -1698,12 +2045,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                         Icons.edit,
                                         color: Colors.white70,
                                         size: 20,
-                                      ), // ✅ cue
+                                      ),
                                     ],
                                   ),
                                 ),
                         ),
-
                         IconButton(
                           onPressed: _cancelAddFlow,
                           icon: const Icon(Icons.close, color: white),
@@ -1711,7 +2057,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ],
                     ),
                     const SizedBox(height: 10),
-
                     Container(
                       width: double.infinity,
                       height: 140,
@@ -1725,9 +2070,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         style: TextStyle(color: Colors.white70),
                       ),
                     ),
-
                     const SizedBox(height: 12),
-
                     if (_step == _ConfigStep.config) ...[
                       Row(
                         children: [
@@ -1793,7 +2136,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                     ],
-
                     if (_step == _ConfigStep.doses)
                       SizedBox(
                         height: 220,
@@ -1832,7 +2174,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       )
                     else
                       const SizedBox(height: 12),
-
                     SizedBox(
                       width: double.infinity,
                       height: 56,
@@ -2027,7 +2368,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   } else {
                     if (_delayDailyCircleOnce) {
                       _dailyCircleDelayTimer ??= Timer(
-                        const Duration(milliseconds: 1500),
+                        const Duration(milliseconds: 1300),
                         () {
                           if (!mounted) return;
                           setState(() {
