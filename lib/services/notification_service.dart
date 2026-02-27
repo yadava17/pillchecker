@@ -7,6 +7,8 @@ import 'package:timezone/timezone.dart' as tz;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pillchecker/constants/prefs_keys.dart';
 
+enum _Kind { early, main, late }
+
 class NotificationService {
   NotificationService._();
 
@@ -14,7 +16,6 @@ class NotificationService {
       FlutterLocalNotificationsPlugin();
 
   static bool _initialized = false;
-
   static Future<void>? _initFuture;
   static bool _permissionRequestInProgress = false;
 
@@ -31,41 +32,36 @@ class NotificationService {
   static Duration get earlyLead => _earlyLead;
   static Duration get lateAfter => _lateAfter;
 
-  // Default horizon if caller doesn't pass one.
-  static const int _defaultHorizonDays = 7;
-
   // ============================================================
-  // HORIZON ID MAPPING (matches your debug dump)
-  // baseId + 2,000,000 * dayOffset
-  // dayOffset=0 is the "start day" used by the scheduler call.
+  // TODAY + TOMORROW WINDOW (2 days)
   // ============================================================
-  static const int _horizonStride = 2_000_000;
 
-  static int _horizonId(int baseId, int dayOffset) =>
-      baseId + (dayOffset * _horizonStride);
+  static const int _windowDays = 2; // today + tomorrow
+  static const int _inactivityDays = 1;
+  static const int _cancelDayBuckets = 3;
+  // cancel offsets 0..2 so we safely cover both patterns:
+  // (today+tomorrow) OR (tomorrow+dayAfter)
 
-  // One global ID for the inactivity shutdown warning.
-  // We always cancel+reschedule this same ID.
-  static const int _inactivityWarningId = 1987654321;
+  static const int _inactivityWarningId = 2_146_987_321; // unique + stable
+  static const Duration _inactivityWarnAfter = Duration(days: 1);
+  static const Duration _inactivityAfterLateBuffer = Duration(minutes: 15);
 
-  // How long after the late reminder this warning fires.
-  static const Duration _inactivityAfterLateBuffer = Duration(minutes: 10);
+  // Deterministic IDs (no collisions, always cancellable).
+  // Layout: dayBucket + pillBucket + doseBucket + kind
+  static const int _idStrideDay = 100000; // separates dayOffset cleanly
+  static const int _idStridePill = 1000; // room for many doses inside a pill
+  static const int _idStrideDose = 10; // room for 3 kinds
 
-  // How many days after the last check until warning.
-  static const int _inactivityDays = 7;
-
-  // Put near the top of NotificationService
-  static const int _inactivityWarningBaseId = 2_147_000_001; // big + unique
-  static const int _inactivityHorizonDays = 7;
-
-  static Future<void> cancelInactivityShutdownWarning({
-    int horizonDays = 7,
-  }) async {
-    await init();
-    await cancelHorizon(baseId: _inactivityWarningId, horizonDays: horizonDays);
-    debugPrint(
-      'NOTIF: cancelInactivityShutdownWarning(base=$_inactivityWarningId days=$horizonDays)',
-    );
+  static int _idFor({
+    required int dayOffset, // 0=today, 1=tomorrow
+    required int pillSlot, // 0..N-1 (index in pillNames list)
+    required int doseIndex, // 0..timesPerDay-1
+    required _Kind kind, // early/main/late
+  }) {
+    return (dayOffset * _idStrideDay) +
+        (pillSlot * _idStridePill) +
+        (doseIndex * _idStrideDose) +
+        kind.index; // 0..2
   }
 
   // ============================================================
@@ -101,8 +97,6 @@ class NotificationService {
 
     _initialized = true;
   }
-
-  static DateTime _dayOnly(DateTime d) => DateTime(d.year, d.month, d.day);
 
   static Future<void> loadUserNotificationSettings() async {
     final prefs = await SharedPreferences.getInstance();
@@ -155,8 +149,21 @@ class NotificationService {
   }
 
   // ============================================================
-  // IMPORTANT: ONE-SHOT ONLY
+  // Window primitives
   // ============================================================
+
+  static DateTime _dayOnly(DateTime d) => DateTime(d.year, d.month, d.day);
+
+  static tz.TZDateTime _atLocalDayTime(DateTime day, TimeOfDay t) {
+    return tz.TZDateTime(
+      tz.local,
+      day.year,
+      day.month,
+      day.day,
+      t.hour,
+      t.minute,
+    );
+  }
 
   static Future<void> _scheduleOneShot({
     required int id,
@@ -177,427 +184,309 @@ class NotificationService {
     );
   }
 
-  // ============================================================
-  // Horizon primitives (THIS is what you should use everywhere)
-  // ============================================================
-
-  static DateTime _startOfTodayLocal() {
-    final now = DateTime.now();
-    return DateTime(now.year, now.month, now.day);
-  }
-
-  static tz.TZDateTime _atLocalDayTime(DateTime day, TimeOfDay t) {
-    return tz.TZDateTime(
-      tz.local,
-      day.year,
-      day.month,
-      day.day,
-      t.hour,
-      t.minute,
-    );
-  }
-
-  /// Schedule a rolling horizon of one-shots.
-  /// - startTomorrow=false => dayOffset=0 is today
-  /// - startTomorrow=true  => dayOffset=0 is tomorrow
-  static Future<void> _scheduleHorizon({
-    required int baseId,
-    required int horizonDays,
-    required bool startTomorrow,
-    required String title,
-    required String body,
-    required TimeOfDay time,
+  // Cancel 2-day window for one pill
+  static Future<void> cancelWindowForPill({
+    required int pillSlot,
+    required int dosesPerDay,
   }) async {
     await init();
-    await _requireExactAlarmsOnAndroid();
-
-    final nowTz = tz.TZDateTime.now(tz.local);
-    final startLocalDay = _startOfTodayLocal().add(
-      Duration(days: startTomorrow ? 1 : 0),
-    );
-
-    for (int d = 0; d < horizonDays; d++) {
-      final day = startLocalDay.add(Duration(days: d));
-      final when = _atLocalDayTime(day, time);
-
-      // Don’t schedule past times (ex: today's time already passed)
-      if (when.isBefore(nowTz)) continue;
-
-      final id = _horizonId(baseId, d);
-
-      await _plugin.zonedSchedule(
-        id: id,
-        scheduledDate: when,
-        notificationDetails: _details(),
-        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-        title: title,
-        body: body,
-      );
+    for (int dayOffset = 0; dayOffset < _windowDays; dayOffset++) {
+      for (int d = 0; d < dosesPerDay; d++) {
+        for (final kind in _Kind.values) {
+          await cancel(
+            _idFor(
+              dayOffset: dayOffset,
+              pillSlot: pillSlot,
+              doseIndex: d,
+              kind: kind,
+            ),
+          );
+        }
+      }
     }
   }
 
-  static Future<void> cancelHorizon({
-    required int baseId,
-    required int horizonDays,
-  }) async {
-    await init();
-    for (int d = 0; d < horizonDays; d++) {
-      await cancel(_horizonId(baseId, d));
-    }
+  static TimeOfDay _parse24h(String hhmm) {
+    final hh = int.parse(hhmm.substring(0, 2));
+    final mm = int.parse(hhmm.substring(3, 5));
+    return TimeOfDay(hour: hh, minute: mm);
   }
 
-  /// Reschedules the "Notifications will be turned off due to inactivity" warning.
-  /// - Cancels the existing warning (fixed ID) and schedules a new one-shot.
-  /// - Fires _inactivityDays days from today, at (lateTime + buffer).
-  /// - Uses the *doseTime* that was just checked as the reference.
-  static Future<void> rescheduleInactivityShutdownWarning({
+  static bool _isInPastToday(DateTime day, TimeOfDay t) {
+    final now = tz.TZDateTime.now(tz.local);
+    final when = _atLocalDayTime(day, t);
+    return when.isBefore(now);
+  }
+
+  static Future<void> _scheduleTripletOneDay({
+    required int dayOffset,
+    required int pillSlot,
+    required int doseIndex,
+    required int totalDoses,
+    required String pillName,
     required TimeOfDay doseTime,
   }) async {
     await init();
     await _requireExactAlarmsOnAndroid();
     await loadUserNotificationSettings();
 
-    // If notifications are off, ensure this warning is dead too.
-    if (_mode == 'off') {
-      await cancel(_inactivityWarningId);
-      return;
-    }
+    if (_mode == 'off') return;
 
-    // lateTime = doseTime + user-configured lateAfter
+    final today = _dayOnly(DateTime.now());
+    final day = today.add(Duration(days: dayOffset));
+
+    final doseNumber1 = doseIndex + 1;
+    final isSingle = totalDoses <= 1;
+
+    final bodyMain = isSingle
+        ? "It's time to take $pillName!"
+        : "It's time to take dose $doseNumber1 of $pillName!";
+
+    final bodyEarly = isSingle
+        ? "Almost time to take $pillName!"
+        : "Almost time to take dose $doseNumber1 of $pillName!";
+
+    final bodyLate = isSingle
+        ? "You haven't checked $pillName yet! Check it off before it's too late!"
+        : "You haven't checked dose $doseNumber1 of $pillName yet! Check it off before it's too late!";
+
+    final earlyTime = shiftTimeOfDay(doseTime, -_earlyLead);
     final lateTime = shiftTimeOfDay(doseTime, _lateAfter);
 
-    // warningTime = lateTime + small buffer (so it definitely comes after late)
-    final warningTime = shiftTimeOfDay(lateTime, _inactivityAfterLateBuffer);
+    // Do not “roll” times forward. We only want *this day’s* events.
+    // If time already passed for today, skip it (tomorrow will cover it).
+    Future<void> scheduleIfValid({
+      required _Kind kind,
+      required TimeOfDay t,
+      required String body,
+    }) async {
+      if (dayOffset == 0 && _isInPastToday(day, t)) return;
 
-    // target day = today + 7 days (local date)
+      if (_mode == 'basic' && kind != _Kind.main) return;
+
+      final id = _idFor(
+        dayOffset: dayOffset,
+        pillSlot: pillSlot,
+        doseIndex: doseIndex,
+        kind: kind,
+      );
+
+      final when = _atLocalDayTime(day, t);
+
+      await _scheduleOneShot(
+        id: id,
+        when: when,
+        title: 'PillChecker',
+        body: body,
+      );
+    }
+
+    await scheduleIfValid(kind: _Kind.early, t: earlyTime, body: bodyEarly);
+    await scheduleIfValid(kind: _Kind.main, t: doseTime, body: bodyMain);
+    await scheduleIfValid(kind: _Kind.late, t: lateTime, body: bodyLate);
+  }
+
+  // ============================================================
+  // ✅ PUBLIC API: rebuild today+tomorrow for ALL pills
+  // Call this from HomeScreen Sync after loading prefs pill lists.
+  // ============================================================
+
+  static Future<void> rebuild2DayWindow({
+    required List<String> pillNames,
+    required List<List<String>> doseTimes24h, // "HH:mm" per dose
+  }) async {
+    await init();
+    await _requireExactAlarmsOnAndroid();
+    await loadUserNotificationSettings();
+
     final today = _dayOnly(DateTime.now());
-    final targetDay = today.add(const Duration(days: _inactivityDays));
 
-    // Build the tz time on/after that day (it won't roll since targetDay is future)
-    final when = _instanceOnOrAfter(targetDay, warningTime);
+    // ---------------------------
+    // A) Decide whether "today" still has ANY valid future notification time
+    // If not, start scheduling from tomorrow (so you still get 2 full future days).
+    // ---------------------------
+    bool hasAnythingLeftToday = false;
 
-    // Cancel any existing watchdog and schedule a new one
+    for (int pillSlot = 0; pillSlot < pillNames.length; pillSlot++) {
+      final times = doseTimes24h[pillSlot];
+      final totalDoses = times.length;
+
+      for (int doseIndex = 0; doseIndex < times.length; doseIndex++) {
+        final doseTime = _parse24h(times[doseIndex]);
+
+        // basic/off rules
+        if (_mode == 'off') break;
+
+        // MAIN
+        if (!_isInPastToday(today, doseTime)) {
+          hasAnythingLeftToday = true;
+          break;
+        }
+
+        // EARLY/LATE only matter in standard mode
+        if (_mode == 'standard') {
+          final earlyTime = shiftTimeOfDay(doseTime, -_earlyLead);
+          final lateTime = shiftTimeOfDay(doseTime, _lateAfter);
+
+          if (!_isInPastToday(today, earlyTime) ||
+              !_isInPastToday(today, lateTime)) {
+            hasAnythingLeftToday = true;
+            break;
+          }
+        }
+      }
+
+      if (hasAnythingLeftToday) break;
+    }
+
+    final startOffset = hasAnythingLeftToday ? 0 : 1;
+
+    debugPrint(
+      'NOTIF: rebuild2DayWindow startOffset=$startOffset '
+      '(0=today+tomorrow, 1=tomorrow+dayAfter)',
+    );
+
+    // ---------------------------
+    // B) Cancel existing buckets that we might have scheduled previously.
+    // We cancel offsets 0..2 to handle switching between patterns safely.
+    // ---------------------------
+    for (int pillSlot = 0; pillSlot < pillNames.length; pillSlot++) {
+      final dosesPerDay = doseTimes24h[pillSlot].length;
+
+      for (int dayOffset = 0; dayOffset < _cancelDayBuckets; dayOffset++) {
+        for (int d = 0; d < dosesPerDay; d++) {
+          for (final kind in _Kind.values) {
+            await cancel(
+              _idFor(
+                dayOffset: dayOffset,
+                pillSlot: pillSlot,
+                doseIndex: d,
+                kind: kind,
+              ),
+            );
+          }
+        }
+      }
+    }
+
+    // ---------------------------
+    // C) Schedule exactly 2 days: startOffset and startOffset+1
+    // ---------------------------
+    for (int i = 0; i < _windowDays; i++) {
+      final dayOffset = startOffset + i;
+
+      for (int pillSlot = 0; pillSlot < pillNames.length; pillSlot++) {
+        final pillName = pillNames[pillSlot];
+        final times = doseTimes24h[pillSlot];
+        final totalDoses = times.length;
+
+        for (int doseIndex = 0; doseIndex < times.length; doseIndex++) {
+          final doseTime = _parse24h(times[doseIndex]);
+
+          await _scheduleTripletOneDay(
+            dayOffset: dayOffset,
+            pillSlot: pillSlot,
+            doseIndex: doseIndex,
+            totalDoses: totalDoses,
+            pillName: pillName,
+            doseTime: doseTime,
+          );
+        }
+      }
+    }
+
+    // ✅ Always re-arm the inactivity warning whenever we rebuild the window
+    await rescheduleInactivityWarning(doseTimes24h: doseTimes24h);
+    debugPrint('NOTIF: rebuild2DayWindow complete');
+  }
+
+  static Future<void> rescheduleInactivityWarning({
+    required List<List<String>> doseTimes24h,
+  }) async {
+    await init();
+    await _requireExactAlarmsOnAndroid();
+    await loadUserNotificationSettings();
+
+    // Always kill old warning first (fixed ID)
     await cancel(_inactivityWarningId);
+
+    // If notifs are off OR no pills, don't schedule warning.
+    if (_mode == 'off') return;
+    if (doseTimes24h.isEmpty) return;
+
+    // Find the latest "late time" across all doses.
+    // - standard: use (dose + lateAfter)
+    // - basic: no late exists, so use main dose time as the "latest"
+    TimeOfDay? latest;
+
+    for (final timesForPill in doseTimes24h) {
+      for (final hhmm in timesForPill) {
+        final dose = _parse24h(hhmm);
+
+        final candidate = (_mode == 'standard')
+            ? shiftTimeOfDay(dose, _lateAfter)
+            : dose;
+
+        if (latest == null || _toMins(candidate) > _toMins(latest)) {
+          latest = candidate;
+        }
+      }
+    }
+
+    if (latest == null) return;
+
+    // Warning should be ~5-10 min AFTER the latest late.
+    final shifted = _shiftWithDayDelta(latest, _inactivityAfterLateBuffer);
+
+    final today = _dayOnly(DateTime.now());
+    final targetDay = today.add(
+      Duration(days: _inactivityDays + shifted.dayDelta),
+    );
+
+    final when = _atLocalDayTime(targetDay, shifted.time);
 
     await _scheduleOneShot(
       id: _inactivityWarningId,
       when: when,
       title: 'PillChecker',
       body:
-          'Notifications will be turned off tomorrow due to inactivity. Check your pills off to start recieving notifications again!',
+          'Warning: Notifications will stop tomorrow due to 2 days of inactivity. '
+          'Open PillChecker again to keep receiving reminders!',
     );
 
     debugPrint(
-      'INACTIVITY WARNING: rescheduled id=$_inactivityWarningId '
-      'for ${when.toIso8601String()} (doseTime=${doseTime.hour}:${doseTime.minute})',
+      'NOTIF: inactivity warning scheduled id=$_inactivityWarningId '
+      'when=${when.toIso8601String()} (latestBase=${latest.hour}:${latest.minute})',
     );
   }
 
   // ============================================================
-  // Public scheduling APIs used by your Sync code
+  // ✅ PUBLIC API: mute remaining notifications today
+  // - muteRemainingDoses=false: cancels only this dose’s early/main/late today
+  // - muteRemainingDoses=true : cancels this dose + all later doses today
   // ============================================================
 
-  static Future<void> scheduleDailyDoseReminder({
-    required int id, // baseId
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    int? totalDoses,
-    tz.TZDateTime?
-    firstFire, // ignored in horizon model (kept for compatibility)
-    int horizonDays = _defaultHorizonDays,
+  static Future<void> muteToday({
+    required int pillSlot,
+    required int doseIndex,
+    required int dosesPerDay,
+    bool muteRemainingDoses = false,
   }) async {
     await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
 
-    if (_mode == 'off') return;
+    final start = doseIndex;
+    final end = muteRemainingDoses ? (dosesPerDay - 1) : doseIndex;
 
-    final isSingleDose = (totalDoses != null && totalDoses <= 1);
-    final body = isSingleDose
-        ? "It's time to take $pillName!"
-        : "It's time to take dose $doseNumber1Based of $pillName!";
-
-    // Rebuild horizon starting TODAY
-    await cancelHorizon(baseId: id, horizonDays: horizonDays);
-    await _scheduleHorizon(
-      baseId: id,
-      horizonDays: horizonDays,
-      startTomorrow: false,
-      title: 'PillChecker',
-      body: body,
-      time: time,
-    );
-  }
-
-  static Future<void> scheduleDailyDoseEarlyReminder({
-    required int id, // baseId
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-    tz.TZDateTime?
-    firstFire, // ignored in horizon model (kept for compatibility)
-    int horizonDays = _defaultHorizonDays,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
-
-    if (_mode == 'off') return;
-    if (_mode == 'basic') return;
-
-    final earlyTime = shiftTimeOfDay(time, -_earlyLead);
-
-    final body = (totalDoses <= 1)
-        ? "Almost time to take $pillName!"
-        : "Almost time to take dose $doseNumber1Based of $pillName!";
-
-    await cancelHorizon(baseId: id, horizonDays: horizonDays);
-    await _scheduleHorizon(
-      baseId: id,
-      horizonDays: horizonDays,
-      startTomorrow: false,
-      title: 'PillChecker',
-      body: body,
-      time: earlyTime,
-    );
-  }
-
-  static Future<void> scheduleDailyDoseLateReminder({
-    required int id, // baseId
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-    tz.TZDateTime?
-    firstFire, // ignored in horizon model (kept for compatibility)
-    int horizonDays = _defaultHorizonDays,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
-
-    if (_mode == 'off') return;
-    if (_mode == 'basic') return;
-
-    final lateTime = shiftTimeOfDay(time, _lateAfter);
-
-    final body = (totalDoses <= 1)
-        ? "You haven't checked $pillName yet! Check it off before it's too late!"
-        : "You haven't checked dose $doseNumber1Based of $pillName yet! Check it off before it's too late!";
-
-    await cancelHorizon(baseId: id, horizonDays: horizonDays);
-    await _scheduleHorizon(
-      baseId: id,
-      horizonDays: horizonDays,
-      startTomorrow: false,
-      title: 'PillChecker',
-      body: body,
-      time: lateTime,
-    );
-  }
-
-  // ============================================================
-  // MUTE (HORIZON MODEL)
-  // ✅ This is the “make it work after missed day” fix:
-  // - cancel ALL offsets
-  // - rebuild starting tomorrow (so main/late can’t fire after check)
-  // ============================================================
-
-  static Future<void> muteMainHorizonUntilTomorrow({
-    required int baseId,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-    int horizonDays = _defaultHorizonDays,
-  }) async {
-    await init();
-    await loadUserNotificationSettings();
-
-    // Always kill whatever is pending for this baseId (today might be offset 1/2/etc after a missed day)
-    await cancelHorizon(baseId: baseId, horizonDays: horizonDays);
-
-    if (_mode == 'off') return;
-
-    final body = (totalDoses <= 1)
-        ? "It's time to take $pillName!"
-        : "It's time to take dose $doseNumber1Based of $pillName!";
-
-    await _scheduleHorizon(
-      baseId: baseId,
-      horizonDays: horizonDays,
-      startTomorrow: true, // <-- KEY
-      title: 'PillChecker',
-      body: body,
-      time: time,
-    );
-  }
-
-  static Future<void> muteEarlyHorizonUntilTomorrow({
-    required int baseId,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-    int horizonDays = _defaultHorizonDays,
-  }) async {
-    await init();
-    await loadUserNotificationSettings();
-
-    await cancelHorizon(baseId: baseId, horizonDays: horizonDays);
-
-    if (_mode == 'off' || _mode == 'basic') return;
-
-    final earlyTime = shiftTimeOfDay(time, -_earlyLead);
-
-    final body = (totalDoses <= 1)
-        ? "Almost time to take $pillName!"
-        : "Almost time to take dose $doseNumber1Based of $pillName!";
-
-    await _scheduleHorizon(
-      baseId: baseId,
-      horizonDays: horizonDays,
-      startTomorrow: true, // <-- KEY
-      title: 'PillChecker',
-      body: body,
-      time: earlyTime,
-    );
-  }
-
-  static Future<void> muteLateHorizonUntilTomorrow({
-    required int baseId,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-    int horizonDays = _defaultHorizonDays,
-  }) async {
-    await init();
-    await loadUserNotificationSettings();
-
-    await cancelHorizon(baseId: baseId, horizonDays: horizonDays);
-
-    if (_mode == 'off' || _mode == 'basic') return;
-
-    final lateTime = shiftTimeOfDay(time, _lateAfter);
-
-    final body = (totalDoses <= 1)
-        ? "You haven't checked $pillName yet! Check it off before it's too late!"
-        : "You haven't checked dose $doseNumber1Based of $pillName yet! Check it off before it's too late!";
-
-    await _scheduleHorizon(
-      baseId: baseId,
-      horizonDays: horizonDays,
-      startTomorrow: true, // <-- KEY
-      title: 'PillChecker',
-      body: body,
-      time: lateTime,
-    );
-  }
-
-  // ============================================================
-  // “From day” one-shots (kept exactly, still one-shot not horizon)
-  // ============================================================
-
-  static tz.TZDateTime _instanceOnOrAfter(DateTime day, TimeOfDay time) {
-    final base = DateTime(day.year, day.month, day.day, time.hour, time.minute);
-    final asTz = tz.TZDateTime.from(base, tz.local);
-
-    final now = tz.TZDateTime.now(tz.local);
-    if (asTz.isBefore(now)) {
-      return asTz.add(const Duration(days: 1));
+    for (int d = start; d <= end; d++) {
+      for (final kind in _Kind.values) {
+        await cancel(
+          _idFor(dayOffset: 0, pillSlot: pillSlot, doseIndex: d, kind: kind),
+        );
+      }
     }
-    return asTz;
-  }
 
-  static Future<void> scheduleDailyDoseReminderFrom({
-    required int id,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    int? totalDoses,
-    required DateTime startDay, // yyyy-mm-dd local date
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
-
-    if (_mode == 'off') return;
-
-    final scheduled = _instanceOnOrAfter(startDay, time);
-
-    final isSingleDose = (totalDoses != null && totalDoses <= 1);
-    final body = isSingleDose
-        ? "It's time to take $pillName!"
-        : "It's time to take dose $doseNumber1Based of $pillName!";
-
-    await _scheduleOneShot(
-      id: id,
-      when: scheduled,
-      title: 'PillChecker',
-      body: body,
-    );
-  }
-
-  static Future<void> scheduleDailyDoseEarlyReminderFrom({
-    required int id,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-    required DateTime startDay,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
-
-    if (_mode == 'off') return;
-    if (_mode == 'basic') return;
-
-    final earlyTime = shiftTimeOfDay(time, -_earlyLead);
-    final scheduled = _instanceOnOrAfter(startDay, earlyTime);
-
-    final body = (totalDoses <= 1)
-        ? "Almost time to take $pillName!"
-        : "Almost time to take dose $doseNumber1Based of $pillName!";
-
-    await _scheduleOneShot(
-      id: id,
-      when: scheduled,
-      title: 'PillChecker',
-      body: body,
-    );
-  }
-
-  static Future<void> scheduleDailyDoseLateReminderFrom({
-    required int id,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-    required DateTime startDay,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
-
-    if (_mode == 'off') return;
-    if (_mode == 'basic') return;
-
-    final lateTime = shiftTimeOfDay(time, _lateAfter);
-    final scheduled = _instanceOnOrAfter(startDay, lateTime);
-
-    final body = (totalDoses <= 1)
-        ? "You haven't checked $pillName yet! Check it off before it's too late!"
-        : "You haven't checked dose $doseNumber1Based of $pillName yet! Check it off before it's too late!";
-
-    await _scheduleOneShot(
-      id: id,
-      when: scheduled,
-      title: 'PillChecker',
-      body: body,
+    debugPrint(
+      'NOTIF: muteToday pillSlot=$pillSlot doseIndex=$doseIndex remaining=$muteRemainingDoses',
     );
   }
 
@@ -620,171 +509,7 @@ class NotificationService {
   }
 
   // ============================================================
-  // Single pill reminder (main) - kept (one-shot)
-  // ============================================================
-
-  static tz.TZDateTime _nextInstanceOfTime(TimeOfDay time) {
-    final now = tz.TZDateTime.now(tz.local);
-    var scheduled = tz.TZDateTime(
-      tz.local,
-      now.year,
-      now.month,
-      now.day,
-      time.hour,
-      time.minute,
-    );
-    if (scheduled.isBefore(now)) {
-      scheduled = scheduled.add(const Duration(days: 1));
-    }
-    return scheduled;
-  }
-
-  static Future<void> scheduleDailyPillReminder({
-    required int id,
-    required String pillName,
-    required TimeOfDay time,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
-
-    if (_mode == 'off') return;
-
-    final scheduled = _nextInstanceOfTime(time);
-
-    debugPrint(
-      'NOTIF: scheduling ONE-SHOT id=$id at ${scheduled.toIso8601String()}',
-    );
-
-    await _scheduleOneShot(
-      id: id,
-      when: scheduled,
-      title: 'PillChecker',
-      body: "It's time to take $pillName!",
-    );
-  }
-
-  // ============================================================
-  // MUTE (ONE-SHOT MODEL) - kept for legacy callers
-  // ============================================================
-
-  static tz.TZDateTime _tomorrowInstanceOfTime(TimeOfDay time) {
-    final now = tz.TZDateTime.now(tz.local);
-    final todayAt = tz.TZDateTime(
-      tz.local,
-      now.year,
-      now.month,
-      now.day,
-      time.hour,
-      time.minute,
-    );
-    return todayAt.add(const Duration(days: 1));
-  }
-
-  static Future<void> muteDailyMainUntilTomorrow({
-    required int id,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
-
-    if (_mode == 'off') return;
-
-    await cancel(id);
-
-    final when = _tomorrowInstanceOfTime(time);
-    final body = (totalDoses <= 1)
-        ? "It's time to take $pillName!"
-        : "It's time to take dose $doseNumber1Based of $pillName!";
-
-    debugPrint(
-      'MUTE->MAIN one-shot: id=$id -> tomorrow=${when.toIso8601String()}',
-    );
-
-    await _scheduleOneShot(
-      id: id,
-      when: when,
-      title: 'PillChecker',
-      body: body,
-    );
-  }
-
-  static Future<void> muteDailyEarlyUntilTomorrow({
-    required int id,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
-
-    if (_mode == 'off') return;
-    if (_mode == 'basic') return;
-
-    await cancel(id);
-
-    final earlyTime = shiftTimeOfDay(time, -_earlyLead);
-    final when = _tomorrowInstanceOfTime(earlyTime);
-
-    final body = (totalDoses <= 1)
-        ? "Almost time to take $pillName!"
-        : "Almost time to take dose $doseNumber1Based of $pillName!";
-
-    debugPrint(
-      'MUTE->EARLY one-shot: id=$id -> tomorrow=${when.toIso8601String()}',
-    );
-
-    await _scheduleOneShot(
-      id: id,
-      when: when,
-      title: 'PillChecker',
-      body: body,
-    );
-  }
-
-  static Future<void> muteDailyLateUntilTomorrow({
-    required int id,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-    await loadUserNotificationSettings();
-
-    if (_mode == 'off') return;
-    if (_mode == 'basic') return;
-
-    await cancel(id);
-
-    final lateTime = shiftTimeOfDay(time, _lateAfter);
-    final when = _tomorrowInstanceOfTime(lateTime);
-
-    final body = (totalDoses <= 1)
-        ? "You haven't checked $pillName yet! Check it off before it's too late!"
-        : "You haven't checked dose $doseNumber1Based of $pillName yet! Check it off before it's too late!";
-
-    debugPrint(
-      'MUTE->LATE one-shot: id=$id -> tomorrow=${when.toIso8601String()}',
-    );
-
-    await _scheduleOneShot(
-      id: id,
-      when: when,
-      title: 'PillChecker',
-      body: body,
-    );
-  }
-
-  // ============================================================
-  // Debug / cancel / misc helpers
+  // Debug / cancel
   // ============================================================
 
   static Future<void> debugDumpPending([String tag = '']) async {
@@ -887,89 +612,37 @@ class NotificationService {
     }
   }
 
-  // ============================================================
-  // Legacy one-shot testers (kept)
-  // ============================================================
+  static Future<void> cancelInactivityWarning() async {
+    await init();
+    await cancel(_inactivityWarningId);
+  }
 
-  static tz.TZDateTime _nextDoseInstance(TimeOfDay time) {
-    final now = tz.TZDateTime.now(tz.local);
-    var scheduled = tz.TZDateTime(
-      tz.local,
-      now.year,
-      now.month,
-      now.day,
-      time.hour,
-      time.minute,
-    );
-    if (scheduled.isBefore(now)) {
-      scheduled = scheduled.add(const Duration(days: 1));
+  static ({TimeOfDay time, int dayDelta}) _shiftWithDayDelta(
+    TimeOfDay t,
+    Duration delta,
+  ) {
+    final base = t.hour * 60 + t.minute;
+    final add = delta.inMinutes;
+
+    final total = base + add;
+
+    int dayDelta = 0;
+    int mins = total;
+
+    while (mins < 0) {
+      mins += 24 * 60;
+      dayDelta -= 1;
     }
-    return scheduled;
-  }
+    while (mins >= 24 * 60) {
+      mins -= 24 * 60;
+      dayDelta += 1;
+    }
 
-  static Future<void> scheduleDoseEarlyReminder({
-    required int id,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-    required int minutesBefore,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-
-    final now = tz.TZDateTime.now(tz.local);
-    final base = _nextDoseInstance(time);
-    final when = base.subtract(Duration(minutes: minutesBefore));
-
-    final body = (totalDoses <= 1)
-        ? "Almost time to take $pillName!"
-        : "Almost time to take dose $doseNumber1Based of $pillName!";
-
-    debugPrint(
-      'ONE-SHOT EARLY: id=$id pill=$pillName dose=$doseNumber1Based '
-      'base=${base.toIso8601String()} minutesBefore=$minutesBefore '
-      'scheduled=${when.toIso8601String()} now=${now.toIso8601String()}',
-    );
-
-    await _scheduleOneShot(
-      id: id,
-      when: when,
-      title: 'PillChecker',
-      body: body,
+    return (
+      time: TimeOfDay(hour: mins ~/ 60, minute: mins % 60),
+      dayDelta: dayDelta,
     );
   }
 
-  static Future<void> scheduleDoseLateReminder({
-    required int id,
-    required String pillName,
-    required int doseNumber1Based,
-    required TimeOfDay time,
-    required int totalDoses,
-    required int minutesAfter,
-  }) async {
-    await init();
-    await _requireExactAlarmsOnAndroid();
-
-    final now = tz.TZDateTime.now(tz.local);
-    final base = _nextDoseInstance(time);
-    final when = base.add(Duration(minutes: minutesAfter));
-
-    final body = (totalDoses <= 1)
-        ? "You haven't checked $pillName yet!"
-        : "You haven't checked dose $doseNumber1Based of $pillName yet!";
-
-    debugPrint(
-      'ONE-SHOT LATE: id=$id pill=$pillName dose=$doseNumber1Based '
-      'base=${base.toIso8601String()} minutesAfter=$minutesAfter '
-      'scheduled=${when.toIso8601String()} now=${now.toIso8601String()}',
-    );
-
-    await _scheduleOneShot(
-      id: id,
-      when: when,
-      title: 'PillChecker',
-      body: body,
-    );
-  }
+  static int _toMins(TimeOfDay t) => t.hour * 60 + t.minute;
 }
