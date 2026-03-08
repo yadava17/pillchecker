@@ -57,6 +57,10 @@ jobs:
       - name: Install Dependencies
         run: flutter pub get
 
+      - name: Inject Development Team into Xcode Project
+        run: |
+          sed -i '' 's/DEVELOPMENT_TEAM = .*/DEVELOPMENT_TEAM = ABCDE12345;/g' ios/Runner.xcodeproj/project.pbxproj || true
+
       - name: Install CocoaPods
         run: |
           cd ios
@@ -74,7 +78,6 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -archivePath build/Runner.xcarchive \
-            DEVELOPMENT_TEAM=ABCDE12345 \
             CODE_SIGNING_ALLOWED=NO \
             archive
 
