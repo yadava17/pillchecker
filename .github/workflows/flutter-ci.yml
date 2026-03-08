@@ -41,51 +41,51 @@ jobs:
 
 
   ios:
-  name: iOS Build
-  runs-on: macos-latest
+    name: iOS Build
+    runs-on: macos-latest
 
-  steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: Set up Flutter
-      uses: subosito/flutter-action@v2
-      with:
-        channel: stable
-        cache: true
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
 
-    - name: Install Dependencies
-      run: flutter pub get
+      - name: Install Dependencies
+        run: flutter pub get
 
-    - name: Install CocoaPods
-      run: |
-        cd ios
-        pod install
-        cd ..
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install
+          cd ..
 
-    - name: Build iOS (Flutter)
-      run: flutter build ios --release --no-codesign
+      - name: Build iOS (Flutter)
+        run: flutter build ios --release --no-codesign
 
-    - name: Archive iOS App
-      run: |
-        xcodebuild \
-          -workspace ios/Runner.xcworkspace \
-          -scheme Runner \
-          -configuration Release \
-          -sdk iphoneos \
-          -archivePath build/Runner.xcarchive \
-          archive \
-          CODE_SIGNING_ALLOWED=NO
+      - name: Archive iOS App
+        run: |
+          xcodebuild \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath build/Runner.xcarchive \
+            archive \
+            CODE_SIGNING_ALLOWED=NO
 
-    - name: Export IPA
-      run: |
-        xcodebuild -exportArchive \
-          -archivePath build/Runner.xcarchive \
-          -exportOptionsPlist ios/ExportOptions.plist \
-          -exportPath build/ios/ipa
+      - name: Export IPA
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath build/Runner.xcarchive \
+            -exportOptionsPlist ios/ExportOptions.plist \
+            -exportPath build/ios/ipa
 
-    - name: Upload iOS IPA
-      uses: actions/upload-artifact@v4
-      with:
-        name: ios-ipa
-        path: build/ios/ipa/*.ipa
+      - name: Upload iOS IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: build/ios/ipa/*.ipa
