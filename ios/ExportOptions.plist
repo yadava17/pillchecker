@@ -7,7 +7,5 @@
     <string>debugging</string>
     <key>destination</key>
     <string>export</string>
-    <key>compileBitcode</key>
-    <false/>
 </dict>
 </plist>
