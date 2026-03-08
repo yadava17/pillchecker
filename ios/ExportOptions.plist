@@ -4,8 +4,6 @@
 <plist version="1.0">
 <dict>
     <key>method</key>
-    <string>debugging</string>
-    <key>destination</key>
-    <string>export</string>
+    <string>development</string>
 </dict>
 </plist>
