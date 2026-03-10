@@ -80,15 +80,6 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           echo "${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
 
-      # 🔎 DEBUG STEP TO FIND BUNDLE ID INSIDE PROFILE
-      - name: Debug provisioning profile
-        run: |
-          security cms -D -i ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision > profile.plist
-          echo "Application Identifier:"
-          /usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" profile.plist
-          echo "Provisioning Profile Name:"
-          /usr/libexec/PlistBuddy -c "Print :Name" profile.plist
-
       - name: Build iOS (no codesign)
         run: flutter build ios --release --no-codesign
 
