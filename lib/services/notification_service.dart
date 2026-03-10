@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
@@ -18,8 +19,12 @@ class NotificationService {
   static bool _initialized = false;
   static Future<void>? _initFuture;
   static bool _permissionRequestInProgress = false;
+  static bool _exactAllowed = false;
+  static bool _checkedExactOnce = false;
+  static bool _androidSoundBroken = false;
 
-  static const String _channelId = 'pill_reminders_v2';
+  static const String _channelIdSound = 'pill_reminders_v2_sound';
+  static const String _channelIdNoSound = 'pill_reminders_v2_nosound'; // ✅ NEW
   static const String _channelName = 'Pill Reminders';
   static const String _channelDesc = 'Daily pill reminder notifications';
 
@@ -43,6 +48,8 @@ class NotificationService {
   // (today+tomorrow) OR (tomorrow+dayAfter)
 
   static const int _inactivityWarningId = 2_146_987_321; // unique + stable
+  static const int _lowSupplyBaseId = 1_909_000_000; // + pillSlot
+  static const int _outOfSupplyBaseId = 1_909_100_000; // + pillSlot
   static const Duration _inactivityWarnAfter = Duration(days: 1);
   static const Duration _inactivityAfterLateBuffer = Duration(minutes: 15);
 
@@ -172,16 +179,57 @@ class NotificationService {
     required String body,
   }) async {
     await init();
-    await _requireExactAlarmsOnAndroid();
 
-    await _plugin.zonedSchedule(
-      id: id,
-      scheduledDate: when,
-      notificationDetails: _details(),
-      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-      title: title,
-      body: body,
-    );
+    // ✅ Prefer exact alarms when possible
+    await _ensureExactAlarmStatus();
+    await _ensureExactAlarmStatus(allowPrompt: false);
+    final AndroidScheduleMode mode = _exactAllowed
+        ? AndroidScheduleMode.exactAllowWhileIdle
+        : AndroidScheduleMode.inexactAllowWhileIdle;
+
+    // First attempt: custom sound (unless we already marked it broken)
+    try {
+      await _plugin.zonedSchedule(
+        id: id,
+        scheduledDate: when,
+        notificationDetails: _details(forceNoSound: false),
+        androidScheduleMode: mode,
+        title: title,
+        body: body,
+      );
+
+      debugPrint(
+        'NOTIF: scheduled id=$id mode=$mode when=${when.toIso8601String()} sound=${_androidSoundBroken ? "default(sticky)" : "custom"}',
+      );
+      return;
+    } on PlatformException catch (e) {
+      // If custom sound caused it, permanently stop trying it this run/install
+      debugPrint(
+        'NOTIF: schedule FAILED id=$id (likely sound/channel) code=${e.code} msg=${e.message}',
+      );
+      _androidSoundBroken = true;
+    } catch (e) {
+      debugPrint('NOTIF: schedule FAILED id=$id err=$e');
+      _androidSoundBroken = true;
+    }
+
+    // Second attempt: guaranteed fallback (default sound/no sound)
+    try {
+      await _plugin.zonedSchedule(
+        id: id,
+        scheduledDate: when,
+        notificationDetails: _details(forceNoSound: true),
+        androidScheduleMode: mode,
+        title: title,
+        body: body,
+      );
+
+      debugPrint(
+        'NOTIF: fallback scheduled id=$id mode=$mode when=${when.toIso8601String()} sound=default',
+      );
+    } catch (e) {
+      debugPrint('NOTIF: fallback ALSO FAILED id=$id err=$e');
+    }
   }
 
   // Cancel 2-day window for one pill
@@ -227,7 +275,7 @@ class NotificationService {
     required TimeOfDay doseTime,
   }) async {
     await init();
-    await _requireExactAlarmsOnAndroid();
+    await _ensureExactAlarmStatus();
     await loadUserNotificationSettings();
 
     if (_mode == 'off') return;
@@ -296,7 +344,7 @@ class NotificationService {
     required List<List<String>> doseTimes24h, // "HH:mm" per dose
   }) async {
     await init();
-    await _requireExactAlarmsOnAndroid();
+    await _ensureExactAlarmStatus();
     await loadUserNotificationSettings();
 
     final today = _dayOnly(DateTime.now());
@@ -404,7 +452,7 @@ class NotificationService {
     required List<List<String>> doseTimes24h,
   }) async {
     await init();
-    await _requireExactAlarmsOnAndroid();
+    await _ensureExactAlarmStatus();
     await loadUserNotificationSettings();
 
     // Always kill old warning first (fixed ID)
@@ -496,7 +544,7 @@ class NotificationService {
 
   static Future<void> scheduleTestIn(Duration fromNow) async {
     await init();
-    await _requireExactAlarmsOnAndroid();
+    await _ensureExactAlarmStatus();
 
     final when = tz.TZDateTime.now(tz.local).add(fromNow);
 
@@ -508,9 +556,96 @@ class NotificationService {
     );
   }
 
+  static Future<void> scheduleOutOfSupplyWarning({
+    required int pillSlot,
+    required String pillName,
+  }) async {
+    await init();
+    await loadUserNotificationSettings();
+    if (_mode == 'off') return;
+
+    final id = _outOfSupplyBaseId + pillSlot;
+
+    // cancel any previous pending warning for this pill
+    await cancel(id);
+
+    final when = tz.TZDateTime.now(tz.local).add(const Duration(seconds: 5));
+    final suffix = pillName.trim().toLowerCase().endsWith('s') ? "'" : "'s";
+
+    await _scheduleOneShot(
+      id: id,
+      when: when,
+      title: 'PillChecker',
+      body: "You're out of $pillName$suffix supply! Time to refill!",
+    );
+  }
+
+  static Future<void> cancelOutOfSupplyWarning({required int pillSlot}) async {
+    await init();
+    final id = _outOfSupplyBaseId + pillSlot;
+    await cancel(id);
+  }
+
+  static Future<void> scheduleLowSupplyWarning({
+    required int pillSlot,
+    required String pillName,
+  }) async {
+    await init();
+    await loadUserNotificationSettings();
+
+    // Respect notifications Off
+    if (_mode == 'off') return;
+
+    // One per pill slot (stable + cancellable)
+    final id = _lowSupplyBaseId + pillSlot;
+
+    // Cancel any pending old warning for this pill
+    await cancel(id);
+
+    final when = tz.TZDateTime.now(tz.local).add(const Duration(seconds: 5));
+
+    final suffix = pillName.trim().toLowerCase().endsWith('s') ? "'" : "'s";
+    final body = '$pillName$suffix supply is running low. Make sure to refill!';
+
+    await _scheduleOneShot(
+      id: id,
+      when: when,
+      title: 'PillChecker',
+      body: body,
+    );
+  }
+
+  static Future<void> cancelLowSupplyWarning({required int pillSlot}) async {
+    await init();
+    final id = _lowSupplyBaseId + pillSlot;
+    await cancel(id);
+  }
+
   // ============================================================
   // Debug / cancel
   // ============================================================
+
+  static Future<void> debugAndroidStatus([String tag = '']) async {
+    await init();
+
+    if (!Platform.isAndroid) {
+      debugPrint('NOTIF STATUS $tag: not Android');
+      return;
+    }
+
+    final android = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+
+    final enabled = await android?.areNotificationsEnabled() ?? false;
+    final exact = await android?.canScheduleExactNotifications() ?? false;
+
+    debugPrint(
+      'NOTIF STATUS $tag: enabled=$enabled exact=$exact mode=$_mode '
+      'early=${_earlyLead.inMinutes} late=${_lateAfter.inMinutes} tz=${tz.local.name}',
+    );
+  }
 
   static Future<void> debugDumpPending([String tag = '']) async {
     await init();
@@ -551,7 +686,11 @@ class NotificationService {
   // Platform / details
   // ============================================================
 
-  static Future<void> _requireExactAlarmsOnAndroid() async {
+  static DateTime _lastExactCheck = DateTime.fromMillisecondsSinceEpoch(0);
+
+  static Future<void> _ensureExactAlarmStatus({
+    bool allowPrompt = false,
+  }) async {
     if (!Platform.isAndroid) return;
 
     final android = _plugin
@@ -559,37 +698,58 @@ class NotificationService {
           AndroidFlutterLocalNotificationsPlugin
         >();
 
-    if (android == null) return;
+    if (android == null) {
+      _exactAllowed = false;
+      return;
+    }
 
-    final can = await android.canScheduleExactNotifications() ?? false;
-    if (can) return;
+    // ✅ Re-check periodically (so if user enabled it in Settings, we start using exact)
+    final now = DateTime.now();
+    final shouldRecheck =
+        now.difference(_lastExactCheck) > const Duration(seconds: 20);
 
-    await android.requestExactAlarmsPermission();
+    if (shouldRecheck) {
+      _lastExactCheck = now;
+      _exactAllowed = await android.canScheduleExactNotifications() ?? false;
+      debugPrint('NOTIF: exactAlarmAllowed=$_exactAllowed (recheck)');
+    }
 
-    final canAfter = await android.canScheduleExactNotifications() ?? false;
-    if (!canAfter) {
-      throw StateError(
-        'Exact alarms are not permitted. Enable: Settings > Apps > Special access > Alarms & reminders (allow PillChecker).',
-      );
+    // ✅ Only ever prompt if caller explicitly allows it (avoid spam)
+    if (!_exactAllowed && allowPrompt) {
+      await android.requestExactAlarmsPermission();
+      _exactAllowed = await android.canScheduleExactNotifications() ?? false;
+      debugPrint('NOTIF: exactAlarmAllowed=$_exactAllowed (after prompt)');
     }
   }
 
-  static NotificationDetails _details() {
-    return const NotificationDetails(
-      android: AndroidNotificationDetails(
-        _channelId,
-        _channelName,
-        channelDescription: _channelDesc,
-        importance: Importance.max,
-        priority: Priority.high,
-        playSound: true,
-        sound: RawResourceAndroidNotificationSound('pillchecker_notification'),
-      ),
-      iOS: DarwinNotificationDetails(
-        presentSound: true,
-        sound: 'pillchecker_notification.wav',
-      ),
+  static NotificationDetails _details({bool forceNoSound = false}) {
+    final useNoSound = forceNoSound || _androidSoundBroken;
+
+    final android = AndroidNotificationDetails(
+      useNoSound ? _channelIdNoSound : _channelIdSound,
+      _channelName,
+      channelDescription: _channelDesc,
+      importance: Importance.max,
+      priority: Priority.high,
+
+      // ✅ Always-valid icon (don’t use a drawable that doesn’t exist)
+      icon: '@mipmap/ic_launcher',
+
+      // If your plugin doesn’t allow sound:null, set playSound: !useNoSound and omit sound.
+      playSound: true,
+      sound: useNoSound
+          ? null
+          : const RawResourceAndroidNotificationSound(
+              'pillchecker_notification',
+            ),
     );
+
+    const ios = DarwinNotificationDetails(
+      presentSound: true,
+      sound: 'pillchecker_notification.wav',
+    );
+
+    return NotificationDetails(android: android, iOS: ios);
   }
 
   static Future<void> _configureLocalTimeZone() async {

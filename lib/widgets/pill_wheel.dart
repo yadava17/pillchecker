@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 
 class PillWheel extends StatefulWidget {
@@ -197,7 +198,12 @@ class _PillWheelState extends State<PillWheel> {
                 final offset = Offset(-riseWithGap, xPush);
 
                 final scale = (1.0 - d * 0.24).clamp(0.75, 1.0);
-                final boostedScale = (scale * 1.5) * 1.1.clamp(0.75, 1.15);
+                final baseBoostedScale = (scale * 1.5) * 1.1.clamp(0.75, 1.15);
+
+                // ✅ Android-only shrink (tweak this number: 0.9 = 10% smaller, 0.8 = 20% smaller)
+                final androidWheelScale = Platform.isAndroid ? 0.9 : 1.0;
+
+                final boostedScale = baseBoostedScale * androidWheelScale;
 
                 // Determine if this pill circle is "real" (has icon) or "empty slot"
                 final pillSlotIndex = index - 1; // 0..displayPillCount-1

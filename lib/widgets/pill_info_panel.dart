@@ -7,12 +7,16 @@ class PillInfoPanel extends StatelessWidget {
     required this.doseTimesLabel,
     required this.onClose,
     required this.onEdit,
+    this.supplyTrackingOn = false,
+    this.supplyLeft = 0,
   });
 
   final String pillName;
   final List<String> doseTimesLabel; // already formatted strings like "8:00 AM"
   final VoidCallback onClose;
   final VoidCallback onEdit;
+  final bool supplyTrackingOn;
+  final int supplyLeft;
 
   @override
   Widget build(BuildContext context) {
@@ -30,10 +34,9 @@ class PillInfoPanel extends StatelessWidget {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            // Header row
+            // Header row (UNCHANGED)
             Row(
               children: [
-                // ✅ Pill icon (placeholder asset for now)
                 Container(
                   width: 52,
                   height: 52,
@@ -50,9 +53,7 @@ class PillInfoPanel extends StatelessWidget {
                     ),
                   ),
                 ),
-
                 const SizedBox(width: 12),
-
                 Expanded(
                   child: Text(
                     pillName,
@@ -64,8 +65,6 @@ class PillInfoPanel extends StatelessWidget {
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
-
-                // ✅ X only (no extra Close button needed)
                 IconButton(
                   onPressed: onClose,
                   icon: const Icon(Icons.close, color: white),
@@ -75,70 +74,121 @@ class PillInfoPanel extends StatelessWidget {
 
             const SizedBox(height: 12),
 
-            // ✅ Placeholder DB info box (bigger / main content)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.12),
-                borderRadius: BorderRadius.circular(18),
-              ),
-              child: const Text(
-                'Placeholder: Pill info will go here (RxNorm / DB later).\n\n'
-                '• Generic name\n'
-                '• Brand names\n'
-                '• Warnings / interactions\n'
-                '• Notes',
-                style: TextStyle(color: Colors.white70, fontSize: 15, height: 1.25),
-              ),
-            ),
-
-            const SizedBox(height: 12),
-
-            Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                'Configured for:',
-                style: TextStyle(
-                  color: Colors.white.withOpacity(0.92),
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-
-            // ✅ Smaller configured-times box
-            Container(
-              width: double.infinity,
-              height: 120, // <-- smaller than before; tweak if you want
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.12),
-                borderRadius: BorderRadius.circular(18),
-              ),
-              child: doseTimesLabel.isEmpty
-                  ? const Text(
-                      'No times set.',
-                      style: TextStyle(color: Colors.white70),
-                    )
-                  : ListView.separated(
-                      itemCount: doseTimesLabel.length,
-                      separatorBuilder: (_, __) => const SizedBox(height: 8),
-                      itemBuilder: (_, i) => Text(
-                        '• ${doseTimesLabel[i]}',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
+            // ✅ Scrollable content area
+            Expanded(
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.12),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: const Text(
+                        'Placeholder: Pill info will go here (RxNorm / DB later).\n\n'
+                        '• Generic name\n'
+                        '• Brand names\n'
+                        '• Warnings / interactions\n'
+                        '• Notes',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 15,
+                          height: 1.25,
                         ),
                       ),
                     ),
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        'Configured for:',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.92),
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+
+                    // Replace fixed-height box with "shrink-safe" list
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.12),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: doseTimesLabel.isEmpty
+                          ? const Text(
+                              'No times set.',
+                              style: TextStyle(color: Colors.white70),
+                            )
+                          : Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                for (final t in doseTimesLabel)
+                                  Padding(
+                                    padding: const EdgeInsets.only(bottom: 8),
+                                    child: Text(
+                                      '• $t',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                    ),
+
+                    const SizedBox(height: 14),
+
+                    if (supplyTrackingOn)
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(18),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.medication_rounded,
+                              color: Colors.white.withOpacity(0.85),
+                            ),
+                            const SizedBox(width: 10),
+                            const Text(
+                              'Supply left:',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 16,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const Spacer(),
+                            Text(
+                              supplyLeft.toString(),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 18,
+                                fontWeight: FontWeight.w900,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
+              ),
             ),
 
-            const SizedBox(height: 40),
-
-            // ✅ Only Edit button (full width)
+            // ✅ Pinned Edit button (always visible)
             SizedBox(
               width: double.infinity,
               height: 52,

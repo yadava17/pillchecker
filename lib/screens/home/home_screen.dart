@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,6 +13,10 @@ import 'package:pillchecker/screens/settings/settings_screen.dart';
 import 'package:pillchecker/widgets/pill_info_panel.dart';
 import 'package:pillchecker/widgets/weekly_pillbox_organizer.dart';
 import 'package:pillchecker/constants/prefs_keys.dart';
+import 'package:pillchecker/models/pill_search_item.dart';
+import 'package:pillchecker/widgets/pill_search_panel.dart';
+import 'package:pillchecker/screens/directory/directory_screen.dart';
+import 'package:pillchecker/widgets/dose_progress_side_bar.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -33,6 +38,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   static const _pillDoseTimesKey =
       'pill_dose_times_v2'; // JSON: List<List<String>>
+
+  // -------- supply prefs keys --------
+  static const _pillSupplyEnabledKey =
+      'pill_supply_enabled_v1'; // JSON List<bool>
+  static const _pillSupplyLeftKey = 'pill_supply_left_v1'; // JSON List<int>
+  static const _pillSupplyInitKey = 'pill_supply_init_v1'; // JSON List<int>
+  static const _pillSupplyLowSentKey =
+      'pill_supply_low_sent_v1'; // JSON List<bool>
+
+  static const _pillNameLockedKey = 'pill_name_locked_v1'; // JSON List<bool>
+
+  // -------- supply in-memory state (aligned with pillNames) --------
+  List<bool> pillSupplyEnabled = [];
+  List<int> pillSupplyLeft = [];
+  List<int> pillSupplyInitial = [];
+  List<bool> pillSupplyLowSent = [];
+  List<bool> pillNameLocked = []; // aligned with pillNames
 
   // -------- in-memory state --------
   List<String> pillNames = [];
@@ -62,6 +84,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   bool _infoOpen = false;
 
+  bool _searchOpen = false;
+
+  // Used to fill the config panel "info" box when a search item was picked
+  String? _selectedPillInfo;
+
   // edit mode
   int? _editingIndex;
   bool get _isEditing => _editingIndex != null;
@@ -70,6 +97,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _timesPerDay = 1;
   TimeOfDay? _singleDoseTime;
   List<TimeOfDay?> _doseTimes = [];
+
+  // -------- supply draft (current config flow) --------
+  bool _supplyTrackOn = false;
+  int _supplyLeftDraft = 0; // current supply left
+  int _supplyInitialDraft = 0; // original starting supply (for later)
 
   Timer? _labelTimer;
   Timer? _doseBoundaryTimer;
@@ -86,6 +118,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String? _labelOverride;
   bool _showPillLabel = true;
 
+  String _supplyModeGlobal = 'decide'; // 'decide' | 'on' | 'off'
+  int _supplyLowThreshold = 10;
+  bool _supplyPromptedThisFlow = false;
+
   final FocusNode _nameFocus = FocusNode();
 
   late final FixedExtentScrollController _wheelController =
@@ -101,6 +137,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   int _pillboxResetToken = 0;
 
+  // Pillbox-only scale (1.0 = current size). Try 0.90 or 0.85.
+  static const double _pillboxScale = 0.75;
+  final pbScale = _pillboxScale;
+
   // what day the pillbox is CURRENTLY positioned to (for sliding)
   int _pillboxVisualDay = 3; // default Wed so your current alignment is sane
 
@@ -114,6 +154,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _coldStart = true; // first time screen shows after app launch
 
   bool _notifRefreshBusy = false;
+
+  bool _lockPillName = false; // true = hide/disable edit-name UI
+
+  int _supplyBadgeCacheValue = 0; // last displayed number (prevents "0 flash")
 
   // ---------------- lifecycle ----------------
   @override
@@ -136,6 +180,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _allowDailyFillAnim = true);
     });
     _loadAndMaybeAutoOpen();
+    unawaited(_loadSupplyGlobalSettings());
     _coldStartOpenToday();
     _scheduleGlobalDayBoundaryRefresh();
     _scheduleGlobalBoundaryRefresh();
@@ -182,6 +227,85 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final ms = (minMs + steps * perStepMs).clamp(minMs, maxMs);
     return Duration(milliseconds: ms);
+  }
+
+  Future<void> _persistSupplyLists() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_pillSupplyEnabledKey, jsonEncode(pillSupplyEnabled));
+    await prefs.setString(_pillSupplyLeftKey, jsonEncode(pillSupplyLeft));
+    await prefs.setString(_pillSupplyInitKey, jsonEncode(pillSupplyInitial));
+    await prefs.setString(_pillSupplyLowSentKey, jsonEncode(pillSupplyLowSent));
+  }
+
+  Future<void> _consumeOneSupplyIfEnabled(int pillIndex) async {
+    if (pillIndex < 0 || pillIndex >= pillNames.length) return;
+
+    _alignSupplyListsToCount(pillNames.length);
+
+    // ✅ obey global mode
+    if (!_effectiveSupplyOn(pillIndex)) return;
+
+    final oldLeft = pillSupplyLeft[pillIndex];
+
+    // if supply was never set (0), don't spam warnings
+    if (oldLeft <= 0) {
+      return;
+    }
+
+    final newLeft = (oldLeft - 1).clamp(0, 1000000);
+    final hitZeroNow = (oldLeft > 0 && newLeft == 0);
+
+    // Align safety (should already be aligned, but avoid crashes)
+    while (pillSupplyEnabled.length < pillNames.length)
+      pillSupplyEnabled.add(false);
+    while (pillSupplyLeft.length < pillNames.length) pillSupplyLeft.add(0);
+    while (pillSupplyInitial.length < pillNames.length)
+      pillSupplyInitial.add(0);
+    while (pillSupplyLowSent.length < pillNames.length)
+      pillSupplyLowSent.add(false);
+
+    if (!pillSupplyEnabled[pillIndex]) return;
+
+    // Update memory immediately (fast UI)
+    setState(() {
+      pillSupplyLeft[pillIndex] = newLeft;
+    });
+
+    // Persist in background (don’t block the check animation/UI)
+    unawaited(_persistSupplyLists());
+
+    // Low supply notification (once) when it goes under threshold
+    final alreadySent = pillSupplyLowSent[pillIndex];
+
+    // ✅ only warn when we CROSS into low territory and we had real supply
+    final shouldWarnLow =
+        !alreadySent && newLeft > 0 && newLeft < _supplyLowThreshold;
+
+    if (shouldWarnLow) {
+      setState(() => pillSupplyLowSent[pillIndex] = true);
+      unawaited(_saveSupplyListsToPrefs());
+
+      unawaited(
+        NotificationService.scheduleLowSupplyWarning(
+          pillSlot: pillIndex,
+          pillName: pillNames[pillIndex],
+        ),
+      );
+    }
+
+    if (hitZeroNow) {
+      // low warning no longer relevant
+      unawaited(
+        NotificationService.cancelLowSupplyWarning(pillSlot: pillIndex),
+      );
+
+      unawaited(
+        NotificationService.scheduleOutOfSupplyWarning(
+          pillSlot: pillIndex,
+          pillName: pillNames[pillIndex],
+        ),
+      );
+    }
   }
 
   void _startNewDaySequence({required int today}) {
@@ -370,12 +494,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _hidePillLabelNow();
     setState(() {
+      _lockPillName = (pillIndex < pillNameLocked.length)
+          ? pillNameLocked[pillIndex]
+          : false;
       _editingIndex = pillIndex;
       _infoOpen = false;
       _configOpen = true;
 
+      _supplyPromptedThisFlow = false;
+      _maybeAutoPromptSupply();
+
       _nameController.text = pillNames[pillIndex];
       _timesPerDay = doses.length;
+
+      _supplyTrackOn = (pillIndex < pillSupplyEnabled.length)
+          ? pillSupplyEnabled[pillIndex]
+          : false;
+
+      _supplyLeftDraft = (pillIndex < pillSupplyLeft.length)
+          ? pillSupplyLeft[pillIndex]
+          : 0;
+
+      _supplyInitialDraft = (pillIndex < pillSupplyInitial.length)
+          ? pillSupplyInitial[pillIndex]
+          : 0;
 
       if (doses.length == 1) {
         _step = _ConfigStep.config;
@@ -551,6 +693,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         pillNames: names,
         doseTimes24h: doseTimes24h,
       );
+
+      await NotificationService.debugDumpPending('after_rebuild_window');
 
       // 3) IMPORTANT: re-mute any already-checked doses FOR TODAY
       // This prevents rebuild from "unmuting" after someone checks early.
@@ -876,14 +1020,84 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return (screenSize.width / 2) + s(offsetFromCenter) - (elementW / 2);
   }
 
+  double _leftFromDesignRightScaled(
+    double baseW,
+    double baseRight,
+    Size screenSize,
+    double Function(double) s,
+    double designW,
+    double scale,
+  ) {
+    final elementW = s(baseW) * scale;
+
+    final designCenterX = designW / 2;
+    final elementCenterX = designW - baseRight - (baseW / 2);
+    final offsetFromCenter = elementCenterX - designCenterX;
+
+    // ✅ scale the offset-from-center too, since the pillbox is scaled down
+    return (screenSize.width / 2) +
+        (s(offsetFromCenter) * scale) -
+        (elementW / 2);
+  }
+
+  void _alignSupplyListsToCount(int count) {
+    while (pillSupplyEnabled.length < count) pillSupplyEnabled.add(false);
+    if (pillSupplyEnabled.length > count) {
+      pillSupplyEnabled.removeRange(count, pillSupplyEnabled.length);
+    }
+
+    while (pillSupplyLeft.length < count) pillSupplyLeft.add(0);
+    if (pillSupplyLeft.length > count) {
+      pillSupplyLeft.removeRange(count, pillSupplyLeft.length);
+    }
+
+    while (pillSupplyInitial.length < count) pillSupplyInitial.add(0);
+    if (pillSupplyInitial.length > count) {
+      pillSupplyInitial.removeRange(count, pillSupplyInitial.length);
+    }
+
+    while (pillSupplyLowSent.length < count) pillSupplyLowSent.add(false);
+    if (pillSupplyLowSent.length > count) {
+      pillSupplyLowSent.removeRange(count, pillSupplyLowSent.length);
+    }
+  }
+
+  void _maybeAutoPromptSupply() {
+    if (_supplyModeGlobal != 'on') return;
+    if (_supplyPromptedThisFlow) return;
+    if (_supplyLeftDraft > 0) return;
+
+    _supplyPromptedThisFlow = true;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await _editSupplyDialog(setInitialToo: true);
+    });
+  }
+
+  Future<void> _saveSupplyListsToPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_pillSupplyEnabledKey, jsonEncode(pillSupplyEnabled));
+    await prefs.setString(_pillSupplyLeftKey, jsonEncode(pillSupplyLeft));
+    await prefs.setString(_pillSupplyInitKey, jsonEncode(pillSupplyInitial));
+    await prefs.setString(_pillSupplyLowSentKey, jsonEncode(pillSupplyLowSent));
+  }
+
   double _pillboxLeftForDay({
     required Size size,
     required double Function(double) s,
     required double designW,
-    required int todayIndex, // 0=Sun..6=Sat
+    required int todayIndex,
+    required double scale, // 0=Sun..6=Sat
   }) {
-    final wedLeft = _leftFromDesignRight(400, 198, size, s, designW);
-
+    final wedLeft = _leftFromDesignRightScaled(
+      400,
+      198,
+      size,
+      s,
+      designW,
+      scale,
+    );
     const base = 92.6;
     const growth = 0.4;
 
@@ -906,7 +1120,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final correctedShift = shiftFromWed + tweak[todayIndex];
 
-    return wedLeft - s(correctedShift);
+    // scale the day-to-day shift too, since the pillbox is smaller
+    return wedLeft - (s(correctedShift) * scale);
   }
 
   @override
@@ -951,6 +1166,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
   }
 
+  Future<void> _loadSupplyGlobalSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final mode = prefs.getString(kSupplyModeKey) ?? 'decide';
+
+    // User chooses the number where it should turn yellow / notify ("when supply is at:")
+    // We store +1 internally because our logic uses "< threshold"
+    final lowUser = (prefs.getInt(kSupplyLowThresholdKey) ?? 10).clamp(5, 999);
+    final lowForLessThanLogic = lowUser + 1;
+
+    if (!mounted) return;
+    setState(() {
+      _supplyModeGlobal = mode;
+      _supplyLowThreshold = lowForLessThanLogic;
+    });
+  }
+
+  bool _effectiveSupplyOn(int pillIndex) {
+    if (_supplyModeGlobal == 'off') return false;
+    if (_supplyModeGlobal == 'on') return true;
+    return pillIndex < pillSupplyEnabled.length && pillSupplyEnabled[pillIndex];
+  }
+
+  Future<bool> _ensureSupplyIfRequired() async {
+    final required =
+        (_supplyModeGlobal == 'on') ||
+        (_supplyModeGlobal == 'decide' && _supplyTrackOn);
+
+    if (!required) return true;
+    if (_supplyLeftDraft > 0) return true;
+
+    await _editSupplyDialog(setInitialToo: true);
+    return _supplyLeftDraft > 0;
+  }
+
   // ---------------- UI label helpers ----------------
   void _hidePillLabelNow() {
     if (_showPillLabel) setState(() => _showPillLabel = false);
@@ -972,6 +1222,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _editNameAgain() {
+    if (_lockPillName) return;
     setState(() => _step = _ConfigStep.name);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1009,6 +1260,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _startAddFlow(createNewSlot: true);
   }
 
+  void _cacheSupplyBadgeIfShowing() {
+    final idx = _centerPillIndex;
+    if (idx == null) return;
+
+    final isOn =
+        idx < pillSupplyEnabled.length && pillSupplyEnabled[idx] == true;
+
+    if (!isOn) return;
+
+    final v = (idx < pillSupplyLeft.length) ? pillSupplyLeft[idx] : 0;
+    _supplyBadgeCacheValue = v;
+  }
+
   // ---------------- decode helpers ----------------
   List<List<String>> _decodeListOfStringLists(String? raw) {
     if (raw == null || raw.isEmpty) return [];
@@ -1016,6 +1280,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return (decoded as List)
         .map((e) => (e as List).map((x) => x.toString()).toList())
         .toList();
+  }
+
+  List<bool> _decodeBoolList(String? raw) {
+    if (raw == null || raw.isEmpty) return [];
+    final decoded = jsonDecode(raw);
+    return (decoded as List).map((e) => e == true).toList();
+  }
+
+  List<int> _decodeIntList(String? raw) {
+    if (raw == null || raw.isEmpty) return [];
+    final decoded = jsonDecode(raw);
+    return (decoded as List).map((e) => (e as num).toInt()).toList();
   }
 
   // ---------------- load ----------------
@@ -1055,7 +1331,53 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     await prefs.setString(_pillDoseTimesKey, jsonEncode(loadedDoseTimes));
 
+    // ---------------- load supply tracking (aligned to pill list) ----------------
+    final supplyEnabled = _decodeBoolList(
+      prefs.getString(_pillSupplyEnabledKey),
+    );
+    final supplyLeft = _decodeIntList(prefs.getString(_pillSupplyLeftKey));
+    final supplyInit = _decodeIntList(prefs.getString(_pillSupplyInitKey));
+    final supplyLowSent = _decodeBoolList(
+      prefs.getString(_pillSupplyLowSentKey),
+    );
+
+    // Align lengths to names
+    while (supplyEnabled.length < savedNames.length) supplyEnabled.add(false);
+    while (supplyLeft.length < savedNames.length) supplyLeft.add(0);
+    while (supplyInit.length < savedNames.length) supplyInit.add(0);
+    while (supplyLowSent.length < savedNames.length) supplyLowSent.add(false);
+
+    if (supplyEnabled.length > savedNames.length) {
+      supplyEnabled.removeRange(savedNames.length, supplyEnabled.length);
+    }
+    if (supplyLeft.length > savedNames.length) {
+      supplyLeft.removeRange(savedNames.length, supplyLeft.length);
+    }
+    if (supplyInit.length > savedNames.length) {
+      supplyInit.removeRange(savedNames.length, supplyInit.length);
+    }
+    if (supplyLowSent.length > savedNames.length) {
+      supplyLowSent.removeRange(savedNames.length, supplyLowSent.length);
+    }
+
+    // Persist back (so fresh installs get seeded)
+    await prefs.setString(_pillSupplyEnabledKey, jsonEncode(supplyEnabled));
+    await prefs.setString(_pillSupplyLeftKey, jsonEncode(supplyLeft));
+    await prefs.setString(_pillSupplyInitKey, jsonEncode(supplyInit));
+    await prefs.setString(_pillSupplyLowSentKey, jsonEncode(supplyLowSent));
+
     final loadedMap = await _loadCheckMap();
+
+    final nameLocked = _decodeBoolList(prefs.getString(_pillNameLockedKey));
+
+    // Align lengths to names
+    while (nameLocked.length < savedNames.length) nameLocked.add(false);
+    if (nameLocked.length > savedNames.length) {
+      nameLocked.removeRange(savedNames.length, nameLocked.length);
+    }
+
+    // Persist back (so it exists going forward)
+    await prefs.setString(_pillNameLockedKey, jsonEncode(nameLocked));
 
     setState(() {
       pillNames = savedNames;
@@ -1063,6 +1385,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _checkMapCache = loadedMap;
       _checkMapFuture = Future.value(loadedMap);
       pillDoseTimes = loadedDoseTimes;
+
+      pillNameLocked = nameLocked;
+      pillSupplyEnabled = supplyEnabled;
+      pillSupplyLeft = supplyLeft;
+      pillSupplyInitial = supplyInit;
+      pillSupplyLowSent = supplyLowSent;
     });
 
     // After loading pills, rebuild window AND re-mute anything already checked today
@@ -1094,10 +1422,163 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
   }
 
+  void _startAddFromDirectory(PillSearchItem item) {
+    _hidePillLabelNow();
+
+    final tp = item.suggestedTimesPerDay.clamp(1, 6);
+
+    setState(() {
+      // close other overlays/panels
+      _searchOpen = false;
+      _infoOpen = false;
+
+      // lock name (non-custom)
+      _lockPillName = true;
+
+      // load info + name
+      _selectedPillInfo = item.info;
+      _nameController.text = item.name;
+
+      // open config panel
+      _configOpen = true;
+      _editingIndex = null;
+
+      // treat like add flow so wheel locks
+      _pendingSlot = true;
+
+      // times/day + step
+      _timesPerDay = tp;
+      _singleDoseTime = null;
+
+      if (tp == 1) {
+        _step = _ConfigStep.config;
+        _doseTimes = [];
+      } else {
+        _step = _ConfigStep.doses;
+        _doseTimes = List<TimeOfDay?>.filled(tp, null);
+      }
+    });
+
+    _centerWheelOn(_pendingWheelIndex);
+  }
+
+  Future<void> _openDirectoryScreen() async {
+    // optional: don’t allow opening while config/search is open
+    if (_configOpen || _infoOpen || _searchOpen) return;
+
+    final picked = await Navigator.push<PillSearchItem>(
+      context,
+      MaterialPageRoute(builder: (_) => const DirectoryScreen()),
+    );
+
+    if (!mounted || picked == null) return;
+
+    _startAddFromDirectory(picked);
+  }
+
+  void _openPillSearch() {
+    FocusManager.instance.primaryFocus?.unfocus();
+    _hidePillLabelNow();
+
+    setState(() {
+      _searchOpen = true;
+
+      // Make sure other panels aren't open
+      _configOpen = false;
+      _infoOpen = false;
+
+      // Don't leave a pending slot from previous flows
+      _pendingSlot = false;
+      _editingIndex = null;
+    });
+  }
+
+  void _closePillSearch() {
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() => _searchOpen = false);
+    _showPillLabelAfterSlide();
+  }
+
+  void _pickCustomFromSearch() {
+    _selectedPillInfo = null;
+    _lockPillName = false;
+    _closePillSearch();
+
+    // Your existing flow
+    _startAddFlow(createNewSlot: true);
+  }
+
+  Future<void> _pickSearchItem(PillSearchItem item) async {
+    final already = pillNames.any(
+      (p) => p.trim().toLowerCase() == item.name.trim().toLowerCase(),
+    );
+
+    if (already) {
+      await showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Already added'),
+          content: Text('"${item.name}" is already on your wheel.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return; // ✅ do not open config flow
+    }
+    _hidePillLabelNow();
+
+    final tp = item.suggestedTimesPerDay.clamp(1, 6);
+
+    setState(() {
+      _supplyTrackOn = false;
+      _supplyLeftDraft = 0;
+      _supplyInitialDraft = 0;
+      _lockPillName = true;
+      _searchOpen = false;
+
+      // ✅ fill the info box + name
+      _selectedPillInfo = item.info;
+      _nameController.text = item.name;
+
+      // ✅ open your existing config panel
+      _editingIndex = null;
+      _infoOpen = false;
+      _configOpen = true;
+
+      _supplyPromptedThisFlow = false;
+      _maybeAutoPromptSupply();
+
+      // ✅ prefill “times per day”
+      _timesPerDay = tp;
+
+      // ✅ treat it like "add flow" so the wheel locks like normal
+      _pendingSlot = true;
+
+      // ✅ jump to the correct step
+      _singleDoseTime = null;
+
+      if (tp == 1) {
+        _step = _ConfigStep.config; // user picks single time here
+        _doseTimes = [];
+      } else {
+        _step = _ConfigStep.doses; // go straight to the dose-times list
+        _doseTimes = List<TimeOfDay?>.filled(tp, null);
+      }
+    });
+
+    // Center wheel onto the pending slot
+    _centerWheelOn(_pendingWheelIndex);
+  }
+
   // ---------------- config flow ----------------
   void _startAddFlow({required bool createNewSlot}) {
     _hidePillLabelNow();
     setState(() {
+      _lockPillName = false;
       _editingIndex = null; // ✅ IMPORTANT: prevent stale edit mode
       _infoOpen = false;
 
@@ -1116,20 +1597,89 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _cancelAddFlow() {
+    _selectedPillInfo = null;
     FocusManager.instance.primaryFocus?.unfocus();
     setState(() {
+      _supplyTrackOn = false;
+      _supplyLeftDraft = 0;
+      _supplyInitialDraft = 0;
+      _lockPillName = false;
       _configOpen = false;
       _pendingSlot = false;
+      _supplyPromptedThisFlow = false;
       _step = _ConfigStep.name;
     });
     _centerWheelOn(1);
     _showPillLabelAfterSlide();
+    _maybeAutoPromptSupply();
   }
 
   void _setCheckMapAndRebuild(Map<String, dynamic> map) {
     _checkMapCache = map;
     _checkMapFuture = Future.value(map);
     if (mounted) setState(() {});
+  }
+
+  Future<void> _showSupplyInfoDialog() async {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Supply tracking'),
+        content: const Text(
+          'This tracks how many pills you have left for this pill.\n\n'
+          'Each time you check a dose, the supply will decrease by 1.\n\n'
+          'Later: you can enable refill reminders and customize it in Settings.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _editSupplyDialog({required bool setInitialToo}) async {
+    final controller = TextEditingController(
+      text: _supplyLeftDraft > 0 ? _supplyLeftDraft.toString() : '',
+    );
+
+    final result = await showDialog<int?>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(setInitialToo ? 'Set starting supply' : 'Edit supply left'),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            hintText: 'Enter a number (ex: 60)',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, null),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () {
+              final v = int.tryParse(controller.text.trim());
+              Navigator.pop(context, v);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (result == null) return;
+    final v = result.clamp(0, 1000000);
+
+    if (!mounted) return;
+    setState(() {
+      _supplyLeftDraft = v;
+      if (setInitialToo) _supplyInitialDraft = v;
+    });
   }
 
   Future<void> _pickTimeSingle() async {
@@ -1151,12 +1701,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool get _allDoseTimesSet =>
       _doseTimes.isNotEmpty && _doseTimes.every((t) => t != null);
 
-  void _handlePrimaryAction() {
+  void _handlePrimaryAction() async {
     if (_step == _ConfigStep.name) {
       if (_nameController.text.trim().isEmpty) return;
       setState(() => _step = _ConfigStep.config);
       return;
     }
+
+    final ok = await _ensureSupplyIfRequired();
+    if (!ok) return;
 
     if (_step == _ConfigStep.config) {
       if (_timesPerDay == 1) {
@@ -1221,8 +1774,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final prefs = await SharedPreferences.getInstance();
 
+    _alignSupplyListsToCount(pillNames.length);
+
     final updatedNames = [...pillNames, name];
     await prefs.setStringList(_pillNamesKey, updatedNames);
+
+    final effectiveTrack = (_supplyModeGlobal == 'on')
+        ? true
+        : (_supplyModeGlobal == 'off')
+        ? false
+        : _supplyTrackOn;
+
+    final leftToStore = effectiveTrack ? _supplyLeftDraft : 0;
+    final initToStore = effectiveTrack
+        ? (_supplyInitialDraft > 0 ? _supplyInitialDraft : leftToStore)
+        : 0;
+
+    // keep arrays aligned BEFORE modifying
+    _alignSupplyListsToCount(pillNames.length);
+
+    // append for this new pill
+    pillSupplyEnabled.add(effectiveTrack);
+    pillSupplyLeft.add(leftToStore);
+    pillSupplyInitial.add(initToStore);
+    pillSupplyLowSent.add(false);
+
+    // align to NEW count and persist
+    _alignSupplyListsToCount(updatedNames.length);
+    await _saveSupplyListsToPrefs();
 
     final existingTimes = prefs.getStringList(_pillTimesKey) ?? [];
     final updatedTimes = [...existingTimes, _timeToStr(firstDose)];
@@ -1233,6 +1812,48 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
     final updatedDoseTimes = [...existingDoseTimes, doseStrings];
     await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
+
+    final updatedSupplyEnabled = [...pillSupplyEnabled, _supplyTrackOn];
+    final updatedSupplyLeft = [
+      ...pillSupplyLeft,
+      _supplyTrackOn ? _supplyLeftDraft : 0,
+    ];
+    final updatedSupplyInit = [
+      ...pillSupplyInitial,
+      _supplyTrackOn
+          ? (_supplyInitialDraft > 0 ? _supplyInitialDraft : _supplyLeftDraft)
+          : 0,
+    ];
+    final updatedSupplyLowSent = [...pillSupplyLowSent, false];
+
+    await prefs.setString(
+      _pillSupplyEnabledKey,
+      jsonEncode(updatedSupplyEnabled),
+    );
+    await prefs.setString(_pillSupplyLeftKey, jsonEncode(updatedSupplyLeft));
+    await prefs.setString(_pillSupplyInitKey, jsonEncode(updatedSupplyInit));
+    await prefs.setString(
+      _pillSupplyLowSentKey,
+      jsonEncode(updatedSupplyLowSent),
+    );
+
+    final updatedNameLocked = [...pillNameLocked, _lockPillName];
+    await prefs.setString(_pillNameLockedKey, jsonEncode(updatedNameLocked));
+
+    pillSupplyEnabled.add(_supplyTrackOn);
+    pillSupplyLeft.add(_supplyTrackOn ? _supplyLeftDraft : 0);
+    pillSupplyInitial.add(
+      _supplyTrackOn
+          ? (_supplyInitialDraft > 0 ? _supplyInitialDraft : _supplyLeftDraft)
+          : 0,
+    );
+    pillSupplyLowSent.add(false);
+
+    // ✅ align again just in case
+    _alignSupplyListsToCount(updatedNames.length);
+
+    // ✅ persist
+    await _saveSupplyListsToPrefs();
 
     // Clear check state for this new pill index (safety)
     final checkMap = await _loadCheckMap();
@@ -1247,13 +1868,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
     setState(() {
+      pillSupplyEnabled = [...pillSupplyEnabled];
+      pillSupplyLeft = [...pillSupplyLeft];
+      pillSupplyInitial = [...pillSupplyInitial];
+      pillSupplyLowSent = [...pillSupplyLowSent];
+      pillNameLocked = updatedNameLocked;
+
       pillNames = updatedNames;
       pillTimes = updatedTimes;
       pillDoseTimes = updatedDoseTimes;
 
+      _lockPillName = false;
       _pendingSlot = false;
       _configOpen = false;
       _step = _ConfigStep.name;
+      _selectedPillInfo = null;
     });
 
     _showPillLabelAfterSlide();
@@ -1301,8 +1930,67 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final prefs = await SharedPreferences.getInstance();
 
+    _alignSupplyListsToCount(pillNames.length);
+
+    final effectiveTrack = (_supplyModeGlobal == 'on')
+        ? true
+        : (_supplyModeGlobal == 'off')
+        ? false
+        : _supplyTrackOn;
+
+    pillSupplyEnabled[pillIndex] = effectiveTrack;
+    pillSupplyLeft[pillIndex] = effectiveTrack ? _supplyLeftDraft : 0;
+
+    if (effectiveTrack) {
+      // keep initial unless not set yet
+      if (pillSupplyInitial[pillIndex] <= 0) {
+        pillSupplyInitial[pillIndex] = _supplyLeftDraft;
+      }
+    } else {
+      pillSupplyInitial[pillIndex] = 0;
+      pillSupplyLowSent[pillIndex] = false;
+    }
+
+    // If refilled back above threshold, allow low-warning again + cancel pending warnings
+    if (effectiveTrack && _supplyLeftDraft >= _supplyLowThreshold) {
+      pillSupplyLowSent[pillIndex] = false;
+      unawaited(
+        NotificationService.cancelLowSupplyWarning(pillSlot: pillIndex),
+      );
+    }
+
+    // If tracking off globally or per-pill, cancel warnings too
+    if (!effectiveTrack) {
+      unawaited(
+        NotificationService.cancelLowSupplyWarning(pillSlot: pillIndex),
+      );
+      unawaited(
+        NotificationService.cancelOutOfSupplyWarning(pillSlot: pillIndex),
+      );
+    }
+
+    // If supply is > 0, cancel any pending out-of-supply warning
+    if (effectiveTrack && _supplyLeftDraft > 0) {
+      unawaited(
+        NotificationService.cancelOutOfSupplyWarning(pillSlot: pillIndex),
+      );
+    }
+
+    await _saveSupplyListsToPrefs();
+
+    _alignSupplyListsToCount(pillNames.length);
+
+    final isLocked = (pillIndex < pillNameLocked.length)
+        ? pillNameLocked[pillIndex]
+        : false;
+
     final updatedNames = [...pillNames];
-    updatedNames[pillIndex] = name;
+    if (!isLocked) {
+      updatedNames[pillIndex] = name;
+    } else {
+      // keep original name if locked
+      updatedNames[pillIndex] = pillNames[pillIndex];
+    }
 
     final updatedTimes = [...pillTimes];
     if (pillIndex < updatedTimes.length) {
@@ -1318,6 +2006,50 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await prefs.setStringList(_pillTimesKey, updatedTimes);
     await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
 
+    _alignSupplyListsToCount(pillNames.length);
+
+    // ✅ USE existing effectiveTrack (already defined above)
+    pillSupplyEnabled[pillIndex] = effectiveTrack;
+    pillSupplyLeft[pillIndex] = effectiveTrack ? _supplyLeftDraft : 0;
+
+    // initial + lowSent rules
+    if (effectiveTrack) {
+      if (pillSupplyInitial[pillIndex] <= 0) {
+        pillSupplyInitial[pillIndex] = (_supplyInitialDraft > 0)
+            ? _supplyInitialDraft
+            : _supplyLeftDraft;
+      }
+
+      // ✅ if user refilled above threshold, allow future warnings again
+      if (_supplyLeftDraft >= _supplyLowThreshold) {
+        pillSupplyLowSent[pillIndex] = false;
+        unawaited(
+          NotificationService.cancelLowSupplyWarning(pillSlot: pillIndex),
+        );
+      }
+
+      // ✅ if supply > 0, cancel any pending "out of supply" warning
+      if (_supplyLeftDraft > 0) {
+        unawaited(
+          NotificationService.cancelOutOfSupplyWarning(pillSlot: pillIndex),
+        );
+      }
+    } else {
+      pillSupplyInitial[pillIndex] = 0;
+      pillSupplyLowSent[pillIndex] = false;
+
+      // ✅ tracking off (either global off or decide+toggle off) => cancel any warnings
+      unawaited(
+        NotificationService.cancelLowSupplyWarning(pillSlot: pillIndex),
+      );
+      unawaited(
+        NotificationService.cancelOutOfSupplyWarning(pillSlot: pillIndex),
+      );
+    }
+
+    // ✅ persist ONCE (remove all updatedSupplyEnabled/Left/Init/LowSent blocks)
+    await _saveSupplyListsToPrefs();
+
     // Clear check state for this pill (so it can notify cleanly)
     final checkMap = await _loadCheckMap();
     checkMap.remove('$pillIndex');
@@ -1330,10 +2062,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
     setState(() {
+      pillSupplyEnabled = [...pillSupplyEnabled];
+      pillSupplyLeft = [...pillSupplyLeft];
+      pillSupplyInitial = [...pillSupplyInitial];
+      pillSupplyLowSent = [...pillSupplyLowSent];
+      _cacheSupplyBadgeIfShowing();
+
       pillNames = updatedNames;
       pillTimes = updatedTimes;
       pillDoseTimes = updatedDoseTimes;
 
+      _lockPillName = false;
       _editingIndex = null;
       _configOpen = false;
       _step = _ConfigStep.name;
@@ -1387,11 +2126,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final updatedDoseTimes = [...pillDoseTimes];
     if (slot < updatedDoseTimes.length) updatedDoseTimes.removeAt(slot);
 
+    // ✅ supply lists must remove the same slot too (guarded)
+    _alignSupplyListsToCount(pillNames.length);
+
+    if (slot < pillSupplyEnabled.length) pillSupplyEnabled.removeAt(slot);
+    if (slot < pillSupplyLeft.length) pillSupplyLeft.removeAt(slot);
+    if (slot < pillSupplyInitial.length) pillSupplyInitial.removeAt(slot);
+    if (slot < pillSupplyLowSent.length) pillSupplyLowSent.removeAt(slot);
+
+    // ✅ now align to the NEW count
+    _alignSupplyListsToCount(updatedNames.length);
+
+    // ✅ persist
+    await _saveSupplyListsToPrefs();
+
     // Persist
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(_pillNamesKey, updatedNames);
     await prefs.setStringList(_pillTimesKey, updatedTimes);
     await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
+
+    // ✅ make sure supply arrays exist and match current pill count BEFORE removing
+    _alignSupplyListsToCount(pillNames.length);
+
+    // Remove the same slot as the deleted pill (guarded)
+    if (slot < pillSupplyEnabled.length) pillSupplyEnabled.removeAt(slot);
+    if (slot < pillSupplyLeft.length) pillSupplyLeft.removeAt(slot);
+    if (slot < pillSupplyInitial.length) pillSupplyInitial.removeAt(slot);
+    if (slot < pillSupplyLowSent.length) pillSupplyLowSent.removeAt(slot);
+
+    // ✅ align to NEW count after delete
+    _alignSupplyListsToCount(updatedNames.length);
+
+    // ✅ persist the actual lists (NOT updatedSupplyEnabled vars)
+    await _saveSupplyListsToPrefs();
 
     // Shift checkMap indexes to match new pill list
     final checkMap = await _loadCheckMap();
@@ -1408,6 +2176,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _saveCheckMap(shifted);
     _setCheckMapAndRebuild(shifted);
     _refreshCheckMapFuture();
+
+    final updatedNameLocked = [...pillNameLocked]..removeAt(slot);
+    await prefs.setString(_pillNameLockedKey, jsonEncode(updatedNameLocked));
 
     // Decide new centered wheel index BEFORE setState
     final newCount = updatedNames.length;
@@ -1430,7 +2201,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
     setState(() {
+      pillSupplyEnabled = [...pillSupplyEnabled];
+      pillSupplyLeft = [...pillSupplyLeft];
+      pillSupplyInitial = [...pillSupplyInitial];
+      pillSupplyLowSent = [...pillSupplyLowSent];
       pillNames = updatedNames;
+      pillNameLocked = updatedNameLocked;
       pillTimes = updatedTimes;
       pillDoseTimes = updatedDoseTimes;
       _pendingSlot = false;
@@ -1490,6 +2266,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           false, // change to true if you want “one check mutes rest of day”
     );
 
+    unawaited(_consumeOneSupplyIfEnabled(pillIndex));
+
     // 5) Everything else unchanged
     _scheduleCenteredDoseBoundaryRefresh();
 
@@ -1537,6 +2315,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 constraints: BoxConstraints(minHeight: constraints.maxHeight),
                 child: Column(
                   children: [
+                    // ---------------- HEADER ROW ----------------
                     Row(
                       children: [
                         Container(
@@ -1571,30 +2350,42 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                     border: InputBorder.none,
                                   ),
                                 )
-                              : InkWell(
-                                  onTap: _editNameAgain,
-                                  child: Row(
-                                    children: [
-                                      Expanded(
-                                        child: Text(
-                                          _nameController.text.trim(),
-                                          style: const TextStyle(
-                                            color: white,
-                                            fontSize: 22,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                          overflow: TextOverflow.ellipsis,
+                              : (_lockPillName
+                                    // ✅ Locked name (search-picked): NO edit button
+                                    ? Text(
+                                        _nameController.text.trim(),
+                                        style: const TextStyle(
+                                          color: white,
+                                          fontSize: 22,
+                                          fontWeight: FontWeight.w600,
                                         ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      const Icon(
-                                        Icons.edit,
-                                        color: Colors.white70,
-                                        size: 20,
-                                      ),
-                                    ],
-                                  ),
-                                ),
+                                        overflow: TextOverflow.ellipsis,
+                                      )
+                                    // ✅ Custom / normal: allow editing name
+                                    : InkWell(
+                                        onTap: _editNameAgain,
+                                        child: Row(
+                                          children: [
+                                            Expanded(
+                                              child: Text(
+                                                _nameController.text.trim(),
+                                                style: const TextStyle(
+                                                  color: white,
+                                                  fontSize: 22,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                                overflow: TextOverflow.ellipsis,
+                                              ),
+                                            ),
+                                            const SizedBox(width: 8),
+                                            const Icon(
+                                              Icons.edit,
+                                              color: Colors.white70,
+                                              size: 20,
+                                            ),
+                                          ],
+                                        ),
+                                      )),
                         ),
                         IconButton(
                           onPressed: _cancelAddFlow,
@@ -1602,7 +2393,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ),
                       ],
                     ),
+
                     const SizedBox(height: 10),
+
+                    // ---------------- INFO BOX ----------------
                     Container(
                       width: double.infinity,
                       height: 140,
@@ -1611,13 +2405,153 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         borderRadius: BorderRadius.circular(18),
                       ),
                       alignment: Alignment.center,
-                      child: const Text(
-                        'Placeholder info area',
-                        style: TextStyle(color: Colors.white70),
+                      child: Text(
+                        _selectedPillInfo ?? 'Placeholder info area',
+                        style: const TextStyle(color: Colors.white70),
                       ),
                     ),
+
                     const SizedBox(height: 12),
+
+                    // ---------------- SUPPLY TRACKING (shows on CONFIG + DOSES) ----------------
+                    if (_step != _ConfigStep.name &&
+                        _supplyModeGlobal != 'off') ...[
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(18),
+                        ),
+                        child: Column(
+                          children: [
+                            // ---------------- HEADER ROW ----------------
+                            if (_supplyModeGlobal == 'decide') ...[
+                              // ✅ Decide mode: show Track supply + switch
+                              Row(
+                                children: [
+                                  const Text(
+                                    'Track supply',
+                                    style: TextStyle(
+                                      color: white,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  GestureDetector(
+                                    onTap: _showSupplyInfoDialog,
+                                    child: const Icon(
+                                      Icons.info_outline,
+                                      color: Colors.white70,
+                                      size: 20,
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  Switch(
+                                    value: _supplyTrackOn,
+                                    onChanged: (v) async {
+                                      if (!mounted) return;
+
+                                      if (!v) {
+                                        setState(() {
+                                          _supplyTrackOn = false;
+                                          _supplyLeftDraft = 0;
+                                          _supplyInitialDraft = 0;
+                                        });
+                                        return;
+                                      }
+
+                                      setState(() => _supplyTrackOn = true);
+                                      await _editSupplyDialog(
+                                        setInitialToo: true,
+                                      );
+
+                                      if (!mounted) return;
+                                      if (_supplyLeftDraft <= 0) {
+                                        setState(() => _supplyTrackOn = false);
+                                      }
+                                    },
+                                  ),
+                                ],
+                              ),
+                            ] else ...[
+                              // ✅ Always On: NO switch row, just label
+                              Row(
+                                children: [
+                                  const Text(
+                                    'Supply',
+                                    style: TextStyle(
+                                      color: white,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  GestureDetector(
+                                    onTap: _showSupplyInfoDialog,
+                                    child: const Icon(
+                                      Icons.info_outline,
+                                      color: Colors.white70,
+                                      size: 20,
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  const Text(
+                                    'Always On',
+                                    style: TextStyle(
+                                      color: Colors.white70,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                            ],
+
+                            // ---------------- SUPPLY LEFT ROW ----------------
+                            if ((_supplyModeGlobal == 'on') ||
+                                (_supplyModeGlobal == 'decide' &&
+                                    _supplyTrackOn)) ...[
+                              const SizedBox(height: 8),
+                              InkWell(
+                                onTap: () =>
+                                    _editSupplyDialog(setInitialToo: false),
+                                child: Row(
+                                  children: [
+                                    const Text(
+                                      'Supply left',
+                                      style: TextStyle(
+                                        color: Colors.white70,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    const Spacer(),
+                                    Text(
+                                      _supplyLeftDraft.toString(),
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 18,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    const Icon(
+                                      Icons.edit,
+                                      color: Colors.white70,
+                                      size: 18,
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
+
+                    // ---------------- CONFIG STEP ----------------
                     if (_step == _ConfigStep.config) ...[
+                      // Times per day
                       Row(
                         children: [
                           const Icon(Icons.schedule, color: white),
@@ -1656,7 +2590,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ],
                       ),
+
                       const SizedBox(height: 10),
+
+                      // Single time picker (only when 1x/day)
                       if (_timesPerDay == 1)
                         Container(
                           height: 48,
@@ -1682,6 +2619,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                     ],
+
+                    // ---------------- DOSES STEP ----------------
                     if (_step == _ConfigStep.doses)
                       SizedBox(
                         height: 220,
@@ -1720,6 +2659,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       )
                     else
                       const SizedBox(height: 12),
+
+                    // ---------------- PRIMARY BUTTON ----------------
                     SizedBox(
                       width: double.infinity,
                       height: 56,
@@ -1778,12 +2719,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final scaleW = size.width / designW;
     final scaleH = size.height / designH;
-    final scale = (scaleW < scaleH ? scaleW : scaleH).clamp(0.8, 1.3);
+    final rawScale = (scaleW < scaleH ? scaleW : scaleH);
+
+    // Keep iOS exactly as-is; Android gets a slightly tighter cap to prevent blow-ups
+    final scale = Platform.isAndroid
+        ? rawScale.clamp(0.78, 1.12)
+        : rawScale.clamp(0.8, 1.3);
 
     double s(double v) => v * scale;
     double fs(double v) => v * scale;
 
-    final configH = _step == _ConfigStep.doses ? s(560) : s(480);
+    final configH = _step == _ConfigStep.doses
+        ? (Platform.isAndroid ? s(620) : s(560))
+        : (Platform.isAndroid ? s(520) : s(480));
 
     final double stripW = s(800);
     final double stripH = s(1383);
@@ -1793,26 +2741,99 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     double cx(double w) => (size.width - w) / 2;
 
-    final bottomSlide = (_configOpen || _infoOpen)
+    final midFade = _searchOpen ? 0.0 : 1.0;
+    final topShift = _searchOpen ? -s(220) : 0.0;
+    final searchScrimOpacity = _searchOpen ? 1.0 : 0.0;
+
+    final bottomSlide = (_configOpen || _infoOpen || _searchOpen)
         ? const Offset(0, 0.30)
         : Offset.zero;
 
+    final bottomSlidDown = (_configOpen || _infoOpen || _searchOpen);
+    final bottomDecorOpacity = bottomSlidDown ? 0.0 : 1.0;
+
     final wheelLocked = _pendingSlot;
+
+    final centerIdx = _centerPillIndex;
+    final showSupplyBadge = centerIdx != null && _effectiveSupplyOn(centerIdx);
+
+    final supplyLeftValue =
+        (centerIdx != null && centerIdx < pillSupplyLeft.length)
+        ? pillSupplyLeft[centerIdx]
+        : 0;
+
+    final displaySupplyValue = showSupplyBadge
+        ? supplyLeftValue
+        : _supplyBadgeCacheValue;
+
+    final supplyNumberColor = (displaySupplyValue <= 0)
+        ? const Color.fromARGB(255, 255, 30, 71) // red
+        : (displaySupplyValue < _supplyLowThreshold)
+        ? const Color.fromARGB(255, 255, 226, 109) // yellow
+        : const Color.fromARGB(245, 255, 255, 255); // your off-white
 
     return Scaffold(
       resizeToAvoidBottomInset: false,
-      backgroundColor: const Color(0xFFC75469),
+      backgroundColor: const Color(0xFFFF6D87),
       body: MediaQuery.removeViewInsets(
         context: context,
         removeBottom: true,
         child: Stack(
           children: [
             // --- TOP BAR ---
-            Positioned(
+            /* Positioned(
               right: 0,
               left: 0,
               top: s(0),
-              child: Container(height: s(140), color: const Color(0xFFFF6D87)),
+              child: Container(height: s(250), color: const Color(0xFFFF6D87)),
+            ),
+*/
+            Positioned(
+              right: 0,
+              left: 0,
+              top: s(238),
+              bottom: s(560),
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeInOut,
+                opacity: midFade,
+                child: Container(
+                  height: s(5),
+                  color: const Color.fromARGB(255, 158, 52, 69),
+                ),
+              ),
+            ),
+
+            Positioned(
+              right: 0,
+              left: 0,
+              top: s(234),
+              bottom: s(674),
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeInOut,
+                opacity: midFade,
+                child: Container(
+                  height: s(5),
+                  color: const Color.fromARGB(123, 158, 52, 70),
+                ),
+              ),
+            ),
+
+            Positioned(
+              right: 0,
+              left: 0,
+              top: s(350),
+              bottom: s(555),
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeInOut,
+                opacity: midFade,
+                child: Container(
+                  height: s(5),
+                  color: const Color.fromARGB(123, 158, 52, 70),
+                ),
+              ),
             ),
 
             // --- WEEKLY PILLBOX (Rive) ---
@@ -1823,67 +2844,197 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 size: size,
                 s: s,
                 designW: designW,
-                todayIndex: _pillboxVisualDay, // ✅ slide uses visual day
+                todayIndex: _pillboxVisualDay,
+                scale: pbScale, // ✅ slide uses visual day
               ),
-              bottom: s(-70),
-              child: SizedBox(
-                width: s(800),
-                height: s(1383),
-                child: WeeklyPillboxOrganizer(
-                  key: ValueKey(
-                    'pillbox_${_pillboxResetToken}_day_${_todayIndex}',
+              bottom: s(130),
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeInOut,
+                opacity: midFade,
+                child: SizedBox(
+                  width: s(800) * pbScale,
+                  height: s(1383) * pbScale,
+                  child: WeeklyPillboxOrganizer(
+                    key: ValueKey(
+                      'pillbox_${_pillboxResetToken}_day_${_todayIndex}',
+                    ),
+                    fit: BoxFit.contain,
+
+                    // keep closed during slide, only open AFTER slide finishes
+                    openDays: _allowPillboxOpen ? <int>{_todayIndex} : <int>{},
+
+                    stateMachineName: 'PillboxSM',
                   ),
-
-                  fit: BoxFit.contain,
-
-                  // keep closed during slide, only open AFTER slide finishes
-                  openDays: _allowPillboxOpen ? <int>{_todayIndex} : <int>{},
-
-                  stateMachineName: 'PillboxSM',
                 ),
               ),
             ),
 
+            // --- SIDE BARS ---
             Positioned(
-              right: 0,
               left: 0,
-              top: s(140),
-              child: Container(
-                height: s(5),
-                color: const Color.fromARGB(255, 158, 52, 69),
+              right: 0,
+              top: s(160), // main vertical placement reference
+              child: FutureBuilder<Map<String, dynamic>>(
+                future: _checkMapFuture,
+                builder: (context, snap) {
+                  final map = snap.data ?? <String, dynamic>{};
+
+                  final idx = _centerPillIndex;
+                  final hasRealPill =
+                      idx != null && idx >= 0 && idx < pillNames.length;
+
+                  final doses = hasRealPill
+                      ? _doseTimesForPill(idx!)
+                      : <TimeOfDay>[];
+
+                  final showLeft = hasRealPill && doses.length > 1;
+
+                  int totalDoses = doses.length;
+                  int activeDoseIndex = 0;
+                  int mask = 0;
+                  int checkedCount = 0;
+                  bool dayCompleteForPill = false;
+
+                  if (showLeft) {
+                    final w = _computeDoseWindow(
+                      now: DateTime.now(),
+                      dosesSorted: doses,
+                    );
+
+                    final cycleIso = w.cycleStart.toIso8601String();
+                    final stored = map['$idx'] as String?;
+                    final parsed = _readCycleAndMask(stored);
+
+                    mask = (parsed.cycleIso == cycleIso) ? parsed.mask : 0;
+                    checkedCount = _bitCount(mask).clamp(0, totalDoses);
+                    dayCompleteForPill = checkedCount >= totalDoses;
+                    activeDoseIndex = w.doseIndex;
+                  }
+
+                  final allDone = _areAllPillsComplete(map);
+
+                  // Match the right bar to the same delayed completion feel as the circle
+                  final doneForCircle =
+                      allDone &&
+                      (_allowDailyFillAnim || !_needsDailyCircleDelay);
+
+                  // Right bar should appear immediately once all pills are complete
+                  final showRight = allDone;
+
+                  return SizedBox(
+                    height: s(70),
+                    child: Stack(
+                      children: [
+                        // LEFT BAR: multi-dose progress
+                        AnimatedPositioned(
+                          duration: const Duration(milliseconds: 280),
+                          curve: Curves.easeInOutCubic,
+                          left: showLeft ? s(1) : -s(220),
+                          top: 0,
+                          width: s(165),
+                          height: s(70),
+                          child: IgnorePointer(
+                            child: DoseProgressSideBar(
+                              totalDoses: totalDoses,
+                              activeDoseIndex: activeDoseIndex,
+                              checkedMask: mask,
+                              height: s(70),
+                            ),
+                          ),
+                        ),
+
+                        // RIGHT BAR: all pills completed
+                        AnimatedPositioned(
+                          duration: const Duration(milliseconds: 320),
+                          curve: Curves.easeInOutCubic,
+                          right: showRight ? s(2) : -s(220),
+                          top: 0,
+                          width: s(166.5),
+                          height: s(70),
+                          child: IgnorePointer(
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: const Color.fromARGB(222, 155, 255, 168),
+                                borderRadius: BorderRadius.circular(18),
+                                border: Border.all(
+                                  color: const Color.fromARGB(
+                                    255,
+                                    137,
+                                    255,
+                                    133,
+                                  ),
+                                  width: 5,
+                                ),
+                              ),
+                              padding: EdgeInsets.symmetric(horizontal: s(14)),
+                              child: Center(
+                                child: Text(
+                                  'Checked all pills\nfor today!',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    fontFamily: 'Amaranth',
+                                    fontSize: fs(17),
+                                    color: const Color.fromARGB(
+                                      255,
+                                      152,
+                                      64,
+                                      79,
+                                    ),
+                                    fontWeight: FontWeight.w700,
+                                    height: 1.0,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
               ),
             ),
-
             // --- LOGO (left) ---
-            Positioned(
-              top: s(24),
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOut,
+              top: s(24) + topShift,
               left: s(0),
               right: s(185),
-              child: Opacity(
-                opacity: 0.75,
-                child: Image.asset(
-                  'assets/images/pillchecker_logo.png',
-                  width: s(150),
-                  height: s(150),
+              child: IgnorePointer(
+                ignoring: _searchOpen,
+                child: Opacity(
+                  opacity: 0.75,
+                  child: Image.asset(
+                    'assets/images/pillchecker_logo.png',
+                    width: s(150),
+                    height: s(150),
+                  ),
                 ),
               ),
             ),
 
             // --- TITLE (center) ---
-            Positioned(
-              top: s(40),
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOut,
+              top: s(40) + topShift,
               left: 35,
               right: 0,
-              child: Center(
-                child: Transform.scale(
-                  scale: 0.5,
-                  child: Text(
-                    'PillChecker',
-                    style: TextStyle(
-                      fontSize: fs(77.9),
-                      fontFamily: 'Amaranth',
-                      color: const Color(0xFF98404F),
-                      fontWeight: FontWeight.w400,
+              child: IgnorePointer(
+                ignoring: _searchOpen,
+                child: Center(
+                  child: Transform.scale(
+                    scale: 0.5,
+                    child: Text(
+                      'PillChecker',
+                      style: TextStyle(
+                        fontSize: fs(77.9),
+                        fontFamily: 'Amaranth',
+                        color: const Color(0xFF98404F),
+                        fontWeight: FontWeight.w400,
+                      ),
                     ),
                   ),
                 ),
@@ -1892,8 +3043,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
             // --- DAILY COMPLETION CIRCLE (auto fill animation) ---
             Positioned(
-              left: cx(s(80.1)),
-              bottom: s(674),
+              left: cx(s(60.2)),
+              bottom: s(687),
               child: FutureBuilder<Map<String, dynamic>>(
                 future: _checkMapFuture,
                 builder: (context, snap) {
@@ -1932,7 +3083,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
                   return DailyCompletionCircle(
                     done: delayedDone,
-                    size: s(77.1),
+                    size: s(58),
                     baseColor: const Color.fromARGB(0, 231, 36, 153),
                     fillColor: const Color(0xFF59FF56),
                   );
@@ -1942,13 +3093,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
             // --- BOTTOM ZONE ---
             IgnorePointer(
-              ignoring: _configOpen || _infoOpen,
+              ignoring: _configOpen || _infoOpen || _searchOpen,
               child: AnimatedSlide(
                 duration: const Duration(milliseconds: 320),
                 curve: Curves.easeInOut,
                 offset: bottomSlide,
                 child: Stack(
                   children: [
+                    // --- BACK PLATE (behind everything) ---
+                    Positioned(
+                      left: s(100),
+                      right: s(100),
+
+                      // tweak these two to place it between pillbox and wheel
+                      top: s(395),
+                      bottom: s(350),
+
+                      child: AnimatedOpacity(
+                        duration: const Duration(milliseconds: 140),
+                        curve: Curves.easeInOut,
+                        opacity: bottomDecorOpacity,
+                        child: IgnorePointer(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: Colors.white.withOpacity(0.18),
+                              borderRadius: BorderRadius.circular(s(25)),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
                     // --- RED STRIP (background) ---
                     Positioned(
                       left: cx(stripW),
@@ -1974,6 +3149,73 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ),
                     ),
 
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: s(260), // tweak if you want it higher/lower
+                      child: IgnorePointer(
+                        child: AnimatedOpacity(
+                          duration: const Duration(milliseconds: 180),
+                          curve: Curves.easeInOut,
+                          opacity: (showSupplyBadge && !bottomSlidDown)
+                              ? 1.0
+                              : 0.0,
+                          child: Center(
+                            child: SizedBox(
+                              width: s(64),
+                              height: s(64),
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  // ✅ tiny patch behind the icon to fill the "hole"
+                                  Positioned(
+                                    // tweak these 3 numbers if needed
+                                    top: s(22),
+                                    child: Container(
+                                      width: s(25),
+                                      height: s(25),
+                                      decoration: BoxDecoration(
+                                        color: const Color.fromARGB(
+                                          255,
+                                          156,
+                                          68,
+                                          83,
+                                        ),
+                                        borderRadius: BorderRadius.circular(
+                                          s(4),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+
+                                  Icon(
+                                    Icons.medication_rounded,
+                                    size: s(64),
+                                    color: const Color.fromARGB(
+                                      255,
+                                      156,
+                                      68,
+                                      83,
+                                    ),
+                                  ),
+
+                                  Text(
+                                    displaySupplyValue.toString(),
+                                    style: TextStyle(
+                                      fontFamily: 'Amaranth',
+                                      fontSize: fs(21),
+                                      color: supplyNumberColor,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
                     // --- WHEEL (below button/rings so it doesn't steal touches) ---
                     Positioned(
                       left: cx(wheelBoxW),
@@ -1989,10 +3231,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         addEnabled: !wheelLocked,
                         onSelectedChanged: (i) {
                           if (i != _wheelSelectedIndex) _clearCheckedMessage();
-                          setState(() => _wheelSelectedIndex = i);
+
+                          setState(() {
+                            _wheelSelectedIndex = i;
+                            _cacheSupplyBadgeIfShowing(); // ✅ cache value if this new pill tracks supply
+                          });
+
                           _scheduleCenteredDoseBoundaryRefresh();
                         },
-                        onAddPressed: () => _startAddFlow(createNewSlot: true),
+                        onAddPressed: _openPillSearch,
                       ),
                     ),
 
@@ -2074,13 +3321,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
                     // --- Bottom-left oval ---
                     Positioned(
-                      left: s(-85),
+                      left: s(-75),
                       bottom: s(-100),
                       child: ClipOval(
                         child: Container(
                           width: s(200),
                           height: s(200),
-                          color: const Color(0xFF59FF56),
+                          color: const Color.fromARGB(255, 135, 255, 133),
                         ),
                       ),
                     ),
@@ -2111,7 +3358,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                   Container(
                                     decoration: const BoxDecoration(
                                       shape: BoxShape.circle,
-                                      color: Color(0xFF59FF56),
+                                      color: const Color.fromARGB(
+                                        255,
+                                        135,
+                                        255,
+                                        133,
+                                      ),
                                     ),
                                   ),
 
@@ -2178,7 +3430,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
                     // --- Bottom-right oval ---
                     Positioned(
-                      right: s(-85),
+                      right: s(-75),
                       bottom: s(-100),
                       child: ClipOval(
                         child: Container(
@@ -2236,22 +3488,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   child: Center(
                     child: Builder(
                       builder: (context) {
-                        final pillIndex = _centerPillIndex;
-
                         String displayName =
                             _labelOverride ?? _centerPillName();
-
-                        if (_labelOverride == null && pillIndex != null) {
-                          final doses = _doseTimesForPill(pillIndex);
-                          if (doses.length > 1) {
-                            final w = _computeDoseWindow(
-                              now: DateTime.now(),
-                              dosesSorted: doses,
-                            );
-                            displayName =
-                                '${_centerPillName()} (Dose ${w.doseIndex + 1})';
-                          }
-                        }
 
                         return Text(
                           displayName,
@@ -2271,26 +3509,35 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
 
             // --- TOP OVALS ---
-            Positioned(
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOut,
               left: s(-75),
-              top: s(40),
-              child: ClipOval(
-                child: Container(
-                  width: s(150),
-                  height: s(85),
-                  color: const Color(0xFFFFFFFF),
+              top: s(40) + topShift,
+              child: IgnorePointer(
+                ignoring: _searchOpen,
+                child: ClipOval(
+                  child: Container(
+                    width: s(150),
+                    height: s(85),
+                    color: const Color(0xFFFFFFFF),
+                  ),
                 ),
               ),
             ),
 
             // --- DIRECTORY ICON (top-left) ---
-            Positioned(
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOut,
               left: s(-10),
-              top: s(45),
+              top: s(45) + topShift,
               child: IgnorePointer(
-                ignoring: _configOpen || _infoOpen,
+                ignoring: _searchOpen || _configOpen || _infoOpen,
                 child: Opacity(
-                  opacity: (_configOpen || _infoOpen) ? 0.45 : 1.0,
+                  opacity: (_configOpen || _infoOpen || _searchOpen)
+                      ? 0.45
+                      : 1.0,
                   child: SizedBox(
                     width: s(88),
                     height: s(70),
@@ -2299,16 +3546,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         color: Colors.transparent,
                         child: InkWell(
                           borderRadius: BorderRadius.circular(s(999)),
-                          onTap: () {
-                            // TODO: directory button functionality later
-                          },
+                          onTap: _openDirectoryScreen,
                           child: SizedBox(
                             width: s(80),
                             height: s(65),
                             child: Center(
                               child: Icon(
-                                Icons
-                                    .format_list_bulleted, // ✅ closest to "dots + lines"
+                                Icons.format_list_bulleted,
                                 size: s(56),
                                 color: const Color.fromARGB(
                                   255,
@@ -2327,80 +3571,125 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
             ),
 
-            Positioned(
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOut,
               right: s(-75),
-              top: s(40),
-              child: ClipOval(
-                child: Container(
-                  width: s(150),
-                  height: s(85),
-                  color: const Color(0xFFB4B4B4),
+              top: s(40) + topShift,
+              child: IgnorePointer(
+                ignoring: _searchOpen,
+                child: ClipOval(
+                  child: Container(
+                    width: s(150),
+                    height: s(85),
+                    color: const Color(0xFFB4B4B4),
+                  ),
                 ),
               ),
             ),
-            Positioned(
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOut,
               right: s(-45),
-              top: s(40),
-              child: SizedBox(
-                width: s(150),
-                height: s(85),
-                child: Center(
-                  child: Material(
-                    color: Colors.transparent,
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(
-                        s(999),
-                      ), // big soft circle
-                      onTap: () async {
-                        final changed = await Navigator.push<bool>(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => const SettingsScreen(),
-                          ),
-                        );
-
-                        if (!mounted) return;
-
-                        debugPrint('HOME: settings returned changed=$changed');
-
-                        if (changed == true) {
-                          // 1) Reload early/late/mode into NotificationService memory
-                          await NotificationService.loadUserNotificationSettings();
-
-                          // 2) Rebuild today+tomorrow window using the latest prefs + re-apply mutes
-                          await _rebuild2DayNotifWindow(
-                            reason: 'after-settings',
+              top: s(40) + topShift,
+              child: IgnorePointer(
+                ignoring: _searchOpen || _configOpen || _infoOpen,
+                child: SizedBox(
+                  width: s(150),
+                  height: s(85),
+                  child: Center(
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(s(999)),
+                        onTap: () async {
+                          final changed = await Navigator.push<bool>(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => const SettingsScreen(),
+                            ),
                           );
 
-                          // 3) Dump pending so we can verify they're actually scheduled
-                          await NotificationService.debugDumpPending(
-                            'after_settings_rebuild',
+                          if (!mounted) return;
+
+                          debugPrint(
+                            'HOME: settings returned changed=$changed',
                           );
 
-                          // (optional but good) re-arm timers so boundaries reflect new times
-                          _scheduleGlobalBoundaryRefresh();
-                          unawaited(_scheduleGlobalDayBoundaryRefresh());
-                        }
-                      },
-                      child: SizedBox(
-                        width: s(80), // ✅ use the whole oval area
-                        height: s(75),
-                        child: Center(
-                          child: Icon(
-                            Icons.settings,
-                            size: s(60), // ✅ this will actually look big now
-                            color: const Color.fromARGB(
-                              255,
-                              60,
-                              59,
-                              59,
-                            ).withOpacity(0.65),
+                          if (changed == true) {
+                            await NotificationService.loadUserNotificationSettings();
+                            await _loadSupplyGlobalSettings();
+                            await _rebuild2DayNotifWindow(
+                              reason: 'after-settings',
+                            );
+                            await NotificationService.debugDumpPending(
+                              'after_settings_rebuild',
+                            );
+                            _scheduleGlobalBoundaryRefresh();
+                            unawaited(_scheduleGlobalDayBoundaryRefresh());
+                          }
+                        },
+                        child: SizedBox(
+                          width: s(80),
+                          height: s(75),
+                          child: Center(
+                            child: Icon(
+                              Icons.settings,
+                              size: s(60),
+                              color: const Color.fromARGB(
+                                255,
+                                60,
+                                59,
+                                59,
+                              ).withOpacity(0.65),
+                            ),
                           ),
                         ),
                       ),
                     ),
                   ),
                 ),
+              ),
+            ),
+
+            Positioned.fill(
+              child: IgnorePointer(
+                ignoring: !_searchOpen,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeInOut,
+                  opacity: searchScrimOpacity,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+
+                    // ✅ tap outside closes search (remove this line if you don’t want that)
+                    onTap: _closePillSearch,
+
+                    child: Container(
+                      color: const Color(
+                        0xFFFF6D87,
+                      ), // same as Scaffold background
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOut,
+              left: s(18),
+              right: s(18),
+              top: _searchOpen ? s(30) : size.height + s(50),
+              bottom: s(18),
+              child: PillSearchPanel(
+                items: kPlaceholderPills,
+                onPickCustom: _pickCustomFromSearch,
+                onPickItem: _pickSearchItem,
+                onClose: _closePillSearch,
+                disabledNamesLower: pillNames
+                    .map((e) => e.trim().toLowerCase())
+                    .toSet(),
               ),
             ),
 
@@ -2433,6 +3722,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       if (pillIndex == null) return;
                       _startEditFlow(pillIndex);
                     },
+
+                    // ✅ Hide supply section entirely when global mode is Always Off
+                    supplyTrackingOn:
+                        (_supplyModeGlobal != 'off' && idx != null)
+                        ? _effectiveSupplyOn(idx)
+                        : false,
+
+                    supplyLeft: (idx != null && idx < pillSupplyLeft.length)
+                        ? pillSupplyLeft[idx]
+                        : 0,
                   );
                 },
               ),
@@ -2491,3 +3790,26 @@ class DayCompleteCircle extends StatelessWidget {
     );
   }
 }
+
+const kPlaceholderPills = <PillSearchItem>[
+  PillSearchItem(
+    name: 'Amoxicillin',
+    suggestedTimesPerDay: 3,
+    info: 'Placeholder info: antibiotic • take with food if stomach upset.',
+  ),
+  PillSearchItem(
+    name: 'Ibuprofen',
+    suggestedTimesPerDay: 2,
+    info: 'Placeholder info: NSAID • avoid mixing with other NSAIDs.',
+  ),
+  PillSearchItem(
+    name: 'Metformin',
+    suggestedTimesPerDay: 2,
+    info: 'Placeholder info: diabetes med • common GI side effects early on.',
+  ),
+  PillSearchItem(
+    name: 'Vitamin D3',
+    suggestedTimesPerDay: 1,
+    info: 'Placeholder info: supplement • usually once daily.',
+  ),
+];
