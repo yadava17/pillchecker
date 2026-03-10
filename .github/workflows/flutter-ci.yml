@@ -88,11 +88,26 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             archive
 
+      - name: Create ExportOptions.plist
+        run: |
+          cat <<EOF > ExportOptions.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>development</string>
+          </dict>
+          </plist>
+          EOF
+
       - name: Export IPA
         run: |
           mkdir -p build/ios/ipa
           xcodebuild -exportArchive \
             -archivePath build/Runner.xcarchive \
+            -exportOptionsPlist ExportOptions.plist \
             -exportPath build/ios/ipa \
             CODE_SIGNING_ALLOWED=NO
 
