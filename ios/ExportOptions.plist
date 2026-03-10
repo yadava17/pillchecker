@@ -11,7 +11,7 @@
     <string>manual</string>
 
     <key>teamID</key>
-    <string>$(IOS_TEAM_ID)</string>
+    <string>ABCDE12345</string>
 
 </dict>
 </plist>
