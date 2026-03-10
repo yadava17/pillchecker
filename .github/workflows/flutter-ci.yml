@@ -63,7 +63,7 @@ jobs:
           pod install
           cd ..
 
-      - name: Decode iOS Certificate
+      - name: Decode Certificate
         run: |
           echo "${{ secrets.IOS_CERTIFICATE_BASE64 }}" | base64 --decode > cert.p12
 
@@ -71,7 +71,7 @@ jobs:
         run: |
           echo "${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}" | base64 --decode > profile.mobileprovision
 
-      - name: Create Temporary Keychain
+      - name: Create Keychain
         run: |
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
@@ -86,12 +86,21 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
 
-      - name: Set Team ID
+      - name: Extract Provisioning Profile UUID
+        id: profile
+        run: |
+          UUID=$(grep -a -A1 UUID profile.mobileprovision | grep -io "[-A-F0-9]\{36\}")
+          echo "PROFILE_UUID=$UUID" >> $GITHUB_ENV
+
+      - name: Set Development Team
         run: |
           sed -i '' "s/DEVELOPMENT_TEAM = .*/DEVELOPMENT_TEAM = ${{ secrets.IOS_TEAM_ID }};/g" ios/Runner.xcodeproj/project.pbxproj
 
       - name: Build IPA
-        run: flutter build ipa --release
+        run: |
+          flutter build ipa \
+          --release \
+          --export-options-plist=ios/ExportOptions.plist
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
