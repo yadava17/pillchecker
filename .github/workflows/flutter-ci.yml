@@ -57,39 +57,43 @@ jobs:
       - name: Install Dependencies
         run: flutter pub get
 
-      - name: Inject Development Team into Xcode Project
-        run: |
-          sed -i '' 's/DEVELOPMENT_TEAM = .*/DEVELOPMENT_TEAM = ABCDE12345;/g' ios/Runner.xcodeproj/project.pbxproj || true
-
       - name: Install CocoaPods
         run: |
           cd ios
           pod install
           cd ..
 
-      - name: Build iOS (Flutter)
-        run: flutter build ios --release --no-codesign
-
-      - name: Archive iOS App
+      - name: Decode iOS Certificate
         run: |
-          xcodebuild \
-            -workspace ios/Runner.xcworkspace \
-            -scheme Runner \
-            -configuration Release \
-            -sdk iphoneos \
-            -archivePath build/Runner.xcarchive \
-            CODE_SIGNING_ALLOWED=NO \
-            archive
+          echo "${{ secrets.IOS_CERTIFICATE_BASE64 }}" | base64 --decode > cert.p12
 
-      - name: Export IPA
+      - name: Decode Provisioning Profile
         run: |
-          xcodebuild -exportArchive \
-            -archivePath build/Runner.xcarchive \
-            -exportOptionsPlist ios/ExportOptions.plist \
-            -exportPath build/ios/ipa \
-            CODE_SIGNING_ALLOWED=NO
+          echo "${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}" | base64 --decode > profile.mobileprovision
 
-      - name: Upload iOS IPA
+      - name: Create Temporary Keychain
+        run: |
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+
+      - name: Import Certificate
+        run: |
+          security import cert.p12 -k build.keychain -P "${{ secrets.IOS_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
+
+      - name: Install Provisioning Profile
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+
+      - name: Set Team ID
+        run: |
+          sed -i '' "s/DEVELOPMENT_TEAM = .*/DEVELOPMENT_TEAM = ${{ secrets.IOS_TEAM_ID }};/g" ios/Runner.xcodeproj/project.pbxproj
+
+      - name: Build IPA
+        run: flutter build ipa --release
+
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: ios-ipa
