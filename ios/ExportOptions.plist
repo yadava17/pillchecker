@@ -5,7 +5,7 @@
 <dict>
 
     <key>method</key>
-    <string>development</string>
+    <string>app-store</string>
 
     <key>signingStyle</key>
     <string>manual</string>
