@@ -1,17 +1,60 @@
 name: Flutter CI
 
 on:
-  pull_request:
   push:
-    branches: [ dev ]
+    branches: [dev]
+  pull_request:
 
 jobs:
-  build:
 
+  android:
+    name: Build Android
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze || true
+
+      - name: Run tests
+        run: flutter test
+
+      - name: Build APK
+        run: flutter build apk --release
+
+      - name: Build AppBundle
+        run: flutter build appbundle --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aab
+          path: build/app/outputs/bundle/release/app-release.aab
+
+
+  ios:
+    name: Build iOS
     runs-on: macos-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Select Xcode
@@ -26,16 +69,6 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Analyze code
-        run: flutter analyze || true
-
-      - name: Run tests
-        run: flutter test
-
-      - name: Build Android APK
-        run: flutter build apk --release
-
-      # iOS signing setup
       - name: Install Apple Certificate
         uses: apple-actions/import-codesign-certs@v2
         with:
@@ -44,20 +77,28 @@ jobs:
 
       - name: Install Provisioning Profile
         run: |
-          echo "${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}" | base64 --decode > profile.mobileprovision
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          mv profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+          echo "${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
 
-      - name: Build iOS IPA
-        run: flutter build ipa --release --export-options-plist=ios/ExportOptions.plist
+      - name: Build iOS archive
+        run: flutter build ios --release --no-codesign
 
-      - name: Upload Android APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+      - name: Archive app
+        run: |
+          xcodebuild -workspace ios/Runner.xcworkspace \
+          -scheme Runner \
+          -configuration Release \
+          -archivePath build/Runner.xcarchive \
+          archive
 
-      - name: Upload iOS IPA
+      - name: Export IPA
+        run: |
+          xcodebuild -exportArchive \
+          -archivePath build/Runner.xcarchive \
+          -exportOptionsPlist ios/ExportOptions.plist \
+          -exportPath build/ios/ipa
+
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: ios-ipa
