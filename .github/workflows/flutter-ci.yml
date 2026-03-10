@@ -88,31 +88,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             archive
 
-      - name: Create ExportOptions.plist
-        run: |
-          cat <<EOF > ExportOptions.plist
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>method</key>
-              <string>development</string>
-          </dict>
-          </plist>
-          EOF
-
-      - name: Export IPA
+      - name: Create unsigned IPA
         run: |
           mkdir -p build/ios/ipa
-          xcodebuild -exportArchive \
-            -archivePath build/Runner.xcarchive \
-            -exportOptionsPlist ExportOptions.plist \
-            -exportPath build/ios/ipa \
-            CODE_SIGNING_ALLOWED=NO
+          cd build/Runner.xcarchive/Products/Applications
+          mkdir Payload
+          cp -R Runner.app Payload
+          zip -r ../../../ios/ipa/Runner.ipa Payload
 
       - name: Upload iOS IPA
         uses: actions/upload-artifact@v4
         with:
           name: ios-ipa
-          path: build/ios/ipa
+          path: build/ios/ipa/Runner.ipa
