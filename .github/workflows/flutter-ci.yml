@@ -6,103 +6,67 @@ on:
     branches: [ dev ]
 
 jobs:
+  build:
 
-  android:
-    name: Android Build
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Install Dependencies
-        run: flutter pub get
-
-      - name: Analyze Code
-        run: flutter analyze || true
-
-      - name: Run Tests
-        run: flutter test
-
-      - name: Build Release APK
-        run: flutter build apk --release
-
-      - name: Upload Release APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-release-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
-
-
-  ios:
-    name: iOS Build
     runs-on: macos-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Flutter
+
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: 'stable'
           cache: true
 
-      - name: Install Dependencies
+
+      - name: Install dependencies
         run: flutter pub get
 
-      - name: Install CocoaPods
-        run: |
-          cd ios
-          pod install
-          cd ..
 
-      - name: Decode Certificate
-        run: |
-          echo "${{ secrets.IOS_CERTIFICATE_BASE64 }}" | base64 --decode > cert.p12
+      - name: Analyze code
+        run: flutter analyze || true
 
-      - name: Decode Provisioning Profile
-        run: |
-          echo "${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}" | base64 --decode > profile.mobileprovision
 
-      - name: Create Keychain
-        run: |
-          security create-keychain -p "" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "" build.keychain
+      - name: Run tests
+        run: flutter test
 
-      - name: Import Certificate
-        run: |
-          security import cert.p12 -k build.keychain -P "${{ secrets.IOS_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
+
+      # ANDROID BUILD
+      - name: Build Android APK
+        run: flutter build apk --release
+
+
+      # IOS SIGNING
+      - name: Install Apple Certificate
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          p12-password: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+
 
       - name: Install Provisioning Profile
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+          echo "${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
 
-      - name: Extract Provisioning Profile UUID
-        id: profile
-        run: |
-          UUID=$(grep -a -A1 UUID profile.mobileprovision | grep -io "[-A-F0-9]\{36\}")
-          echo "PROFILE_UUID=$UUID" >> $GITHUB_ENV
 
-      - name: Set Development Team
-        run: |
-          sed -i '' "s/DEVELOPMENT_TEAM = .*/DEVELOPMENT_TEAM = ${{ secrets.IOS_TEAM_ID }};/g" ios/Runner.xcodeproj/project.pbxproj
+      # IOS BUILD
+      - name: Build iOS IPA
+        run: flutter build ipa --release
 
-      - name: Build IPA
-        run: |
-          flutter build ipa \
-          --release \
-          --export-options-plist=ios/ExportOptions.plist
 
-      - name: Upload IPA
+      # ARTIFACTS
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+
+      - name: Upload iOS IPA
         uses: actions/upload-artifact@v4
         with:
           name: ios-ipa
