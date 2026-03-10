@@ -89,7 +89,7 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
                           Expanded(
                             child: TextField(
                               controller: _ctrl,
-                              autofocus: true,
+                              autofocus: false,
                               decoration: const InputDecoration(
                                 hintText: 'Search for a pill…',
                                 border: InputBorder.none,
