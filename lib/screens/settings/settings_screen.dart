@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pillchecker/constants/prefs_keys.dart';
 import 'dart:io' show Platform;
+import 'package:url_launcher/url_launcher.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -17,6 +18,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   static const Color _card = Color(0xFF98404F);
 
   bool _loaded = false;
+
+  bool _notifExpanded = false;
+  bool _supplyExpanded = false;
+  bool _feedbackExpanded = false;
 
   String _mode = 'standard';
   int _earlyMin = 30;
@@ -334,6 +339,64 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Uri get _feedbackUri => Uri.parse(
+    Platform.isIOS
+        ? 'https://docs.google.com/forms/d/1fInqV7iNYnWDGHIAl54mhiqIcsswi5J5-EtSU50Pd_s/edit?ts=698e0252'
+        : 'https://docs.google.com/forms/d/1IwTVYPABp3hzrIP2QDfentDElskPrOh6XD5aYLpQ-cE/edit?ts=699455dd',
+  );
+
+  Future<void> _openFeedbackForm() async {
+    final ok = await launchUrl(
+      _feedbackUri,
+      mode: LaunchMode.externalApplication,
+    );
+
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not open the feedback form.')),
+      );
+    }
+  }
+
+  Widget _expandSection({
+    required String title,
+    required bool expanded,
+    required ValueChanged<bool> onChanged,
+    required List<Widget> children,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: _card,
+        borderRadius: BorderRadius.circular(22),
+      ),
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          maintainState: true,
+          initiallyExpanded: expanded,
+          onExpansionChanged: onChanged,
+          tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+          childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          collapsedIconColor: Colors.white70,
+          iconColor: Colors.white,
+          trailing: Icon(
+            expanded ? Icons.expand_less : Icons.expand_more,
+            color: Colors.white,
+          ),
+          title: Text(
+            title,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 20,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          children: children,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return PopScope(
@@ -430,209 +493,251 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
               Positioned.fill(
                 top: 115,
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(18, 18, 18, 18),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text(
-                        'Settings',
-                        style: TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.w700,
-                          color: _card,
-                          fontFamily: 'Amaranth',
-                        ),
+                child: ListView(
+                  padding: const EdgeInsets.fromLTRB(18, 70, 18, 18),
+                  children: [
+                    const Text(
+                      'Settings',
+                      style: TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.w700,
+                        color: _card,
+                        fontFamily: 'Amaranth',
                       ),
-                      const SizedBox(height: 18),
+                    ),
+                    const SizedBox(height: 18),
 
-                      if (!_loaded)
-                        const Center(
-                          child: Padding(
-                            padding: EdgeInsets.all(24),
-                            child: CircularProgressIndicator(),
+                    if (!_loaded)
+                      const Center(
+                        child: Padding(
+                          padding: EdgeInsets.all(24),
+                          child: CircularProgressIndicator(),
+                        ),
+                      )
+                    else ...[
+                      _expandSection(
+                        title: 'Notifications',
+                        expanded: _notifExpanded,
+                        onChanged: (v) => setState(() => _notifExpanded = v),
+                        children: [
+                          const SizedBox(height: 6),
+
+                          const Text(
+                            'Reminder mode',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
-                        )
-                      else ...[
-                        _SectionCard(
-                          title: 'Notifications',
-                          children: [
-                            const SizedBox(height: 6),
-
-                            // MODE
-                            const Text(
-                              'Reminder mode',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 16,
-                                fontWeight: FontWeight.w700,
-                              ),
+                          const SizedBox(height: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(14),
                             ),
-                            const SizedBox(height: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 12,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.circular(14),
-                              ),
-                              child: DropdownButton<String>(
-                                value: _mode,
-                                underline: const SizedBox.shrink(),
-                                isExpanded: true,
-                                items: const ['standard', 'basic', 'off']
-                                    .map(
-                                      (m) => DropdownMenuItem(
-                                        value: m,
-                                        child: Text(_modeLabel(m)),
-                                      ),
-                                    )
-                                    .toList(),
-                                onChanged: (v) {
-                                  if (v == null) return;
-                                  setState(() => _mode = v);
-                                },
-                              ),
-                            ),
-
-                            const SizedBox(height: 16),
-
-                            // ✅ BOX CONTROLS (no sliders)
-                            // Only enabled in Standard mode (Basic ignores early/late, Off ignores everything)
-                            Builder(
-                              builder: (context) {
-                                const step = 5; // minutes per tap
-                                const maxMin = 240; // 4 hours
-                                final enabled = _mode == 'standard';
-
-                                return Column(
-                                  children: [
-                                    _timeBox(
-                                      title: 'Early reminder',
-                                      subtitle: 'How long before the dose?',
-                                      minutes: _earlyMin,
-                                      enabled: enabled,
-                                      onMinus: () {
-                                        setState(
-                                          () => _earlyMin = (_earlyMin - step)
-                                              .clamp(0, maxMin),
-                                        );
-                                      },
-                                      onPlus: () {
-                                        setState(
-                                          () => _earlyMin = (_earlyMin + step)
-                                              .clamp(0, maxMin),
-                                        );
-                                      },
+                            child: DropdownButton<String>(
+                              value: _mode,
+                              underline: const SizedBox.shrink(),
+                              isExpanded: true,
+                              items: const ['standard', 'basic', 'off']
+                                  .map(
+                                    (m) => DropdownMenuItem(
+                                      value: m,
+                                      child: Text(_modeLabel(m)),
                                     ),
-                                    const SizedBox(height: 12),
-                                    _timeBox(
-                                      title: 'Late reminder',
-                                      subtitle: 'How long after the dose?',
-                                      minutes: _lateMin,
-                                      enabled: enabled,
-                                      onMinus: () {
-                                        setState(
-                                          () => _lateMin = (_lateMin - step)
-                                              .clamp(0, maxMin),
-                                        );
-                                      },
-                                      onPlus: () {
-                                        setState(
-                                          () => _lateMin = (_lateMin + step)
-                                              .clamp(0, maxMin),
-                                        );
-                                      },
-                                    ),
-                                  ],
-                                );
+                                  )
+                                  .toList(),
+                              onChanged: (v) {
+                                if (v == null) return;
+                                setState(() => _mode = v);
                               },
                             ),
-                          ],
-                        ),
+                          ),
 
-                        const SizedBox(height: 18),
+                          const SizedBox(height: 16),
 
-                        _SectionCard(
-                          title: 'Supply tracking',
-                          children: [
-                            const SizedBox(height: 6),
+                          Builder(
+                            builder: (context) {
+                              const step = 5;
+                              const maxMin = 240;
+                              final enabled = _mode == 'standard';
 
-                            const Text(
-                              'Mode',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 16,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 12,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.circular(14),
-                              ),
-                              child: DropdownButton<String>(
-                                value: _supplyMode,
-                                underline: const SizedBox.shrink(),
-                                isExpanded: true,
-                                items: const [
-                                  DropdownMenuItem(
-                                    value: 'decide',
-                                    child: Text(
-                                      'Decide in Configure (default)',
-                                    ),
+                              return Column(
+                                children: [
+                                  _timeBox(
+                                    title: 'Early reminder',
+                                    subtitle: 'How long before the dose?',
+                                    minutes: _earlyMin,
+                                    enabled: enabled,
+                                    onMinus: () {
+                                      setState(
+                                        () => _earlyMin = (_earlyMin - step)
+                                            .clamp(0, maxMin),
+                                      );
+                                    },
+                                    onPlus: () {
+                                      setState(
+                                        () => _earlyMin = (_earlyMin + step)
+                                            .clamp(0, maxMin),
+                                      );
+                                    },
                                   ),
-                                  DropdownMenuItem(
-                                    value: 'on',
-                                    child: Text('Always On'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'off',
-                                    child: Text('Always Off'),
+                                  const SizedBox(height: 12),
+                                  _timeBox(
+                                    title: 'Late reminder',
+                                    subtitle: 'How long after the dose?',
+                                    minutes: _lateMin,
+                                    enabled: enabled,
+                                    onMinus: () {
+                                      setState(
+                                        () => _lateMin = (_lateMin - step)
+                                            .clamp(0, maxMin),
+                                      );
+                                    },
+                                    onPlus: () {
+                                      setState(
+                                        () => _lateMin = (_lateMin + step)
+                                            .clamp(0, maxMin),
+                                      );
+                                    },
                                   ),
                                 ],
-                                onChanged: (v) {
-                                  if (v == null) return;
-                                  setState(() => _supplyMode = v);
-                                },
+                              );
+                            },
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 18),
+
+                      _expandSection(
+                        title: 'Supply tracking',
+                        expanded: _supplyExpanded,
+                        onChanged: (v) => setState(() => _supplyExpanded = v),
+                        children: [
+                          const SizedBox(height: 6),
+
+                          const Text(
+                            'Mode',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: DropdownButton<String>(
+                              value: _supplyMode,
+                              underline: const SizedBox.shrink(),
+                              isExpanded: true,
+                              items: const [
+                                DropdownMenuItem(
+                                  value: 'decide',
+                                  child: Text('Decide in Configure (default)'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'on',
+                                  child: Text('Always On'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'off',
+                                  child: Text('Always Off'),
+                                ),
+                              ],
+                              onChanged: (v) {
+                                if (v == null) return;
+                                setState(() => _supplyMode = v);
+                              },
+                            ),
+                          ),
+
+                          const SizedBox(height: 16),
+
+                          _numBox(
+                            title: 'Low supply warning',
+                            subtitle: 'When supply is at:',
+                            value: _supplyLow,
+                            enabled: _supplyMode != 'off',
+                            onMinus: () => setState(
+                              () => _supplyLow = (_supplyLow - 1).clamp(5, 999),
+                            ),
+                            onPlus: () => setState(
+                              () => _supplyLow = (_supplyLow + 1).clamp(5, 999),
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 18),
+
+                      _expandSection(
+                        title: 'Issues / Feedback',
+                        expanded: _feedbackExpanded,
+                        onChanged: (v) => setState(() => _feedbackExpanded = v),
+                        children: [
+                          const SizedBox(height: 6),
+
+                          SizedBox(
+                            width: double.infinity,
+                            height: 50,
+                            child: Material(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(14),
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(14),
+                                onTap: _openFeedbackForm,
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: const [
+                                    Icon(
+                                      Icons.open_in_new,
+                                      color: Color(0xFF98404F),
+                                    ),
+                                    SizedBox(width: 8),
+                                    Text(
+                                      'Open feedback form',
+                                      style: TextStyle(
+                                        color: Color(0xFF98404F),
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w800,
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
+                          ),
 
-                            const SizedBox(height: 16),
+                          const SizedBox(height: 10),
 
-                            // Low threshold (simple +/- like your early/late)
-                            _numBox(
-                              title: 'Low supply warning',
-                              subtitle: 'When supply is at:',
-                              value: _supplyLow,
-                              enabled: _supplyMode != 'off',
-                              onMinus: () => setState(
-                                () =>
-                                    _supplyLow = (_supplyLow - 1).clamp(5, 999),
-                              ),
-                              onPlus: () => setState(
-                                () =>
-                                    _supplyLow = (_supplyLow + 1).clamp(5, 999),
-                              ),
+                          const Text(
+                            'Open this form to submit issues/feedback!',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
                             ),
-                          ],
-                        ),
+                          ),
+                        ],
+                      ),
 
-                        const SizedBox(height: 18),
-                      ],
+                      const SizedBox(height: 18),
                     ],
-                  ),
+                  ],
                 ),
               ),
 
               Positioned(
                 top: 135,
-                right: 50,
+                right: 5,
                 child: Opacity(
                   opacity: (_loaded && _changed) ? 1.0 : 0.55,
                   child: IgnorePointer(
@@ -644,7 +749,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         borderRadius: BorderRadius.circular(18),
                         onTap: _save,
                         child: const SizedBox(
-                          width: 200,
+                          width: 400,
                           height: 40,
                           child: Center(
                             child: Text(

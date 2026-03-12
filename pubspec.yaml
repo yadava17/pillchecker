@@ -16,6 +16,8 @@ dependencies:
   flutter_timezone: ^4.1.1
   timezone: ^0.10.1
 
+  url_launcher: ^6.3.2
+
   rive: ^0.14.2
 
   cupertino_icons: ^1.0.8
