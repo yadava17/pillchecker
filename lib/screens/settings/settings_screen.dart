@@ -737,7 +737,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
               Positioned(
                 top: 135,
-                right: 3,
+                right: 4,
                 child: Opacity(
                   opacity: (_loaded && _changed) ? 1.0 : 0.55,
                   child: IgnorePointer(
@@ -749,7 +749,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         borderRadius: BorderRadius.circular(18),
                         onTap: _save,
                         child: const SizedBox(
-                          width: 400,
+                          width: 350,
                           height: 40,
                           child: Center(
                             child: Text(
