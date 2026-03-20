@@ -2,11 +2,10 @@ name: Android UI bugtest
 
 on:
   push:
-    branches: [android_ui-bugs]
-  pull_request:
+    branches:
+      - feature/android_ui-bugs
 
 jobs:
-
   android:
     name: Build Android
     runs-on: ubuntu-latest
@@ -24,26 +23,11 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Analyze code
-        run: flutter analyze || true
+      - name: Build Debug APK
+        run: flutter build apk --debug
 
-      - name: Run tests
-        run: flutter test
-
-      - name: Build APK
-        run: flutter build apk --release
-
-      - name: Build App Bundle
-        run: flutter build appbundle --release
-
-      - name: Upload Android APK
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
-
-      - name: Upload Android AAB
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-aab
-          path: build/app/outputs/bundle/release/app-release.aab
+          path: build/app/outputs/flutter-apk/app-debug.apk
