@@ -1,4 +1,4 @@
-name: Android UI Bug fix temp
+name: Android UI bugtest
 
 on:
   push:
