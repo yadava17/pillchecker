@@ -737,7 +737,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
               Positioned(
                 top: 135,
-                right: 5,
+                right: 3,
                 child: Opacity(
                   opacity: (_loaded && _changed) ? 1.0 : 0.55,
                   child: IgnorePointer(
