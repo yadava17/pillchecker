@@ -1,0 +1,175 @@
+warning: in the working copy of 'linux/flutter/generated_plugin_registrant.cc', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'linux/flutter/generated_plugins.cmake', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'macos/Flutter/GeneratedPluginRegistrant.swift', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'pubspec.lock', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'pubspec.yaml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'windows/flutter/generated_plugin_registrant.cc', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'windows/flutter/generated_plugins.cmake', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/lib/main.dart b/lib/main.dart[m
+[1mindex 7f34fd7..c9d1b0d 100644[m
+[1m--- a/lib/main.dart[m
+[1m+++ b/lib/main.dart[m
+[36m@@ -2,9 +2,13 @@[m [mimport 'dart:async';[m
+ import 'package:flutter/material.dart';[m
+ import 'package:pillchecker/app/app.dart';[m
+ import 'package:pillchecker/services/notification_service.dart';[m
+[32m+[m[32mimport 'package:rive/rive.dart';[m
+ [m
+[31m-void main() {[m
+[32m+[m[32mFuture<void> main() async {[m
+   WidgetsFlutterBinding.ensureInitialized();[m
+[32m+[m
+[32m+[m[32m  await RiveNative.init();[m
+[32m+[m
+   runApp(const App());[m
+ [m
+   WidgetsBinding.instance.addPostFrameCallback((_) {[m
+[1mdiff --git a/lib/screens/home/home_screen.dart b/lib/screens/home/home_screen.dart[m
+[1mindex 7dfddb0..44d70a4 100644[m
+[1m--- a/lib/screens/home/home_screen.dart[m
+[1m+++ b/lib/screens/home/home_screen.dart[m
+[36m@@ -10,6 +10,8 @@[m [mimport 'package:pillchecker/services/notification_service.dart';[m
+ import 'package:pillchecker/widgets/daily_completion_circle.dart';[m
+ import 'package:pillchecker/screens/settings/settings_screen.dart';[m
+ import 'package:pillchecker/widgets/pill_info_panel.dart';[m
+[32m+[m[32mimport 'package:pillchecker/widgets/weekly_pillbox_organizer.dart';[m
+[32m+[m[32mimport 'package:pillchecker/constants/prefs_keys.dart';[m
+ [m
+ class HomeScreen extends StatefulWidget {[m
+   const HomeScreen({super.key});[m
+[36m@@ -20,7 +22,7 @@[m [mclass HomeScreen extends StatefulWidget {[m
+ [m
+ enum _ConfigStep { name, config, doses }[m
+ [m
+[31m-class _HomeScreenState extends State<HomeScreen> {[m
+[32m+[m[32mclass _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {[m
+   // -------- prefs keys --------[m
+   static const _pillNamesKey = 'pill_names';[m
+   static const _pillTimesKey =[m
+[36m@@ -80,11 +82,34 @@[m [mclass _HomeScreenState extends State<HomeScreen> {[m
+   String? _labelOverride;[m
+   bool _showPillLabel = true;[m
+ [m
+[32m+[m[32m  final FocusNode _nameFocus = FocusNode();[m
+[32m+[m
+   late final FixedExtentScrollController _wheelController =[m
+       FixedExtentScrollController(initialItem: 1);[m
+ [m
+   bool get _centerIsRealPill => _centerPillIndex != null;[m
+ [m
+[32m+[m[32m  int _todayIndex = 3; // default Wed for safety[m
+[32m+[m[32m  bool _allowDailyFillAnim = true; // will gate the DailyCompletionCircle fill[m
+[32m+[m[32m  static const Duration _pillboxOpenAnim = Duration(milliseconds: 650);[m
+[32m+[m[32m  int? _debugDayOverride; // null = real day[m
+[32m+[m[32m  int _lastSeenDayKey = -1; // store last "day stamp"[m
+[32m+[m
+[32m+[m[32m  int get _realTodayIndex => _debugDayOverride ?? (DateTime.now().weekday % 7);[m
+[32m+[m
+[32m+[m[32m  final _pillboxKey = GlobalKey<WeeklyPillboxOrganizerState>();[m
+[32m+[m[32m  int _pillboxResetToken = 0;[m
+[32m+[m
+[32m+[m[32m  // what day the pillbox is CURRENTLY positioned to (for sliding)[m
+[32m+[m[32m  int _pillboxVisualDay = 3; // default Wed so your current alignment is sane[m
+[32m+[m
+[32m+[m[32m  // do we allow the pillbox to OPEN yet (we keep it closed during slide)[m
+[32m+[m[32m  bool _allowPillboxOpen = false;[m
+[32m+[m
+[32m+[m[32m  // slide timing[m
+[32m+[m[32m  Duration _pillboxSlideDur = const Duration(milliseconds: 650);[m
+[32m+[m[32m  Timer? _pillboxSlideTimer;[m
+[32m+[m
+   // stable-ish notification id generator[m
+   int _newNotifId() =>[m
+       DateTime.now().microsecondsSinceEpoch.remainder(2000000000);[m
+[36m@@ -93,7 +118,18 @@[m [mclass _HomeScreenState extends State<HomeScreen> {[m
+   @override[m
+   void initState() {[m
+     super.initState();[m
+[32m+[m[32m    WidgetsBinding.instance.addObserver(this);[m
+[32m+[m
+[32m+[m[32m    _lastSeenDayKey =[m
+[32m+[m[32m        DateTime.now().year * 10000 +[m
+[32m+[m[32m        DateTime.now().month * 100 +[m
+[32m+[m[32m        DateTime.now().day;[m
+[32m+[m[32m    Timer(_pillboxOpenAnim, () {[m
+[32m+[m[32m      if (!mounted) return;[m
+[32m+[m[32m      setState(() => _allowDailyFillAnim = true);[m
+[32m+[m[32m    });[m
+     _loadAndMaybeAutoOpen();[m
+[32m+[m[32m    _coldStartOpenToday();[m
+     _scheduleGlobalDayBoundaryRefresh();[m
+     _scheduleGlobalBoundaryRefresh();[m
+     _checkMapFuture = _loadCheckMap();[m
+[36m@@ -103,15 +139,99 @@[m [mclass _HomeScreenState extends State<HomeScreen> {[m
+ [m
+   @override[m
+   void dispose() {[m
+[32m+[m[32m    WidgetsBinding.instance.removeObserver(this);[m
+[32m+[m[32m    _pillboxSlideTimer?.cancel();[m
+[32m+[m[32m    _nameFocus.dispose();[m
+[32m+[m
+     _labelTimer?.cancel();[m
+     _doseBoundaryTimer?.cancel();[m
+     _dayBoundaryTimer?.cancel();[m
+[32m+[m[32m    _globalBoundaryTimer?.cancel();[m
+[32m+[m
+     _nameController.dispose();[m
+     _wheelController.dispose();[m
+[31m-    _globalBoundaryTimer?.cancel();[m
+[32m+[m
+     super.dispose();[m
+   }[m
+ [m
+[32m+[m[32m  int _yesterdayOf(int day) => (day + 6) % 7; // 0..6[m
+[32m+[m
+[32m+[m[32m  int _slideDistanceSteps(int from, int to) {[m
+[32m+[m[32m    // Your special rule:[m
+[32m+[m[32m    // Sunday should start on Saturday and slide "all the way back"[m
+[32m+[m[32m    // (big distance). Since from=yesterday, only Sunday needs special.[m
+[32m+[m[32m    if (from == 6 && to == 0) return 6;[m
+[32m+[m
+[32m+[m[32m    // normal days: just 1 step[m
+[32m+[m[32m    return (to - from).abs();[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  Duration _durationForSlideSteps(int steps) {[m
+[32m+[m[32m    // Tune these if you want:[m
+[32m+[m[32m    const minMs = 520;[m
+[32m+[m[32m    const perStepMs = 180;[m
+[32m+[m[32m    const maxMs = 1250;[m
+[32m+[m
+[32m+[m[32m    final ms = (minMs + steps * perStepMs).clamp(minMs, maxMs);[m
+[32m+[m[32m    return Duration(milliseconds: ms);[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  void _startNewDaySequence({required int today}) {[m
+[32m+[m[32m    final from = _yesterdayOf(today);[m
+[32m+[m
+[32m+[m[32m    // Reset Rive back to idle/closed (since no CLOSE triggers)[m
+[32m+[m[32m    // so yesterday's flap doesn't remain open.[m
+[32m+[m[32m    setState(() {[m
+[32m+[m[32m      _todayIndex = today;[m
+[32m+[m
+[32m+[m[32m      _pillboxResetToken++;[m
+[32m+[m[32m      _allowPillboxOpen = false;[m
+[32m+[m
+[32m+[m[32m      // start visually on yesterday[m
+[32m+[m[32m      _pillboxVisualDay = from;[m
+[32m+[m
+[32m+[m[32m      // gate daily fill too[m
+[32m+[m[32m      _allowDailyFillAnim = false;[m
+[32m+[m
+[32m+[m[32m      // compute slide duration[m
+[32m+[m[32m      final steps = _slideDistanceSteps(from, today);[m
+[32m+[m[32m      _pillboxSlideDur = _durationForSlideSteps(steps);[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m    // 1 frame later: animate to today[m
+[32m+[m[32m    WidgetsBinding.instance.addPostFrameCallback((_) {[m
+[32m+[m[32m      if (!mounted) return;[m
+[32m+[m
+[32m+[m[32m      setState(() {[m
+[32m+[m[32m        _pillboxVisualDay = today; // triggers AnimatedPositioned slide[m
+[32m+[m[32m      });[m
+[32m+[m
+[32m+[m[32m      // after slide completes: allo
