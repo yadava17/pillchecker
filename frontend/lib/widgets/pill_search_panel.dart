@@ -99,7 +99,8 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
 
   List<PillSearchItem> get _rxAsItems {
     return _rxResults.map((m) {
-      final sub = m.subtitle ??
+      final sub =
+          m.subtitle ??
           [
             if (m.genericName != null) m.genericName,
             if (m.strength != null) m.strength,
@@ -136,10 +137,8 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
     final hasOfflineMatches = _offlineLongQueryMatches.isNotEmpty;
     final showOfflineOnlyBanner =
         useRx && _hadNetworkError && _rxResults.isEmpty && hasOfflineMatches;
-    final showNoMatchesBanner = useRx &&
-        !_loading &&
-        items.isEmpty &&
-        !hasOfflineMatches;
+    final showNoMatchesBanner =
+        useRx && !_loading && items.isEmpty && !hasOfflineMatches;
 
     return Material(
       color: Colors.transparent,
@@ -292,16 +291,16 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
                           );
                           final subtitle = useRx
                               ? (isDup
-                                  ? 'Already added'
-                                  : (p.isRxNorm
-                                      ? (p.searchSubtitle ??
-                                          (p.isFromCache
-                                              ? 'Saved lookup • tap to review'
-                                              : 'Online directory • tap to review'))
-                                      : 'On-device suggestion • tap to add'))
+                                    ? 'Already added'
+                                    : (p.isRxNorm
+                                          ? (p.searchSubtitle ??
+                                                (p.isFromCache
+                                                    ? 'Saved lookup • tap to review'
+                                                    : 'Online directory • tap to review'))
+                                          : 'On-device suggestion • tap to add'))
                               : (isDup
-                                  ? 'Already added'
-                                  : '${p.suggestedTimesPerDay}× per day • Tap to add');
+                                    ? 'Already added'
+                                    : '${p.suggestedTimesPerDay}× per day • Tap to add');
 
                           return Opacity(
                             opacity: isDup ? 0.45 : 1.0,

@@ -40,7 +40,7 @@ class _DoseTimesScreenState extends State<DoseTimesScreen> {
     if (picked != null) setState(() => times[i] = picked);
   }
 
-  bool get _allSet => times.every((t) => t != null);
+  bool get _anySet => times.any((t) => t != null);
 
   @override
   Widget build(BuildContext context) {
@@ -75,8 +75,18 @@ class _DoseTimesScreenState extends State<DoseTimesScreen> {
                     tileColor: Colors.black12,
                     title: Text('Dose ${i + 1}'),
                     subtitle: Text(t == null ? 'No time set' : _format(t)),
-                    trailing: const Icon(Icons.schedule),
+                    trailing: t == null
+                        ? const Icon(Icons.schedule)
+                        : IconButton(
+                            tooltip: 'Skip this dose',
+                            icon: const Icon(Icons.cancel),
+                            onPressed: () => setState(() => times[i] = null),
+                          ),
                     onTap: () => _pickTime(i),
+                    onLongPress: () {
+                      // Clear this slot to treat it as skipped.
+                      setState(() => times[i] = null);
+                    },
                   );
                 },
               ),
@@ -86,12 +96,19 @@ class _DoseTimesScreenState extends State<DoseTimesScreen> {
               width: double.infinity,
               height: 52,
               child: ElevatedButton(
-                onPressed: _allSet
+                onPressed: _anySet
                     ? () {
+                        final enabled = <TimeOfDay>[
+                          for (final t in times)
+                            if (t != null) t,
+                        ];
+
+                        if (enabled.isEmpty) return;
+
                         final config = PillConfig(
                           name: widget.pillName,
-                          timesPerDay: widget.timesPerDay,
-                          doseTimes24h: times.map((t) => _format(t!)).toList(),
+                          timesPerDay: enabled.length,
+                          doseTimes24h: enabled.map(_format).toList(),
                         );
                         Navigator.pop(context, config);
                       }

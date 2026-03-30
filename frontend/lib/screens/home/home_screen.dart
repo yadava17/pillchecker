@@ -1746,8 +1746,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (picked != null) setState(() => _doseTimes[i] = picked);
   }
 
-  bool get _allDoseTimesSet =>
-      _doseTimes.isNotEmpty && _doseTimes.every((t) => t != null);
+  bool get _anyDoseTimeSet =>
+      _doseTimes.isNotEmpty && _doseTimes.any((t) => t != null);
 
   void _handlePrimaryAction() async {
     if (_step == _ConfigStep.name) {
@@ -1789,7 +1789,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     if (_step == _ConfigStep.doses) {
-      if (!_allDoseTimesSet) return;
+      if (!_anyDoseTimeSet) return;
 
       if (_isEditing) {
         _updatePill();
@@ -1807,11 +1807,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (name.isEmpty) return;
 
     if (_timesPerDay == 1 && _singleDoseTime == null) return;
-    if (_timesPerDay > 1 && !_allDoseTimesSet) return;
+    if (_timesPerDay > 1 && !_anyDoseTimeSet) return;
 
     final List<TimeOfDay> doses = (_timesPerDay == 1)
         ? <TimeOfDay>[_singleDoseTime!]
-        : _doseTimes.map((t) => t!).toList();
+        : _doseTimes.whereType<TimeOfDay>().toList();
 
     doses.sort(
       (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
@@ -1984,11 +1984,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (name.isEmpty) return;
 
     if (_timesPerDay == 1 && _singleDoseTime == null) return;
-    if (_timesPerDay > 1 && !_allDoseTimesSet) return;
+    if (_timesPerDay > 1 && !_anyDoseTimeSet) return;
 
     final List<TimeOfDay> doses = (_timesPerDay == 1)
         ? <TimeOfDay>[_singleDoseTime!]
-        : _doseTimes.map((t) => t!).toList();
+        : _doseTimes.whereType<TimeOfDay>().toList();
 
     doses.sort(
       (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
@@ -2296,6 +2296,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _pendingSlot = false;
       _editingIndex = newEditingIndex;
       _wheelSelectedIndex = newWheelIndex;
+      _infoOpen = false; // close dashboard panel after delete
     });
 
     final checkMap = await _deriveCheckMapFromDatabase();
@@ -2817,14 +2818,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                   ),
                                 ),
                                 subtitle: Text(
-                                  t == null ? 'Tap to set time' : _fmt(t),
+                                  t == null
+                                      ? 'Tap to set time (leave empty to skip)'
+                                      : '${_fmt(t)} • tap to change, or clear to skip',
                                   style: const TextStyle(color: cardColor),
                                 ),
-                                trailing: const Icon(
-                                  Icons.schedule,
-                                  color: cardColor,
-                                ),
+                                trailing: t == null
+                                    ? const Icon(
+                                        Icons.schedule,
+                                        color: cardColor,
+                                      )
+                                    : IconButton(
+                                        tooltip: 'Skip this dose',
+                                        onPressed: () {
+                                          setState(() => _doseTimes[i] = null);
+                                        },
+                                        icon: const Icon(
+                                          Icons.cancel,
+                                          color: cardColor,
+                                        ),
+                                      ),
                                 onTap: () => _pickDoseTime(i),
+                                onLongPress: () {
+                                  // Long-press clears this slot so the user can skip it.
+                                  setState(() => _doseTimes[i] = null);
+                                },
                               ),
                             );
                           },
@@ -3894,6 +3912,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       if (pillIndex == null) return;
                       _startEditFlow(pillIndex);
                     },
+                    onDelete: idx == null ? null : _deleteCenteredPill,
+                    rxNormService: _rxNormService,
 
                     // ✅ Hide supply section entirely when global mode is Always Off
                     supplyTrackingOn:
