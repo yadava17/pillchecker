@@ -10,14 +10,14 @@ class DoseTimesScreen extends StatefulWidget {
 
   final String pillName;
   final int timesPerDay;
-  
 
   @override
   State<DoseTimesScreen> createState() => _DoseTimesScreenState();
 }
 
 class _DoseTimesScreenState extends State<DoseTimesScreen> {
-  int _newNotifId() => DateTime.now().microsecondsSinceEpoch.remainder(2000000000);
+  int _newNotifId() =>
+      DateTime.now().microsecondsSinceEpoch.remainder(2000000000);
   late List<TimeOfDay?> times; // one per dose
 
   @override
@@ -54,7 +54,10 @@ class _DoseTimesScreenState extends State<DoseTimesScreen> {
               alignment: Alignment.centerLeft,
               child: Text(
                 widget.pillName,
-                style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+                style: const TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
             const SizedBox(height: 16),

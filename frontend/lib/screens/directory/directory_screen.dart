@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'package:pillchecker/data/offline_medication_suggestions.dart';
+import 'package:pillchecker/backend/data/offline_medication_suggestions.dart';
 import 'package:pillchecker/models/pill_search_item.dart';
 import 'package:pillchecker/constants/prefs_keys.dart';
 import 'package:pillchecker/backend/services/med_service.dart';

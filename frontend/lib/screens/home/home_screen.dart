@@ -13,7 +13,7 @@ import 'package:pillchecker/screens/settings/settings_screen.dart';
 import 'package:pillchecker/widgets/pill_info_panel.dart';
 import 'package:pillchecker/widgets/weekly_pillbox_organizer.dart';
 import 'package:pillchecker/constants/prefs_keys.dart';
-import 'package:pillchecker/data/offline_medication_suggestions.dart';
+import 'package:pillchecker/backend/data/offline_medication_suggestions.dart';
 import 'package:pillchecker/models/pill_search_item.dart';
 import 'package:pillchecker/widgets/medication_details_sheet.dart';
 import 'package:pillchecker/widgets/pill_search_panel.dart';
@@ -586,10 +586,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final sch = await _scheduleService.getScheduleForMedication(m.id);
       var times = <String>['08:00'];
       if (sch != null) {
-        times = (jsonDecode(sch['times_json']! as String) as List)
-            .map((e) => e.toString())
-            .toList()
-          ..sort((a, b) => a.compareTo(b));
+        times =
+            (jsonDecode(sch['times_json']! as String) as List)
+                .map((e) => e.toString())
+                .toList()
+              ..sort((a, b) => a.compareTo(b));
       }
       pillDoseTimes.add(times);
       pillTimes.add(times.isNotEmpty ? times.first : '08:00');
@@ -627,10 +628,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         w.cycleStart.day,
       );
       final mid = medicationIds[i];
-      final events = await _adherenceService.getDoseEventsForMedicationOnLocalDay(
-        medicationId: mid,
-        localDay: cycleDay,
-      );
+      final events = await _adherenceService
+          .getDoseEventsForMedicationOnLocalDay(
+            medicationId: mid,
+            localDay: cycleDay,
+          );
       var mask = 0;
       for (final e in events) {
         if (e.status == 'taken') {
@@ -1579,7 +1581,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _hidePillLabelNow();
 
     final tp = item.suggestedTimesPerDay.clamp(1, 6);
-    final resolvedName = (details != null && details.displayName.trim().isNotEmpty)
+    final resolvedName =
+        (details != null && details.displayName.trim().isNotEmpty)
         ? details.displayName.trim()
         : item.name;
     final resolvedInfo = details?.userFriendlyInfoText ?? item.info;
@@ -3959,4 +3962,3 @@ class DayCompleteCircle extends StatelessWidget {
     );
   }
 }
-

@@ -1,6 +1,7 @@
 // Offline data layer: SQLite + medication / schedule / adherence services.
 // UI lives under lib/; notifications stay in lib/services/notification_service.dart.
 
+export 'data/offline_medication_suggestions.dart';
 export 'database/app_database.dart';
 export 'models/dose_event_record.dart';
 export 'models/history_entry.dart';
