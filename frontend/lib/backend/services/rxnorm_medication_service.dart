@@ -12,8 +12,8 @@ class RxNormMedicationService {
   RxNormMedicationService({
     RxNavApiClient? apiClient,
     RxNormMedicationCache? cache,
-  })  : _api = apiClient ?? RxNavApiClient(),
-        _cache = cache ?? RxNormCacheRepository();
+  }) : _api = apiClient ?? RxNavApiClient(),
+       _cache = cache ?? RxNormCacheRepository();
 
   final RxNavApiClient _api;
   final RxNormMedicationCache _cache;
@@ -36,8 +36,10 @@ class RxNormMedicationService {
 
       if (merged.length < 12) {
         final approx = await _api.approximateTerm(q);
-        final extra =
-            RxNormResponseMapper.parseApproximateCandidates(approx, q);
+        final extra = RxNormResponseMapper.parseApproximateCandidates(
+          approx,
+          q,
+        );
         final seen = merged.map((e) => e.rxcui).toSet();
         for (final e in extra) {
           if (!seen.contains(e.rxcui)) {

@@ -50,7 +50,9 @@ class ScheduleService {
     return sid;
   }
 
-  Future<Map<String, Object?>?> getScheduleForMedication(int medicationId) async {
+  Future<Map<String, Object?>?> getScheduleForMedication(
+    int medicationId,
+  ) async {
     final db = await _database;
     final rows = await db.query(
       'schedules',

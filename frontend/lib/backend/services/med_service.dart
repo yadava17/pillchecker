@@ -72,21 +72,12 @@ class MedService {
     if (nameLocked != null) map['name_locked'] = nameLocked ? 1 : 0;
     if (sortOrder != null) map['sort_order'] = sortOrder;
     if (map.isEmpty) return;
-    await db.update(
-      'medications',
-      map,
-      where: 'id = ?',
-      whereArgs: [id],
-    );
+    await db.update('medications', map, where: 'id = ?', whereArgs: [id]);
   }
 
   Future<void> delete(int id) async {
     final db = await _database;
-    await db.delete(
-      'medications',
-      where: 'id = ?',
-      whereArgs: [id],
-    );
+    await db.delete('medications', where: 'id = ?', whereArgs: [id]);
   }
 
   Future<int> count() async {

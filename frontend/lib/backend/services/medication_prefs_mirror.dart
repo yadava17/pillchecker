@@ -25,10 +25,7 @@ class MedicationPrefsMirror {
       jsonEncode(pillSupplyEnabled),
     );
     await prefs.setString('pill_supply_left_v1', jsonEncode(pillSupplyLeft));
-    await prefs.setString(
-      'pill_supply_init_v1',
-      jsonEncode(pillSupplyInitial),
-    );
+    await prefs.setString('pill_supply_init_v1', jsonEncode(pillSupplyInitial));
     await prefs.setString(
       'pill_supply_low_sent_v1',
       jsonEncode(pillSupplyLowSent),

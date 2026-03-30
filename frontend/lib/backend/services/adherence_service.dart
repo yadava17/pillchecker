@@ -135,12 +135,11 @@ class AdherenceService {
   }
 
   /// Auto-mark planned doses as missed after a grace period past planned local time.
-  Future<void> autoMarkMissedPastPlanned({Duration grace = const Duration(hours: 2)}) async {
+  Future<void> autoMarkMissedPastPlanned({
+    Duration grace = const Duration(hours: 2),
+  }) async {
     final db = await _database;
-    final rows = await db.query(
-      'dose_events',
-      where: "status = 'planned'",
-    );
+    final rows = await db.query('dose_events', where: "status = 'planned'");
     final now = DateTime.now();
     for (final r in rows) {
       final planned = DateTime.parse(r['planned_at']! as String).toLocal();

@@ -1,8 +1,7 @@
 import 'package:flutter/material.dart';
 
 /// Local calendar day (date only) from [DateTime].
-DateTime localDateOnly(DateTime dt) =>
-    DateTime(dt.year, dt.month, dt.day);
+DateTime localDateOnly(DateTime dt) => DateTime(dt.year, dt.month, dt.day);
 
 /// Dart weekday: Mon=1..Sun=7. PillChecker uses Sun=0..Sat=6.
 int weekdaySun0(DateTime localDay) => localDay.weekday % 7;
