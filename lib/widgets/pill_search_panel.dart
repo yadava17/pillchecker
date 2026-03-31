@@ -1,10 +1,16 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+
+import 'package:pillchecker/backend/rxnorm/medication_summary.dart';
+import 'package:pillchecker/backend/services/rxnorm_medication_service.dart';
 import 'package:pillchecker/models/pill_search_item.dart';
 
 class PillSearchPanel extends StatefulWidget {
   const PillSearchPanel({
     super.key,
-    required this.items,
+    required this.rxNormService,
+    required this.placeholderItems,
     required this.onPickCustom,
     required this.onPickItem,
     required this.onClose,
@@ -12,20 +18,17 @@ class PillSearchPanel extends StatefulWidget {
     this.initialQuery = '',
   });
 
-  final List<PillSearchItem> items;
+  final RxNormMedicationService rxNormService;
 
-  /// “Custom pill” always appears and routes to your existing flow.
+  /// Bundled on-device names — filtered for any query length; merged with
+  /// RxNorm results when online. Works fully offline without internet.
+  final List<PillSearchItem> placeholderItems;
+
   final VoidCallback onPickCustom;
-
-  /// User tapped a placeholder/RxNorm result.
   final ValueChanged<PillSearchItem> onPickItem;
-
-  /// Close the search overlay.
   final VoidCallback onClose;
-
   final String initialQuery;
-
-  final Set<String> disabledNamesLower; // lowercase pill names already added
+  final Set<String> disabledNamesLower;
 
   @override
   State<PillSearchPanel> createState() => _PillSearchPanelState();
@@ -39,39 +42,113 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
     text: widget.initialQuery,
   );
 
-  String get _q => _ctrl.text.trim().toLowerCase();
+  Timer? _debounce;
+  bool _loading = false;
+  List<MedicationSummary> _rxResults = [];
+  bool _servedFromCache = false;
+  bool _hadNetworkError = false;
 
-  List<PillSearchItem> get _filtered {
-    if (_q.isEmpty) return widget.items;
-    return widget.items
-        .where((p) => p.name.toLowerCase().contains(_q))
-        .toList(growable: false);
-  }
+  String get _q => _ctrl.text.trim();
 
   @override
   void dispose() {
+    _debounce?.cancel();
     _ctrl.dispose();
     super.dispose();
   }
 
+  void _onQueryChanged() {
+    setState(() {});
+    _debounce?.cancel();
+    final query = _q;
+    if (query.length < 2) {
+      setState(() {
+        _loading = false;
+        _rxResults = [];
+        _servedFromCache = false;
+        _hadNetworkError = false;
+      });
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _rxResults = [];
+    });
+    _debounce = Timer(const Duration(milliseconds: 420), () async {
+      final outcome = await widget.rxNormService.searchMedications(query);
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _rxResults = outcome.items;
+        _servedFromCache = outcome.servedFromCache;
+        _hadNetworkError = outcome.hadNetworkError;
+      });
+    });
+  }
+
+  List<PillSearchItem> get _placeholderFiltered {
+    final q = _q.toLowerCase();
+    if (q.isEmpty) return widget.placeholderItems;
+    return widget.placeholderItems
+        .where((p) => p.name.toLowerCase().contains(q))
+        .toList(growable: false);
+  }
+
+  /// Same filter as [_placeholderFiltered] but only used when [useRx] (2+ chars).
+  List<PillSearchItem> get _offlineLongQueryMatches => _placeholderFiltered;
+
+  List<PillSearchItem> get _rxAsItems {
+    return _rxResults.map((m) {
+      final sub =
+          m.subtitle ??
+          [
+            if (m.genericName != null) m.genericName,
+            if (m.strength != null) m.strength,
+            if (m.doseForm != null) m.doseForm,
+          ].whereType<String>().join(' • ');
+      return PillSearchItem(
+        name: m.displayName,
+        suggestedTimesPerDay: 2,
+        info: '',
+        rxcui: m.rxcui,
+        searchSubtitle: sub.isEmpty ? null : sub,
+        isFromCache: _servedFromCache,
+      );
+    }).toList();
+  }
+
+  /// RxNorm rows first, then on-device suggestions that are not duplicates.
+  List<PillSearchItem> get _mergedRxAndOffline {
+    final rx = _rxAsItems;
+    final seen = rx.map((e) => e.name.trim().toLowerCase()).toSet();
+    final out = [...rx];
+    for (final o in _offlineLongQueryMatches) {
+      final k = o.name.trim().toLowerCase();
+      if (seen.add(k)) out.add(o);
+    }
+    return out;
+  }
+
   @override
   Widget build(BuildContext context) {
-    final items = _filtered;
+    final q = _q;
+    final useRx = q.length >= 2;
+    final items = useRx ? _mergedRxAndOffline : _placeholderFiltered;
+    final hasOfflineMatches = _offlineLongQueryMatches.isNotEmpty;
+    final showOfflineOnlyBanner =
+        useRx && _hadNetworkError && _rxResults.isEmpty && hasOfflineMatches;
+    final showNoMatchesBanner =
+        useRx && !_loading && items.isEmpty && !hasOfflineMatches;
 
     return Material(
       color: Colors.transparent,
       child: SafeArea(
         child: Padding(
-          // ✅ keeps the list usable when keyboard is up
           padding: EdgeInsets.only(
-            left: 0,
-            right: 0,
-            top: 0,
             bottom: MediaQuery.of(context).viewInsets.bottom,
           ),
           child: Column(
             children: [
-              // --- Top row: Search bar + close ---
               Row(
                 children: [
                   Expanded(
@@ -91,15 +168,18 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
                               controller: _ctrl,
                               autofocus: false,
                               decoration: const InputDecoration(
-                                hintText: 'Search for a pill…',
+                                hintText: 'Search medicines…',
                                 border: InputBorder.none,
                               ),
-                              onChanged: (_) => setState(() {}),
+                              onChanged: (_) => _onQueryChanged(),
                             ),
                           ),
                           if (_ctrl.text.isNotEmpty)
                             GestureDetector(
-                              onTap: () => setState(() => _ctrl.clear()),
+                              onTap: () {
+                                _ctrl.clear();
+                                _onQueryChanged();
+                              },
                               child: const Icon(Icons.close, color: cardColor),
                             ),
                         ],
@@ -110,43 +190,123 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
                   _iconBtn(icon: Icons.close, onTap: widget.onClose),
                 ],
               ),
-
-              const SizedBox(height: 14),
-
-              // --- Results list (ALWAYS scrollable) ---
+              const SizedBox(height: 10),
+              if (showOfflineOnlyBanner)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.teal.shade50,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      'Offline — showing built-in medication names below. Pick one to add, or use Custom pill.',
+                      style: TextStyle(
+                        color: Colors.teal.shade900,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                ),
+              if (useRx && _servedFromCache && _rxResults.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.amber.shade100,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      'Showing saved search results — connect to refresh from the medicine directory.',
+                      style: TextStyle(
+                        color: Colors.amber.shade900,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                ),
               Expanded(
                 child: ListView(
-                  // ✅ ALWAYS scrollable (even when short)
                   physics: const AlwaysScrollableScrollPhysics(
                     parent: ClampingScrollPhysics(),
                   ),
-                  // ✅ drag list to dismiss keyboard
                   keyboardDismissBehavior:
                       ScrollViewKeyboardDismissBehavior.onDrag,
                   padding: const EdgeInsets.only(bottom: 18),
                   children: [
                     _resultTile(
                       title: 'Custom pill',
-                      subtitle: 'Create your own pill (manual)',
+                      subtitle: 'Enter details yourself (no online lookup)',
                       leading: const Icon(Icons.add, color: white),
                       onTap: widget.onPickCustom,
                     ),
                     const SizedBox(height: 10),
-
+                    if (useRx && _loading)
+                      const Padding(
+                        padding: EdgeInsets.all(24),
+                        child: Center(child: CircularProgressIndicator()),
+                      ),
+                    if (showNoMatchesBanner)
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: cardColor.withOpacity(0.75),
+                          borderRadius: BorderRadius.circular(18),
+                        ),
+                        child: Text(
+                          _hadNetworkError
+                              ? 'Can\'t reach the online medicine directory. No on-device names matched — try a different spelling, or add a Custom pill.'
+                              : 'No matches from the online directory or on-device list. Try another spelling or use Custom pill.',
+                          style: const TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    if (!useRx)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Text(
+                          'Type at least 2 letters to search (on-device + online when available), or pick below.',
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.85),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
                     for (final p in items) ...[
                       Builder(
                         builder: (_) {
                           final isDup = widget.disabledNamesLower.contains(
                             p.name.trim().toLowerCase(),
                           );
+                          final subtitle = useRx
+                              ? (isDup
+                                    ? 'Already added'
+                                    : (p.isRxNorm
+                                          ? (p.searchSubtitle ??
+                                                (p.isFromCache
+                                                    ? 'Saved lookup • tap to review'
+                                                    : 'Online directory • tap to review'))
+                                          : 'On-device suggestion • tap to add'))
+                              : (isDup
+                                    ? 'Already added'
+                                    : '${p.suggestedTimesPerDay}× per day • Tap to add');
 
                           return Opacity(
                             opacity: isDup ? 0.45 : 1.0,
                             child: _resultTile(
                               title: p.name,
-                              subtitle: isDup
-                                  ? 'Already added'
-                                  : '${p.suggestedTimesPerDay}× per day • Tap to add',
+                              subtitle: subtitle,
                               leading: Image.asset(
                                 'assets/images/pill_placeholder.png',
                                 width: 34,
@@ -160,8 +320,7 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
                       ),
                       const SizedBox(height: 10),
                     ],
-
-                    if (items.isEmpty)
+                    if (!useRx && items.isEmpty)
                       Container(
                         padding: const EdgeInsets.all(16),
                         decoration: BoxDecoration(
@@ -169,7 +328,7 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
                           borderRadius: BorderRadius.circular(18),
                         ),
                         child: const Text(
-                          'No matches. Try a different search.',
+                          'No on-device names match. Type more letters or use Custom pill.',
                           style: TextStyle(color: Colors.white70),
                         ),
                       ),
@@ -195,12 +354,12 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
         borderRadius: BorderRadius.circular(18),
         onTap: onTap,
         child: Container(
-          height: 70,
+          constraints: const BoxConstraints(minHeight: 70),
           decoration: BoxDecoration(
             color: cardColor.withOpacity(0.88),
             borderRadius: BorderRadius.circular(18),
           ),
-          padding: const EdgeInsets.symmetric(horizontal: 14),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           child: Row(
             children: [
               Container(
@@ -221,18 +380,18 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
                   children: [
                     Text(
                       title,
-                      maxLines: 1,
+                      maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                         color: Colors.white,
-                        fontSize: 18,
+                        fontSize: 17,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
                     const SizedBox(height: 2),
                     Text(
                       subtitle,
-                      maxLines: 1,
+                      maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                         color: Colors.white70,
@@ -244,7 +403,7 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
                 ),
               ),
               const SizedBox(width: 10),
-              const Icon(Icons.add, color: Colors.white, size: 34),
+              const Icon(Icons.chevron_right, color: Colors.white, size: 28),
             ],
           ),
         ),

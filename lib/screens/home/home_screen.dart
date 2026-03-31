@@ -13,10 +13,21 @@ import 'package:pillchecker/screens/settings/settings_screen.dart';
 import 'package:pillchecker/widgets/pill_info_panel.dart';
 import 'package:pillchecker/widgets/weekly_pillbox_organizer.dart';
 import 'package:pillchecker/constants/prefs_keys.dart';
+import 'package:pillchecker/backend/data/offline_medication_suggestions.dart';
 import 'package:pillchecker/models/pill_search_item.dart';
+import 'package:pillchecker/widgets/medication_details_sheet.dart';
 import 'package:pillchecker/widgets/pill_search_panel.dart';
 import 'package:pillchecker/screens/directory/directory_screen.dart';
+import 'package:pillchecker/screens/history/history_screen.dart';
 import 'package:pillchecker/widgets/dose_progress_side_bar.dart';
+import 'package:pillchecker/backend/rxnorm/medication_details.dart';
+import 'package:pillchecker/backend/services/adherence_service.dart';
+import 'package:pillchecker/backend/services/med_service.dart';
+import 'package:pillchecker/backend/services/rxnorm_medication_service.dart';
+import 'package:pillchecker/backend/services/medication_prefs_mirror.dart';
+import 'package:pillchecker/backend/services/prefs_migration.dart';
+import 'package:pillchecker/backend/services/schedule_service.dart';
+import 'package:pillchecker/backend/utils/local_date_time.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -61,6 +72,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<String> pillTimes = []; // legacy: first dose only
   List<List<String>> pillDoseTimes =
       []; // ["08:00","14:00"...] aligned with pillNames
+
+  /// Parallel to [pillNames] — SQLite medication ids (staging backend).
+  List<int> medicationIds = [];
+  final MedService _medService = MedService();
+  final ScheduleService _scheduleService = ScheduleService();
+  final AdherenceService _adherenceService = AdherenceService();
+  final RxNormMedicationService _rxNormService = RxNormMedicationService();
+
   Map<String, dynamic> _checkMapCache = {};
   Future<Map<String, dynamic>> _checkMapFuture = Future.value(
     <String, dynamic>{},
@@ -179,12 +198,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() => _allowDailyFillAnim = true);
     });
+    _checkMapFuture = Future.value(<String, dynamic>{});
     _loadAndMaybeAutoOpen();
     unawaited(_loadSupplyGlobalSettings());
     _coldStartOpenToday();
     _scheduleGlobalDayBoundaryRefresh();
     _scheduleGlobalBoundaryRefresh();
-    _checkMapFuture = _loadCheckMap();
     _scheduleCenteredDoseBoundaryRefresh();
     _nameController.addListener(() => setState(() {}));
   }
@@ -203,6 +222,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _nameController.dispose();
     _wheelController.dispose();
+    _rxNormService.dispose();
 
     super.dispose();
   }
@@ -505,7 +525,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _maybeAutoPromptSupply();
 
       _nameController.text = pillNames[pillIndex];
-      _timesPerDay = doses.length;
+      _timesPerDay = doses.length.clamp(1, 6);
 
       _supplyTrackOn = (pillIndex < pillSupplyEnabled.length)
           ? pillSupplyEnabled[pillIndex]
@@ -519,14 +539,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ? pillSupplyInitial[pillIndex]
           : 0;
 
-      if (doses.length == 1) {
-        _step = _ConfigStep.config;
+      // Always start edit on config so times/day can be adjusted safely.
+      _step = _ConfigStep.config;
+      if (_timesPerDay == 1) {
         _singleDoseTime = doses.first;
         _doseTimes = [];
       } else {
-        _step = _ConfigStep.doses;
         _singleDoseTime = null;
         _doseTimes = doses.map((t) => t as TimeOfDay?).toList();
+        while (_doseTimes.length < _timesPerDay) {
+          _doseTimes.add(null);
+        }
       }
     });
 
@@ -535,15 +558,94 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // ---------------- helpers: check map ----------------
   Future<Map<String, dynamic>> _loadCheckMap() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_pillCheckKey);
-    if (raw == null || raw.isEmpty) {
+    if (pillNames.isEmpty) {
       _lastCheckMapCache = {};
       return {};
     }
-    final decoded = jsonDecode(raw) as Map<String, dynamic>;
-    _lastCheckMapCache = decoded;
-    return decoded;
+    if (medicationIds.length != pillNames.length) {
+      await _hydrateMedicationsFromDatabase();
+    }
+    final map = await _deriveCheckMapFromDatabase();
+    _lastCheckMapCache = map;
+    return map;
+  }
+
+  Future<void> _hydrateMedicationsFromDatabase() async {
+    final meds = await _medService.getAll();
+    medicationIds = meds.map((m) => m.id).toList();
+    pillNames = meds.map((m) => m.name).toList();
+    pillTimes = [];
+    pillDoseTimes = [];
+    pillSupplyEnabled = [];
+    pillSupplyLeft = [];
+    pillSupplyInitial = [];
+    pillNameLocked = [];
+
+    for (final m in meds) {
+      pillSupplyEnabled.add(m.supplyEnabled);
+      pillSupplyLeft.add(m.supplyLeft);
+      pillSupplyInitial.add(m.supplyInitial);
+      pillNameLocked.add(m.nameLocked);
+
+      final sch = await _scheduleService.getScheduleForMedication(m.id);
+      var times = <String>['08:00'];
+      if (sch != null) {
+        times =
+            (jsonDecode(sch['times_json']! as String) as List)
+                .map((e) => e.toString())
+                .toList()
+              ..sort((a, b) => a.compareTo(b));
+      }
+      pillDoseTimes.add(times);
+      pillTimes.add(times.isNotEmpty ? times.first : '08:00');
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    final lowSent = _decodeBoolList(prefs.getString(_pillSupplyLowSentKey));
+    pillSupplyLowSent = List.generate(
+      pillNames.length,
+      (i) => i < lowSent.length ? lowSent[i] : false,
+    );
+  }
+
+  Future<void> _refreshAdherenceFromDb() async {
+    if (medicationIds.isEmpty) return;
+    await _scheduleService.ensureDoseEventsForMedications(medicationIds);
+    await _adherenceService.autoMarkMissedPastPlanned();
+    final map = await _deriveCheckMapFromDatabase();
+    await _saveCheckMap(map);
+    if (!mounted) return;
+    _setCheckMapAndRebuild(map);
+  }
+
+  Future<Map<String, dynamic>> _deriveCheckMapFromDatabase() async {
+    final map = <String, dynamic>{};
+    final now = DateTime.now();
+    for (var i = 0; i < pillNames.length; i++) {
+      if (i >= medicationIds.length) continue;
+      final doses = _doseTimesForPill(i);
+      if (doses.isEmpty) continue;
+      final w = _computeDoseWindow(now: now, dosesSorted: doses);
+      final cycleDay = DateTime(
+        w.cycleStart.year,
+        w.cycleStart.month,
+        w.cycleStart.day,
+      );
+      final mid = medicationIds[i];
+      final events = await _adherenceService
+          .getDoseEventsForMedicationOnLocalDay(
+            medicationId: mid,
+            localDay: cycleDay,
+          );
+      var mask = 0;
+      for (final e in events) {
+        if (e.status == 'taken') {
+          mask |= (1 << e.doseIndex);
+        }
+      }
+      map['$i'] = _packCycleAndMask(w.cycleStart.toIso8601String(), mask);
+    }
+    return map;
   }
 
   Future<void> _saveCheckMap(Map<String, dynamic> map) async {
@@ -1128,6 +1230,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
 
+    unawaited(_refreshAdherenceFromDb());
+
     final now = DateTime.now();
     final dayKey = now.year * 10000 + now.month * 100 + now.day;
 
@@ -1288,115 +1392,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return (decoded as List).map((e) => e == true).toList();
   }
 
-  List<int> _decodeIntList(String? raw) {
-    if (raw == null || raw.isEmpty) return [];
-    final decoded = jsonDecode(raw);
-    return (decoded as List).map((e) => (e as num).toInt()).toList();
-  }
-
   // ---------------- load ----------------
   Future<void> _loadAndMaybeAutoOpen() async {
     final prefs = await SharedPreferences.getInstance();
 
-    final savedNames = prefs.getStringList(_pillNamesKey) ?? [];
-    final savedTimes = prefs.getStringList(_pillTimesKey) ?? [];
-
-    // align legacy times to names
-    final alignedTimes = List<String>.from(savedTimes);
-    while (alignedTimes.length < savedNames.length) {
-      alignedTimes.add('08:00');
-    }
-    if (alignedTimes.length > savedNames.length) {
-      alignedTimes.removeRange(savedNames.length, alignedTimes.length);
-    }
-    await prefs.setStringList(_pillTimesKey, alignedTimes);
-
-    // load v2 dose times
-    final rawDoseTimes = prefs.getString(_pillDoseTimesKey);
-    var loadedDoseTimes = _decodeListOfStringLists(rawDoseTimes);
-
-    // seed doseTimes from legacy if upgrading
-    if (loadedDoseTimes.isEmpty && savedNames.isNotEmpty) {
-      loadedDoseTimes = [
-        for (int i = 0; i < savedNames.length; i++) [alignedTimes[i]],
-      ];
-    }
-
-    while (loadedDoseTimes.length < savedNames.length) {
-      loadedDoseTimes.add(['08:00']);
-    }
-    if (loadedDoseTimes.length > savedNames.length) {
-      loadedDoseTimes.removeRange(savedNames.length, loadedDoseTimes.length);
-    }
-
-    await prefs.setString(_pillDoseTimesKey, jsonEncode(loadedDoseTimes));
-
-    // ---------------- load supply tracking (aligned to pill list) ----------------
-    final supplyEnabled = _decodeBoolList(
-      prefs.getString(_pillSupplyEnabledKey),
-    );
-    final supplyLeft = _decodeIntList(prefs.getString(_pillSupplyLeftKey));
-    final supplyInit = _decodeIntList(prefs.getString(_pillSupplyInitKey));
-    final supplyLowSent = _decodeBoolList(
-      prefs.getString(_pillSupplyLowSentKey),
+    await PrefsMigration.runOnceIfNeeded(
+      medService: _medService,
+      scheduleService: _scheduleService,
     );
 
-    // Align lengths to names
-    while (supplyEnabled.length < savedNames.length) supplyEnabled.add(false);
-    while (supplyLeft.length < savedNames.length) supplyLeft.add(0);
-    while (supplyInit.length < savedNames.length) supplyInit.add(0);
-    while (supplyLowSent.length < savedNames.length) supplyLowSent.add(false);
+    await _hydrateMedicationsFromDatabase();
 
-    if (supplyEnabled.length > savedNames.length) {
-      supplyEnabled.removeRange(savedNames.length, supplyEnabled.length);
-    }
-    if (supplyLeft.length > savedNames.length) {
-      supplyLeft.removeRange(savedNames.length, supplyLeft.length);
-    }
-    if (supplyInit.length > savedNames.length) {
-      supplyInit.removeRange(savedNames.length, supplyInit.length);
-    }
-    if (supplyLowSent.length > savedNames.length) {
-      supplyLowSent.removeRange(savedNames.length, supplyLowSent.length);
-    }
+    await _scheduleService.ensureDoseEventsForMedications(medicationIds);
+    await _adherenceService.autoMarkMissedPastPlanned();
 
-    // Persist back (so fresh installs get seeded)
-    await prefs.setString(_pillSupplyEnabledKey, jsonEncode(supplyEnabled));
-    await prefs.setString(_pillSupplyLeftKey, jsonEncode(supplyLeft));
-    await prefs.setString(_pillSupplyInitKey, jsonEncode(supplyInit));
-    await prefs.setString(_pillSupplyLowSentKey, jsonEncode(supplyLowSent));
+    final loadedMap = await _deriveCheckMapFromDatabase();
+    await _saveCheckMap(loadedMap);
 
-    final loadedMap = await _loadCheckMap();
+    await MedicationPrefsMirror.write(
+      pillNames: pillNames,
+      pillTimesFirst: pillTimes,
+      pillDoseTimes: pillDoseTimes,
+      pillSupplyEnabled: pillSupplyEnabled,
+      pillSupplyLeft: pillSupplyLeft,
+      pillSupplyInitial: pillSupplyInitial,
+      pillSupplyLowSent: pillSupplyLowSent,
+      pillNameLocked: pillNameLocked,
+    );
 
-    final nameLocked = _decodeBoolList(prefs.getString(_pillNameLockedKey));
-
-    // Align lengths to names
-    while (nameLocked.length < savedNames.length) nameLocked.add(false);
-    if (nameLocked.length > savedNames.length) {
-      nameLocked.removeRange(savedNames.length, nameLocked.length);
-    }
-
-    // Persist back (so it exists going forward)
-    await prefs.setString(_pillNameLockedKey, jsonEncode(nameLocked));
-
+    if (!mounted) return;
     setState(() {
-      pillNames = savedNames;
-      pillTimes = alignedTimes;
       _checkMapCache = loadedMap;
       _checkMapFuture = Future.value(loadedMap);
-      pillDoseTimes = loadedDoseTimes;
-
-      pillNameLocked = nameLocked;
-      pillSupplyEnabled = supplyEnabled;
-      pillSupplyLeft = supplyLeft;
-      pillSupplyInitial = supplyInit;
-      pillSupplyLowSent = supplyLowSent;
     });
 
-    // After loading pills, rebuild window AND re-mute anything already checked today
     unawaited(_rebuild2DayNotifWindowAndReMuteChecked(tag: 'initial-load'));
 
-    if (savedNames.isEmpty && mounted) {
+    if (pillNames.isEmpty && mounted) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         if (!mounted) return;
         await _showWelcomeThenOpenConfig(prefs);
@@ -1529,9 +1561,35 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
       return; // ✅ do not open config flow
     }
+
+    MedicationDetails? details;
+    if (item.isRxNorm) {
+      details = await showModalBottomSheet<MedicationDetails?>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: Theme.of(context).colorScheme.surface,
+        builder: (ctx) => MedicationDetailsSheet(
+          service: _rxNormService,
+          rxcui: item.rxcui!,
+          fallbackName: item.name,
+        ),
+      );
+      if (!mounted) return;
+      if (details == null) return;
+    }
+
+    _applySearchSelection(item, details);
+  }
+
+  void _applySearchSelection(PillSearchItem item, MedicationDetails? details) {
     _hidePillLabelNow();
 
     final tp = item.suggestedTimesPerDay.clamp(1, 6);
+    final resolvedName =
+        (details != null && details.displayName.trim().isNotEmpty)
+        ? details.displayName.trim()
+        : item.name;
+    final resolvedInfo = details?.userFriendlyInfoText ?? item.info;
 
     setState(() {
       _supplyTrackOn = false;
@@ -1540,11 +1598,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _lockPillName = true;
       _searchOpen = false;
 
-      // ✅ fill the info box + name
-      _selectedPillInfo = item.info;
-      _nameController.text = item.name;
+      _selectedPillInfo = resolvedInfo;
+      _nameController.text = resolvedName;
 
-      // ✅ open your existing config panel
       _editingIndex = null;
       _infoOpen = false;
       _configOpen = true;
@@ -1552,25 +1608,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _supplyPromptedThisFlow = false;
       _maybeAutoPromptSupply();
 
-      // ✅ prefill “times per day”
       _timesPerDay = tp;
 
-      // ✅ treat it like "add flow" so the wheel locks like normal
       _pendingSlot = true;
 
-      // ✅ jump to the correct step
       _singleDoseTime = null;
 
       if (tp == 1) {
-        _step = _ConfigStep.config; // user picks single time here
+        _step = _ConfigStep.config;
         _doseTimes = [];
       } else {
-        _step = _ConfigStep.doses; // go straight to the dose-times list
+        _step = _ConfigStep.doses;
         _doseTimes = List<TimeOfDay?>.filled(tp, null);
       }
     });
 
-    // Center wheel onto the pending slot
     _centerWheelOn(_pendingWheelIndex);
   }
 
@@ -1698,8 +1750,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (picked != null) setState(() => _doseTimes[i] = picked);
   }
 
-  bool get _allDoseTimesSet =>
-      _doseTimes.isNotEmpty && _doseTimes.every((t) => t != null);
+  bool get _anyDoseTimeSet =>
+      _doseTimes.isNotEmpty && _doseTimes.any((t) => t != null);
 
   void _handlePrimaryAction() async {
     if (_step == _ConfigStep.name) {
@@ -1730,6 +1782,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 ? <TimeOfDay>[]
                 : _doseTimesForPill(idx);
             _doseTimes = List<TimeOfDay?>.from(existing);
+            while (_doseTimes.length < _timesPerDay) {
+              _doseTimes.add(null);
+            }
+            if (_doseTimes.length > _timesPerDay) {
+              _doseTimes = _doseTimes.sublist(0, _timesPerDay);
+            }
           } else {
             _doseTimes = List<TimeOfDay?>.filled(_timesPerDay, null);
           }
@@ -1741,7 +1799,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     if (_step == _ConfigStep.doses) {
-      if (!_allDoseTimesSet) return;
+      if (!_anyDoseTimeSet) return;
 
       if (_isEditing) {
         _updatePill();
@@ -1759,11 +1817,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (name.isEmpty) return;
 
     if (_timesPerDay == 1 && _singleDoseTime == null) return;
-    if (_timesPerDay > 1 && !_allDoseTimesSet) return;
+    if (_timesPerDay > 1 && !_anyDoseTimeSet) return;
 
     final List<TimeOfDay> doses = (_timesPerDay == 1)
         ? <TimeOfDay>[_singleDoseTime!]
-        : _doseTimes.map((t) => t!).toList();
+        : _doseTimes.whereType<TimeOfDay>().toList();
 
     doses.sort(
       (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
@@ -1790,6 +1848,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ? (_supplyInitialDraft > 0 ? _supplyInitialDraft : leftToStore)
         : 0;
 
+    final med = await _medService.create(
+      name: name,
+      supplyEnabled: effectiveTrack,
+      supplyLeft: leftToStore,
+      supplyInitial: initToStore,
+      nameLocked: _lockPillName,
+      sortOrder: pillNames.length,
+    );
+    await _scheduleService.upsertSchedule(
+      medicationId: med.id,
+      times24hSorted: doseStrings,
+    );
+    await _scheduleService.ensureDoseEventsForMedication(med.id);
+
     // keep arrays aligned BEFORE modifying
     _alignSupplyListsToCount(pillNames.length);
 
@@ -1813,41 +1885,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final updatedDoseTimes = [...existingDoseTimes, doseStrings];
     await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
 
-    final updatedSupplyEnabled = [...pillSupplyEnabled, _supplyTrackOn];
-    final updatedSupplyLeft = [
-      ...pillSupplyLeft,
-      _supplyTrackOn ? _supplyLeftDraft : 0,
-    ];
-    final updatedSupplyInit = [
-      ...pillSupplyInitial,
-      _supplyTrackOn
-          ? (_supplyInitialDraft > 0 ? _supplyInitialDraft : _supplyLeftDraft)
-          : 0,
-    ];
-    final updatedSupplyLowSent = [...pillSupplyLowSent, false];
-
-    await prefs.setString(
-      _pillSupplyEnabledKey,
-      jsonEncode(updatedSupplyEnabled),
-    );
-    await prefs.setString(_pillSupplyLeftKey, jsonEncode(updatedSupplyLeft));
-    await prefs.setString(_pillSupplyInitKey, jsonEncode(updatedSupplyInit));
-    await prefs.setString(
-      _pillSupplyLowSentKey,
-      jsonEncode(updatedSupplyLowSent),
-    );
-
     final updatedNameLocked = [...pillNameLocked, _lockPillName];
     await prefs.setString(_pillNameLockedKey, jsonEncode(updatedNameLocked));
-
-    pillSupplyEnabled.add(_supplyTrackOn);
-    pillSupplyLeft.add(_supplyTrackOn ? _supplyLeftDraft : 0);
-    pillSupplyInitial.add(
-      _supplyTrackOn
-          ? (_supplyInitialDraft > 0 ? _supplyInitialDraft : _supplyLeftDraft)
-          : 0,
-    );
-    pillSupplyLowSent.add(false);
 
     // ✅ align again just in case
     _alignSupplyListsToCount(updatedNames.length);
@@ -1855,10 +1894,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // ✅ persist
     await _saveSupplyListsToPrefs();
 
-    // Clear check state for this new pill index (safety)
-    final checkMap = await _loadCheckMap();
-    final newIndex = updatedNames.length - 1;
-    checkMap.remove('$newIndex');
+    final checkMap = await _deriveCheckMapFromDatabase();
     await _saveCheckMap(checkMap);
     _setCheckMapAndRebuild(checkMap);
     _refreshCheckMapFuture();
@@ -1868,6 +1904,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
     setState(() {
+      medicationIds = [...medicationIds, med.id];
       pillSupplyEnabled = [...pillSupplyEnabled];
       pillSupplyLeft = [...pillSupplyLeft];
       pillSupplyInitial = [...pillSupplyInitial];
@@ -1884,6 +1921,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _step = _ConfigStep.name;
       _selectedPillInfo = null;
     });
+
+    await MedicationPrefsMirror.write(
+      pillNames: pillNames,
+      pillTimesFirst: pillTimes,
+      pillDoseTimes: pillDoseTimes,
+      pillSupplyEnabled: pillSupplyEnabled,
+      pillSupplyLeft: pillSupplyLeft,
+      pillSupplyInitial: pillSupplyInitial,
+      pillSupplyLowSent: pillSupplyLowSent,
+      pillNameLocked: pillNameLocked,
+    );
 
     _showPillLabelAfterSlide();
     _centerWheelOn(1 + (updatedNames.length - 1));
@@ -1909,17 +1957,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    if (pillIndex == null) return;
-
     final name = _nameController.text.trim();
     if (name.isEmpty) return;
 
     if (_timesPerDay == 1 && _singleDoseTime == null) return;
-    if (_timesPerDay > 1 && !_allDoseTimesSet) return;
+    if (_timesPerDay > 1 && !_anyDoseTimeSet) return;
 
     final List<TimeOfDay> doses = (_timesPerDay == 1)
         ? <TimeOfDay>[_singleDoseTime!]
-        : _doseTimes.map((t) => t!).toList();
+        : _doseTimes.whereType<TimeOfDay>().toList();
 
     doses.sort(
       (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
@@ -2050,9 +2096,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // ✅ persist ONCE (remove all updatedSupplyEnabled/Left/Init/LowSent blocks)
     await _saveSupplyListsToPrefs();
 
-    // Clear check state for this pill (so it can notify cleanly)
-    final checkMap = await _loadCheckMap();
-    checkMap.remove('$pillIndex');
+    if (pillIndex < medicationIds.length) {
+      final mid = medicationIds[pillIndex];
+      await _medService.update(
+        id: mid,
+        name: isLocked ? null : name,
+        supplyEnabled: effectiveTrack,
+        supplyLeft: effectiveTrack ? _supplyLeftDraft : 0,
+        supplyInitial: pillSupplyInitial[pillIndex],
+      );
+      await _scheduleService.upsertSchedule(
+        medicationId: mid,
+        times24hSorted: doseStrings,
+      );
+      await _scheduleService.regenerateAfterScheduleChange(mid);
+    }
+
+    final checkMap = await _deriveCheckMapFromDatabase();
     await _saveCheckMap(checkMap);
     _setCheckMapAndRebuild(checkMap);
     _refreshCheckMapFuture();
@@ -2077,6 +2137,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _configOpen = false;
       _step = _ConfigStep.name;
     });
+
+    await MedicationPrefsMirror.write(
+      pillNames: pillNames,
+      pillTimesFirst: pillTimes,
+      pillDoseTimes: pillDoseTimes,
+      pillSupplyEnabled: pillSupplyEnabled,
+      pillSupplyLeft: pillSupplyLeft,
+      pillSupplyInitial: pillSupplyInitial,
+      pillSupplyLowSent: pillSupplyLowSent,
+      pillNameLocked: pillNameLocked,
+    );
 
     _scheduleGlobalDayBoundaryRefresh();
     _scheduleGlobalBoundaryRefresh();
@@ -2113,6 +2184,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         false;
 
     if (!shouldDelete) return;
+
+    if (slot < medicationIds.length) {
+      await _medService.delete(medicationIds[slot]);
+    }
+    final updatedMedIds = [...medicationIds]..removeAt(slot);
 
     // Deterministic IDs depend on pillSlot; delete shifts slots => easiest is hard clear.
     await NotificationService.cancelAll();
@@ -2161,22 +2237,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // ✅ persist the actual lists (NOT updatedSupplyEnabled vars)
     await _saveSupplyListsToPrefs();
 
-    // Shift checkMap indexes to match new pill list
-    final checkMap = await _loadCheckMap();
-    final Map<String, dynamic> shifted = {};
-    checkMap.forEach((k, v) {
-      final idx = int.tryParse(k);
-      if (idx == null) return;
-      if (idx < slot) {
-        shifted['$idx'] = v;
-      } else if (idx > slot) {
-        shifted['${idx - 1}'] = v;
-      }
-    });
-    await _saveCheckMap(shifted);
-    _setCheckMapAndRebuild(shifted);
-    _refreshCheckMapFuture();
-
     final updatedNameLocked = [...pillNameLocked]..removeAt(slot);
     await prefs.setString(_pillNameLockedKey, jsonEncode(updatedNameLocked));
 
@@ -2201,6 +2261,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
     setState(() {
+      medicationIds = updatedMedIds;
       pillSupplyEnabled = [...pillSupplyEnabled];
       pillSupplyLeft = [...pillSupplyLeft];
       pillSupplyInitial = [...pillSupplyInitial];
@@ -2212,7 +2273,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _pendingSlot = false;
       _editingIndex = newEditingIndex;
       _wheelSelectedIndex = newWheelIndex;
+      _infoOpen = false; // close dashboard panel after delete
     });
+
+    final checkMap = await _deriveCheckMapFromDatabase();
+    await _saveCheckMap(checkMap);
+    _setCheckMapAndRebuild(checkMap);
+    _refreshCheckMapFuture();
+
+    await MedicationPrefsMirror.write(
+      pillNames: pillNames,
+      pillTimesFirst: pillTimes,
+      pillDoseTimes: pillDoseTimes,
+      pillSupplyEnabled: pillSupplyEnabled,
+      pillSupplyLeft: pillSupplyLeft,
+      pillSupplyInitial: pillSupplyInitial,
+      pillSupplyLowSent: pillSupplyLowSent,
+      pillNameLocked: pillNameLocked,
+    );
 
     // Move wheel after rebuild
     _centerWheelOn(_wheelSelectedIndex);
@@ -2227,28 +2305,187 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _onWarningOverrideTap() async {
+    final pillIndex = _centerPillIndex;
+    if (pillIndex == null) return;
+    if (pillIndex >= medicationIds.length) return;
+
+    final doses = _doseTimesForPill(pillIndex);
+    if (doses.isEmpty) return;
+
+    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final cycleDay = DateTime(
+      w.cycleStart.year,
+      w.cycleStart.month,
+      w.cycleStart.day,
+    );
+    final mid = medicationIds[pillIndex];
+
+    await _scheduleService.ensureDoseEventsForMedication(mid);
+    final missed = await _adherenceService.firstMissedOnLocalDay(
+      medicationId: mid,
+      localDay: cycleDay,
+    );
+
+    if (missed == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No missed dose to override for this pill.'),
+        ),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Override missed dose?'),
+        content: const Text(
+          'Mark this missed dose as taken (overridden)? '
+          'This will show in History as Taken (Overridden).',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Override'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted) return;
+    if (confirmed != true) return;
+
+    await _adherenceService.overrideDose(missed.id);
+    final map = await _deriveCheckMapFromDatabase();
+    await _saveCheckMap(map);
+    _setCheckMapAndRebuild(map);
+    _refreshCheckMapFuture();
+  }
+
+  Future<void> _markCurrentDoseMissed() async {
+    final pillIndex = _centerPillIndex;
+    if (pillIndex == null || pillIndex >= medicationIds.length) return;
+
+    final doses = _doseTimesForPill(pillIndex);
+    if (doses.isEmpty) return;
+    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final cycleDay = DateTime(
+      w.cycleStart.year,
+      w.cycleStart.month,
+      w.cycleStart.day,
+    );
+    final tod = doses[w.doseIndex];
+    final plannedIso = plannedAtUtcIsoForSlot(cycleDay, tod);
+    final mid = medicationIds[pillIndex];
+
+    await _scheduleService.ensureDoseEventsForMedication(mid);
+    final ev = await _adherenceService.findDoseEventForPlannedUtc(
+      medicationId: mid,
+      plannedAtUtcIso: plannedIso,
+    );
+    if (ev == null || ev.status != 'planned') return;
+
+    await _adherenceService.markMissed(ev.id);
+    final map = await _deriveCheckMapFromDatabase();
+    await _saveCheckMap(map);
+    _setCheckMapAndRebuild(map);
+    _refreshCheckMapFuture();
+  }
+
+  Future<void> _openHistoryScreen() async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => HistoryScreen(adherenceService: _adherenceService),
+      ),
+    );
+    if (!mounted) return;
+    await _refreshAdherenceFromDb();
+  }
+
+  Future<void> _openWarningActions() async {
+    final centered = _centerPillIndex;
+    if (centered == null || centered >= medicationIds.length) {
+      return;
+    }
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.check_circle_outline),
+              title: const Text('Override missed dose'),
+              onTap: () => Navigator.pop(ctx, 'override'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.remove_circle_outline),
+              title: const Text('Mark current dose missed'),
+              onTap: () => Navigator.pop(ctx, 'miss'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.history),
+              title: const Text('Open history'),
+              onTap: () => Navigator.pop(ctx, 'history'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action == null) return;
+
+    if (action == 'override') {
+      await _onWarningOverrideTap();
+      return;
+    }
+    if (action == 'miss') {
+      await _markCurrentDoseMissed();
+      return;
+    }
+    if (action == 'history') {
+      await _openHistoryScreen();
+    }
+  }
+
   // ---------------- CHECK current dose ----------------
   Future<void> _checkCenteredPill() async {
     final pillIndex = _centerPillIndex;
     if (pillIndex == null) return;
+    if (pillIndex >= medicationIds.length) return;
 
     // 1) Figure out which dose we’re checking (and the current cycle key)
     final doses = _doseTimesForPill(pillIndex);
     final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
 
-    final cycleIso = w.cycleStart.toIso8601String();
     final doseIndex = w.doseIndex;
 
-    // 2) Update checkMap (cycle-aware bitmask)
-    final map = await _loadCheckMap();
+    final cycleDay = DateTime(
+      w.cycleStart.year,
+      w.cycleStart.month,
+      w.cycleStart.day,
+    );
+    final tod = doses[doseIndex];
+    final plannedIso = plannedAtUtcIsoForSlot(cycleDay, tod);
+    final mid = medicationIds[pillIndex];
 
-    final stored = map['$pillIndex'] as String?;
-    final parsed = _readCycleAndMask(stored);
+    await _scheduleService.ensureDoseEventsForMedication(mid);
+    final ev = await _adherenceService.findDoseEventForPlannedUtc(
+      medicationId: mid,
+      plannedAtUtcIso: plannedIso,
+    );
+    if (ev == null) return;
+    await _adherenceService.confirmTaken(ev.id);
 
-    final baseMask = (parsed.cycleIso == cycleIso) ? parsed.mask : 0;
-    final newMask = baseMask | (1 << doseIndex);
-
-    map['$pillIndex'] = _packCycleAndMask(cycleIso, newMask);
+    final map = await _deriveCheckMapFromDatabase();
     await _saveCheckMap(map);
 
     // keep your existing UI/cache refresh flow
@@ -3449,9 +3686,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         child: Opacity(
                           opacity: (_configOpen || _infoOpen) ? 0.45 : 1.0,
                           child: GestureDetector(
-                            onTap: () {
-                              // TODO: override button functionality later
-                            },
+                            onTap: _openWarningActions,
                             child: ClipOval(
                               child: Container(
                                 width: s(82),
@@ -3683,7 +3918,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               top: _searchOpen ? s(30) : size.height + s(50),
               bottom: s(18),
               child: PillSearchPanel(
-                items: kPlaceholderPills,
+                rxNormService: _rxNormService,
+                placeholderItems: kOfflineMedicationSuggestions,
                 onPickCustom: _pickCustomFromSearch,
                 onPickItem: _pickSearchItem,
                 onClose: _closePillSearch,
@@ -3722,6 +3958,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       if (pillIndex == null) return;
                       _startEditFlow(pillIndex);
                     },
+                    onDelete: idx == null ? null : _deleteCenteredPill,
+                    rxNormService: _rxNormService,
 
                     // ✅ Hide supply section entirely when global mode is Always Off
                     supplyTrackingOn:
@@ -3790,26 +4028,3 @@ class DayCompleteCircle extends StatelessWidget {
     );
   }
 }
-
-const kPlaceholderPills = <PillSearchItem>[
-  PillSearchItem(
-    name: 'Amoxicillin',
-    suggestedTimesPerDay: 3,
-    info: 'Placeholder info: antibiotic • take with food if stomach upset.',
-  ),
-  PillSearchItem(
-    name: 'Ibuprofen',
-    suggestedTimesPerDay: 2,
-    info: 'Placeholder info: NSAID • avoid mixing with other NSAIDs.',
-  ),
-  PillSearchItem(
-    name: 'Metformin',
-    suggestedTimesPerDay: 2,
-    info: 'Placeholder info: diabetes med • common GI side effects early on.',
-  ),
-  PillSearchItem(
-    name: 'Vitamin D3',
-    suggestedTimesPerDay: 1,
-    info: 'Placeholder info: supplement • usually once daily.',
-  ),
-];

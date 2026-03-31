@@ -1,9 +1,15 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:pillchecker/backend/data/offline_medication_suggestions.dart';
 import 'package:pillchecker/models/pill_search_item.dart';
 import 'package:pillchecker/constants/prefs_keys.dart';
+import 'package:pillchecker/backend/services/med_service.dart';
+import 'package:pillchecker/backend/services/prefs_migration.dart';
+import 'package:pillchecker/backend/services/rxnorm_medication_service.dart';
+import 'package:pillchecker/backend/services/schedule_service.dart';
 import 'dart:io' show Platform;
 
 class DirectoryScreen extends StatefulWidget {
@@ -14,9 +20,9 @@ class DirectoryScreen extends StatefulWidget {
 }
 
 class _DirectoryScreenState extends State<DirectoryScreen> {
-  // Match HomeScreen storage keys
-  static const String _pillNamesKey = 'pill_names';
-  static const String _pillDoseTimesKey = 'pill_dose_times_v2';
+  final MedService _medService = MedService();
+  final ScheduleService _scheduleService = ScheduleService();
+  final RxNormMedicationService _rxNormService = RxNormMedicationService();
 
   static const Color _bg = Color(0xffcf5c71); // darker body like Settings
   static const Color _topBar = Color(0xFFFF6D87); // light header like Settings
@@ -37,6 +43,11 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
   List<int> _mySupplyLeft = [];
 
   final TextEditingController _searchCtrl = TextEditingController();
+  Timer? _debounce;
+  bool _searchLoading = false;
+  bool _servedFromCache = false;
+  bool _hadNetworkError = false;
+  List<PillSearchItem> _rxItems = [];
 
   bool _loaded = false;
 
@@ -68,49 +79,44 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
     return (decoded as List).map((e) => (e as num).toInt()).toList();
   }
 
-  // ✅ Placeholder catalog (RxNorm later)
-  final List<PillSearchItem> _catalog = const <PillSearchItem>[
-    PillSearchItem(
-      name: 'Amoxicillin',
-      suggestedTimesPerDay: 3,
-      info: 'Placeholder info: antibiotic • take with food if stomach upset.',
-    ),
-    PillSearchItem(
-      name: 'Ibuprofen',
-      suggestedTimesPerDay: 2,
-      info: 'Placeholder info: NSAID • avoid mixing with other NSAIDs.',
-    ),
-    PillSearchItem(
-      name: 'Metformin',
-      suggestedTimesPerDay: 2,
-      info: 'Placeholder info: diabetes med • common GI side effects early on.',
-    ),
-    PillSearchItem(
-      name: 'Vitamin D3',
-      suggestedTimesPerDay: 1,
-      info: 'Placeholder info: supplement • usually once daily.',
-    ),
-  ];
+  final List<PillSearchItem> _catalog = kOfflineMedicationSuggestions;
 
   @override
   void initState() {
     super.initState();
     _loadMyPills();
-    _searchCtrl.addListener(() => setState(() {}));
+    _searchCtrl.addListener(_onQueryChanged);
   }
 
   @override
   void dispose() {
+    _debounce?.cancel();
     _searchCtrl.dispose();
+    _rxNormService.dispose();
     super.dispose();
   }
 
   Future<void> _loadMyPills() async {
     final prefs = await SharedPreferences.getInstance();
 
-    final names = prefs.getStringList(_pillNamesKey) ?? <String>[];
-    final raw = prefs.getString(_pillDoseTimesKey);
-    final doseTimes = _decodeListOfStringLists(raw);
+    await PrefsMigration.runOnceIfNeeded(
+      medService: _medService,
+      scheduleService: _scheduleService,
+    );
+
+    final meds = await _medService.getAll();
+    final names = meds.map((m) => m.name).toList();
+    final doseTimes = <List<String>>[];
+    for (final m in meds) {
+      final sch = await _scheduleService.getScheduleForMedication(m.id);
+      var times = <String>['08:00'];
+      if (sch != null) {
+        times = (jsonDecode(sch['times_json']! as String) as List)
+            .map((e) => e.toString())
+            .toList();
+      }
+      doseTimes.add(times);
+    }
 
     // ---- global supply settings ----
     final supplyMode = prefs.getString(kSupplyModeKey) ?? 'decide';
@@ -153,24 +159,78 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
     });
   }
 
-  List<List<String>> _decodeListOfStringLists(String? raw) {
-    if (raw == null || raw.isEmpty) return <List<String>>[];
-    final decoded = jsonDecode(raw);
-    return (decoded as List)
-        .map((e) => (e as List).map((x) => x.toString()).toList())
-        .toList();
-  }
-
   bool _alreadyAdded(String name) {
     final n = name.trim().toLowerCase();
     return _myNames.any((x) => x.trim().toLowerCase() == n);
   }
 
   String get _q => _searchCtrl.text.trim().toLowerCase();
+  String get _queryRaw => _searchCtrl.text.trim();
+
+  Future<void> _onQueryChanged() async {
+    setState(() {});
+    _debounce?.cancel();
+
+    if (_queryRaw.length < 2) {
+      if (mounted) {
+        setState(() {
+          _searchLoading = false;
+          _servedFromCache = false;
+          _hadNetworkError = false;
+          _rxItems = [];
+        });
+      }
+      return;
+    }
+
+    setState(() {
+      _searchLoading = true;
+      _rxItems = [];
+    });
+
+    _debounce = Timer(const Duration(milliseconds: 420), () async {
+      final outcome = await _rxNormService.searchMedications(_queryRaw);
+      if (!mounted) return;
+      setState(() {
+        _searchLoading = false;
+        _servedFromCache = outcome.servedFromCache;
+        _hadNetworkError = outcome.hadNetworkError;
+        _rxItems = outcome.items
+            .map(
+              (m) => PillSearchItem(
+                name: m.displayName,
+                suggestedTimesPerDay: 2,
+                info: '',
+                rxcui: m.rxcui,
+                searchSubtitle: m.subtitle,
+                isFromCache: outcome.servedFromCache,
+              ),
+            )
+            .toList();
+      });
+    });
+  }
 
   bool _matches(String name) {
     if (_q.isEmpty) return true;
     return name.toLowerCase().contains(_q);
+  }
+
+  List<PillSearchItem> get _catalogForView {
+    if (_queryRaw.length < 2) {
+      return _catalog.where((p) => _matches(p.name)).toList();
+    }
+    final seen = <String>{};
+    final merged = <PillSearchItem>[];
+    for (final p in _rxItems) {
+      final k = p.name.trim().toLowerCase();
+      if (seen.add(k)) merged.add(p);
+    }
+    for (final p in _catalog.where((x) => _matches(x.name))) {
+      final k = p.name.trim().toLowerCase();
+      if (seen.add(k)) merged.add(p);
+    }
+    return merged;
   }
 
   Future<void> _openDetails({
@@ -576,12 +636,58 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
                                     16,
                                   ),
                                   children: [
-                                    for (final p in _catalog)
-                                      if (_matches(p.name))
+                                    if (_queryRaw.length >= 2 && _searchLoading)
+                                      const Padding(
+                                        padding: EdgeInsets.only(bottom: 10),
+                                        child: Center(
+                                          child: CircularProgressIndicator(),
+                                        ),
+                                      ),
+                                    if (_queryRaw.length >= 2 &&
+                                        _servedFromCache &&
+                                        _rxItems.isNotEmpty)
+                                      Container(
+                                        margin: const EdgeInsets.only(bottom: 10),
+                                        padding: const EdgeInsets.all(10),
+                                        decoration: BoxDecoration(
+                                          color: Colors.amber.shade100,
+                                          borderRadius: BorderRadius.circular(12),
+                                        ),
+                                        child: Text(
+                                          'Showing saved RxNorm results (offline or API unavailable).',
+                                          style: TextStyle(
+                                            color: Colors.amber.shade900,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                    if (_queryRaw.length >= 2 &&
+                                        _hadNetworkError &&
+                                        _rxItems.isEmpty)
+                                      Container(
+                                        margin: const EdgeInsets.only(bottom: 10),
+                                        padding: const EdgeInsets.all(10),
+                                        decoration: BoxDecoration(
+                                          color: Colors.teal.shade50,
+                                          borderRadius: BorderRadius.circular(12),
+                                        ),
+                                        child: Text(
+                                          'Offline — showing built-in medication names.',
+                                          style: TextStyle(
+                                            color: Colors.teal.shade900,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                    for (final p in _catalogForView)
                                         _pillRow(
                                           name: p.name,
-                                          subtitle:
-                                              '${p.suggestedTimesPerDay}× per day',
+                                          subtitle: p.isRxNorm
+                                              ? (p.searchSubtitle ??
+                                                    (p.isFromCache
+                                                        ? 'RxNorm (saved)'
+                                                        : 'RxNorm'))
+                                              : '${p.suggestedTimesPerDay}× per day',
                                           showAddButton: true,
                                           addEnabled: !_alreadyAdded(p.name),
                                           onAdd: !_alreadyAdded(p.name)
@@ -624,7 +730,7 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
                                                       false;
 
                                                   if (!ok) return;
-                                                  if (!mounted) return;
+                                                  if (!context.mounted) return;
                                                   Navigator.pop(context, p);
                                                 }
                                               : null,

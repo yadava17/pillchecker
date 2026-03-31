@@ -3,6 +3,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pillchecker/constants/prefs_keys.dart';
 import 'dart:io' show Platform;
 import 'package:url_launcher/url_launcher.dart';
+import 'package:pillchecker/backend/services/adherence_service.dart';
+import 'package:pillchecker/screens/history/history_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -37,6 +39,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   String _origSupplyMode = 'decide';
   int _origSupplyLow = 10;
+  final AdherenceService _adherenceService = AdherenceService();
 
   @override
   void initState() {
@@ -358,6 +361,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _openHistory() async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => HistoryScreen(adherenceService: _adherenceService),
+      ),
+    );
+  }
+
   Widget _expandSection({
     required String title,
     required bool expanded,
@@ -674,6 +686,59 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             ),
                           ),
                         ],
+                      ),
+
+                      const SizedBox(height: 18),
+
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(22),
+                          onTap: _openHistory,
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: _card,
+                              borderRadius: BorderRadius.circular(22),
+                            ),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 14,
+                            ),
+                            child: Row(
+                              children: [
+                                const Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        'Adherence history',
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 20,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                      ),
+                                      SizedBox(height: 2),
+                                      Text(
+                                        'Taken, missed, and overridden doses',
+                                        style: TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Icon(
+                                  Icons.chevron_right,
+                                  color: Colors.white.withOpacity(0.9),
+                                  size: 28,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
                       ),
 
                       const SizedBox(height: 18),
