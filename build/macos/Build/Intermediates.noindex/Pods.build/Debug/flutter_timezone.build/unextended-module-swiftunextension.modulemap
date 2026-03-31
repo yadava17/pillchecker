@@ -1,0 +1,4 @@
+
+module flutter_timezone.__Swift {
+  exclude header "flutter_timezone-Swift.h"
+}

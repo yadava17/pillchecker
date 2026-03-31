@@ -1,0 +1,64 @@
+Running `(cd /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/; TMPDIR=/var/folders/bp/rjsqffkj5tngnvp1d6scscj00000gn/T/ PATH=/opt/homebrew/share/flutter/bin/:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/Library/Apple/usr/bin:/opt/homebrew/bin:/opt/homebrew/share/flutter/bin/ HOME=/Users/aadityayadav /opt/homebrew/share/flutter/bin/cache/dart-sdk/bin/dart --packages=/Users/aadityayadav/pillchecker/pillchecker/.dart_tool/package_config.json /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/objective_c/7ad245dadc/hook.dill --config=/Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/objective_c/7ad245dadc/input.json )`.
+INFO: 2026-03-31 14:55:23.450202: Running `/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang --version`.
+
+INFO: 2026-03-31 14:55:23.503748: Running `/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang --version`.
+
+INFO: 2026-03-31 14:55:23.548007: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 -c /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/src/include/dart_api_dl.c -fpic -I src -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/include/dart_api_dl.c.o
+
+INFO: 2026-03-31 14:55:23.549253: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 -c /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/src/objective_c.c -fpic -I src -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/objective_c.c.o
+
+INFO: 2026-03-31 14:55:23.549830: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 -c /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/test/util.c -fpic -I src -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/test/util.c.o
+
+INFO: 2026-03-31 14:55:23.550239: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 -x objective-c -fobjc-arc -c /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/src/input_stream_adapter.m -fpic -I src -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/input_stream_adapter.m.o
+
+INFO: 2026-03-31 14:55:23.550594: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 -x objective-c -fobjc-arc -c /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/src/objective_c.m -fpic -I src -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/objective_c.m.o
+
+INFO: 2026-03-31 14:55:23.551065: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 -x objective-c -fobjc-arc -c /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/src/observer.m -fpic -I src -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/observer.m.o
+
+INFO: 2026-03-31 14:55:23.551553: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 -x objective-c -fobjc-arc -c /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/src/ns_number.m -fpic -I src -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/ns_number.m.o
+
+INFO: 2026-03-31 14:55:23.551931: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 -x objective-c -fobjc-arc -c /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/src/protocol.m -fpic -I src -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/protocol.m.o
+
+INFO: 2026-03-31 14:55:23.552182: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 -x objective-c -fobjc-arc -c /Users/aadityayadav/.pub-cache/hosted/pub.dev/objective_c-9.3.0/src/objective_c_bindings_generated.m -fpic -I src -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/objective_c_bindings_generated.m.o
+
+INFO: 2026-03-31 14:55:23.758045: 
+INFO: 2026-03-31 14:55:23.758159: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/objective_c.c.o
+
+INFO: 2026-03-31 14:55:23.759266: 
+INFO: 2026-03-31 14:55:23.759331: 
+INFO: 2026-03-31 14:55:23.759356: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/include/dart_api_dl.c.o
+
+INFO: 2026-03-31 14:55:23.776707: 
+INFO: 2026-03-31 14:55:23.776838: 
+INFO: 2026-03-31 14:55:23.776865: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/observer.m.o
+
+INFO: 2026-03-31 14:55:23.783413: 
+INFO: 2026-03-31 14:55:23.783554: 
+INFO: 2026-03-31 14:55:23.783585: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/test/util.c.o
+
+INFO: 2026-03-31 14:55:23.855495: 
+INFO: 2026-03-31 14:55:23.855663: 
+INFO: 2026-03-31 14:55:23.855711: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/protocol.m.o
+
+INFO: 2026-03-31 14:55:24.243827: 
+INFO: 2026-03-31 14:55:24.243958: 
+INFO: 2026-03-31 14:55:24.243984: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/ns_number.m.o
+
+INFO: 2026-03-31 14:55:24.245872: 
+INFO: 2026-03-31 14:55:24.245936: 
+INFO: 2026-03-31 14:55:24.245959: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/objective_c.m.o
+
+INFO: 2026-03-31 14:55:24.267473: 
+INFO: 2026-03-31 14:55:24.267587: 
+INFO: 2026-03-31 14:55:24.267612: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/input_stream_adapter.m.o
+
+INFO: 2026-03-31 14:55:24.324267: 
+INFO: 2026-03-31 14:55:24.324363: 
+INFO: 2026-03-31 14:55:24.324388: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/objective_c_bindings_generated.m.o
+
+INFO: 2026-03-31 14:55:24.325085: Running: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -shared -Wl,-encryptable -undefined dynamic_lookup -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk -target arm64-apple-darwin -mmacos-version-min=13 /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/include/dart_api_dl.c.o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/objective_c.c.o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/test/util.c.o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/input_stream_adapter.m.o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/objective_c.m.o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/observer.m.o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/ns_number.m.o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/protocol.m.o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/obj/src/objective_c_bindings_generated.m.o -o /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/objective_c.dylib
+
+INFO: 2026-03-31 14:55:24.399175: 
+INFO: 2026-03-31 14:55:24.399345: 
+INFO: 2026-03-31 14:55:24.399373: Generated /Users/aadityayadav/pillchecker/pillchecker/.dart_tool/hooks_runner/shared/objective_c/build/7ad245dadc/objective_c.dylib
+

@@ -1,0 +1,5 @@
+
+module flutter_local_notifications.Swift {
+  header "flutter_local_notifications-Swift.h"
+  requires objc
+}

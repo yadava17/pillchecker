@@ -1,0 +1,10 @@
+framework module rive_native {
+  umbrella header "rive_native-umbrella.h"
+
+  export *
+  module * { export * }
+}
+
+module rive_native.__Swift {
+  exclude header "rive_native-Swift.h"
+}

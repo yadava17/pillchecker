@@ -1,0 +1,5 @@
+
+module flutter_timezone.Swift {
+  header "flutter_timezone-Swift.h"
+  requires objc
+}

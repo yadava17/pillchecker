@@ -1,0 +1,4 @@
+
+module rive_native.__Swift {
+  exclude header "rive_native-Swift.h"
+}

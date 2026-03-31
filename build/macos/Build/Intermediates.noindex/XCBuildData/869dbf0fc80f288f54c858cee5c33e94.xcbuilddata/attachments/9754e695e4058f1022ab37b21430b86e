@@ -1,0 +1,19 @@
+{
+  "" : {
+    "diagnostics" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/flutter_timezone-primary.dia",
+    "emit-module-dependencies" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/flutter_timezone-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/flutter_timezone-primary-emit-module.dia",
+    "pch" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/flutter_timezone-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/flutter_timezone-primary.swiftdeps"
+  },
+  "/Users/aadityayadav/.pub-cache/hosted/pub.dev/flutter_timezone-4.1.1/macos/flutter_timezone/Sources/flutter_timezone/FlutterTimezonePlugin.swift" : {
+    "const-values" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/FlutterTimezonePlugin.swiftconstvalues",
+    "dependencies" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/FlutterTimezonePlugin.d",
+    "diagnostics" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/FlutterTimezonePlugin.dia",
+    "index-unit-output-path" : "/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/FlutterTimezonePlugin.o",
+    "llvm-bc" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/FlutterTimezonePlugin.bc",
+    "object" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/FlutterTimezonePlugin.o",
+    "swift-dependencies" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/FlutterTimezonePlugin.swiftdeps",
+    "swiftmodule" : "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/flutter_timezone.build/Objects-normal/arm64/FlutterTimezonePlugin~partial.swiftmodule"
+  }
+}

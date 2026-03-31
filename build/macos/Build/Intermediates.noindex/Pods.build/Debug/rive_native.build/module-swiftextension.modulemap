@@ -1,0 +1,5 @@
+
+module rive_native.Swift {
+  header "rive_native-Swift.h"
+  requires objc
+}

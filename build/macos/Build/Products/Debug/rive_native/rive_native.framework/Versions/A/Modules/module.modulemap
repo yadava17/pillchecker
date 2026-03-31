@@ -1,0 +1,11 @@
+framework module rive_native {
+  umbrella header "rive_native-umbrella.h"
+
+  export *
+  module * { export * }
+}
+
+module rive_native.Swift {
+  header "rive_native-Swift.h"
+  requires objc
+}

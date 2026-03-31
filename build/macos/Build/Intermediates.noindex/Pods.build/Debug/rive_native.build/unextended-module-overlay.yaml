@@ -1,0 +1,23 @@
+{
+  "version": 0,
+  "use-external-names": false,
+  "case-sensitive": false,
+  "roots": [{
+    "type": "directory",
+    "name": "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Products/Debug/rive_native/rive_native.framework/Modules",
+    "contents": [{
+      "type": "file",
+      "name": "module.modulemap",
+      "external-contents": "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/rive_native.build/unextended-module.modulemap",
+    }]
+    },
+    {
+    "type": "directory",
+    "name": "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Products/Debug/rive_native/rive_native.framework/Headers",
+    "contents": [{
+      "type": "file",
+      "name": "rive_native-Swift.h",
+      "external-contents": "/Users/aadityayadav/pillchecker/pillchecker/build/macos/Build/Intermediates.noindex/Pods.build/Debug/rive_native.build/unextended-interface-header.h",
+    }]
+  }]
+}
