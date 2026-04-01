@@ -138,7 +138,9 @@ class _PillInfoPanelState extends State<PillInfoPanel> {
                             return const SizedBox(
                               height: 38,
                               child: Center(
-                                child: CircularProgressIndicator(strokeWidth: 2),
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
                               ),
                             );
                           }
@@ -286,20 +288,19 @@ class _PillInfoPanelState extends State<PillInfoPanel> {
                 child: OutlinedButton(
                   onPressed: widget.onDelete,
                   style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.red.shade100,
-                    side: BorderSide(
-                      color: Colors.red.shade200,
-                      width: 1.5,
-                    ),
+                    backgroundColor: Colors.red,
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Colors.red, width: 1.5),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(18),
                     ),
                   ),
                   child: const Text(
-                    'Delete medicine',
+                    'Delete',
                     style: TextStyle(
                       fontSize: 16,
                       fontWeight: FontWeight.w700,
+                      color: Colors.white,
                     ),
                   ),
                 ),

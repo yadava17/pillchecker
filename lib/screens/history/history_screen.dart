@@ -86,7 +86,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                 child: Text(
                   'History',
                   style: TextStyle(
-                    color: Color.fromARGB(255, 60, 59, 59),
+                    color: _divider,
                     fontSize: 30,
                     fontFamily: 'Amaranth',
                     fontWeight: FontWeight.w700,
