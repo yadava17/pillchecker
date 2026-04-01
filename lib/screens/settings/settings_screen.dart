@@ -438,44 +438,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
 
               Positioned(
-                top: Platform.isAndroid ? -6 : -1,
-                left: 0,
-                right: Platform.isAndroid ? 165 : 185,
+                top: Platform.isAndroid ? 10 : 0,
+                left: Platform.isAndroid ? 112 : 82,
                 child: Opacity(
                   opacity: 0.75,
                   child: Image.asset(
                     'assets/images/pillchecker_logo.png',
-                    width: 150,
-                    height: 150,
+                    width: 120,
+                    height: 120,
+                    fit: BoxFit.contain,
                   ),
                 ),
               ),
 
               Positioned(
-                top: 15,
-                left: 35,
-                right: 0,
-                child: Center(
-                  child: SizedBox(
-                    // ✅ Android gets more horizontal room so it doesn't clip/weird-render
-                    width: Platform.isAndroid ? 340 : 260,
-                    child: Transform.scale(
-                      scale: 0.5,
-                      child: FittedBox(
-                        fit: BoxFit.scaleDown,
-                        child: Text(
-                          'PillChecker',
-                          maxLines: 1,
-                          softWrap: false,
-                          style: TextStyle(
-                            fontSize: 77.9,
-                            fontFamily: 'Amaranth',
-                            color: _card,
-                            fontWeight: FontWeight.w400,
-                          ),
-                        ),
-                      ),
-                    ),
+                top: Platform.isAndroid ? 23 : 34,
+                left: Platform.isAndroid ? 168 : 158,
+                right: 24,
+                child: Text(
+                  'PillChecker',
+                  maxLines: 1,
+                  overflow: TextOverflow.visible,
+                  softWrap: false,
+                  style: TextStyle(
+                    fontSize: Platform.isAndroid ? 34 : 32,
+                    fontFamily: 'Amaranth',
+                    color: _card,
+                    fontWeight: FontWeight.w400,
                   ),
                 ),
               ),
@@ -802,27 +791,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
               Positioned(
                 top: 135,
-                right: 5,
+                left: 0,
+                right: 0,
                 child: Opacity(
                   opacity: (_loaded && _changed) ? 1.0 : 0.55,
                   child: IgnorePointer(
                     ignoring: !(_loaded && _changed),
-                    child: Material(
-                      color: const Color(0xFF59FF56),
-                      borderRadius: BorderRadius.circular(18),
-                      child: InkWell(
+                    child: Center(
+                      child: Material(
+                        color: const Color(0xFF59FF56),
                         borderRadius: BorderRadius.circular(18),
-                        onTap: _save,
-                        child: const SizedBox(
-                          width: 400,
-                          height: 40,
-                          child: Center(
-                            child: Text(
-                              'Save',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w900,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(18),
+                          onTap: _save,
+                          child: const SizedBox(
+                            width: 375,
+                            height: 40,
+                            child: Center(
+                              child: Text(
+                                'Save',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w900,
+                                ),
                               ),
                             ),
                           ),
