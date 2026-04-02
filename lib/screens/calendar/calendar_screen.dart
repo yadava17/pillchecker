@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:table_calendar/table_calendar.dart';
+import 'dart:io' show Platform;
 
 import 'package:pillchecker/backend/models/history_entry.dart';
 import 'package:pillchecker/backend/services/adherence_service.dart';
@@ -165,11 +166,11 @@ class _CalendarScreenState extends State<CalendarScreen> {
                 iconSize: 40,
               ),
             ),
-            const Positioned(
+            Positioned(
               top: 32,
-              left: 0,
-              right: 0,
-              child: Center(
+              left: Platform.isIOS ? 0 : 0,
+              right: Platform.isIOS ? 7 : 0,
+              child: const Center(
                 child: Text(
                   'Calendar',
                   style: TextStyle(

@@ -617,7 +617,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         description:
             'Open Settings to change reminders, supply tracking, feedback, credits, and to run this tutorial again later.',
         targetRect: rectFromTop(
-          left: s(340),
+          left: Platform.isIOS ? s(350) : s(340),
           top: s(45) + topShift,
           width: s(80),
           height: s(75),
@@ -3829,7 +3829,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         AnimatedPositioned(
                           duration: const Duration(milliseconds: 280),
                           curve: Curves.easeInOutCubic,
-                          left: showLeft ? s(1) : -s(220),
+                          left: showLeft ? s(4) : -s(220),
                           top: 0,
                           width: s(165),
                           height: s(70),
@@ -3848,7 +3848,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         AnimatedPositioned(
                           duration: const Duration(milliseconds: 320),
                           curve: Curves.easeInOutCubic,
-                          right: showRight ? s(2) : -s(220),
+                          right: showRight ? s(5) : -s(220),
                           top: 0,
                           width: s(166.5),
                           height: s(70),
