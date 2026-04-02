@@ -42,6 +42,9 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
   List<bool> _mySupplyEnabled = [];
   List<int> _mySupplyLeft = [];
 
+  List<String> _myCustomInfo = [];
+  List<bool> _myNameLocked = [];
+
   final TextEditingController _searchCtrl = TextEditingController();
   Timer? _debounce;
   bool _searchLoading = false;
@@ -50,6 +53,9 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
   List<PillSearchItem> _rxItems = [];
 
   bool _loaded = false;
+
+  static const String _pillCustomInfoKey = 'pill_custom_info_v1';
+  static const String _pillNameLockedKey = 'pill_name_locked_v1';
 
   bool _effectiveSupplyOnForMyPill(int i) {
     if (_supplyModeGlobal == 'off') return false;
@@ -77,6 +83,21 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
     if (raw == null || raw.isEmpty) return <int>[];
     final decoded = jsonDecode(raw);
     return (decoded as List).map((e) => (e as num).toInt()).toList();
+  }
+
+  List<String> _readStringListPref(SharedPreferences prefs, String key) {
+    final asList = prefs.getStringList(key);
+    if (asList != null) {
+      return List<String>.from(asList);
+    }
+
+    final asString = prefs.getString(key);
+    if (asString == null || asString.isEmpty) {
+      return <String>[];
+    }
+
+    final decoded = jsonDecode(asString);
+    return (decoded as List).map((e) => e.toString()).toList();
   }
 
   final List<PillSearchItem> _catalog = kOfflineMedicationSuggestions;
@@ -127,6 +148,8 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
       prefs.getString(_pillSupplyEnabledKey),
     );
     final supplyLeft = _decodeIntList(prefs.getString(_pillSupplyLeftKey));
+    final customInfo = _readStringListPref(prefs, _pillCustomInfoKey);
+    final nameLocked = _decodeBoolList(prefs.getString(_pillNameLockedKey));
 
     // align to names
     while (supplyEnabled.length < names.length) supplyEnabled.add(false);
@@ -145,6 +168,16 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
       doseTimes.removeRange(names.length, doseTimes.length);
     }
 
+    while (customInfo.length < names.length) customInfo.add('');
+    while (nameLocked.length < names.length) nameLocked.add(false);
+
+    if (customInfo.length > names.length) {
+      customInfo.removeRange(names.length, customInfo.length);
+    }
+    if (nameLocked.length > names.length) {
+      nameLocked.removeRange(names.length, nameLocked.length);
+    }
+
     if (!mounted) return;
     setState(() {
       _myNames = names;
@@ -156,6 +189,8 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
 
       _mySupplyEnabled = supplyEnabled;
       _mySupplyLeft = supplyLeft;
+      _myCustomInfo = customInfo;
+      _myNameLocked = nameLocked;
     });
   }
 
@@ -246,14 +281,15 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
       builder: (_) {
-        final showSupply = (!isCatalog) &&
+        final showSupply =
+            (!isCatalog) &&
             (myPillIndex != null) &&
             _effectiveSupplyOnForMyPill(myPillIndex);
 
         final supplyLeft =
             (myPillIndex != null && myPillIndex < _mySupplyLeft.length)
-                ? _mySupplyLeft[myPillIndex]
-                : 0;
+            ? _mySupplyLeft[myPillIndex]
+            : 0;
 
         return SafeArea(
           child: Padding(
@@ -637,11 +673,15 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
                                         _servedFromCache &&
                                         _rxItems.isNotEmpty)
                                       Container(
-                                        margin: const EdgeInsets.only(bottom: 10),
+                                        margin: const EdgeInsets.only(
+                                          bottom: 10,
+                                        ),
                                         padding: const EdgeInsets.all(10),
                                         decoration: BoxDecoration(
                                           color: Colors.amber.shade100,
-                                          borderRadius: BorderRadius.circular(12),
+                                          borderRadius: BorderRadius.circular(
+                                            12,
+                                          ),
                                         ),
                                         child: Text(
                                           'Showing saved RxNorm results (offline or API unavailable).',
@@ -655,11 +695,15 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
                                         _hadNetworkError &&
                                         _rxItems.isEmpty)
                                       Container(
-                                        margin: const EdgeInsets.only(bottom: 10),
+                                        margin: const EdgeInsets.only(
+                                          bottom: 10,
+                                        ),
                                         padding: const EdgeInsets.all(10),
                                         decoration: BoxDecoration(
                                           color: Colors.teal.shade50,
-                                          borderRadius: BorderRadius.circular(12),
+                                          borderRadius: BorderRadius.circular(
+                                            12,
+                                          ),
                                         ),
                                         child: Text(
                                           'Offline — showing built-in medication names.',
@@ -685,8 +729,7 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
                                                 final ok =
                                                     await showDialog<bool>(
                                                       context: context,
-                                                      builder: (ctx) =>
-                                                          AlertDialog(
+                                                      builder: (ctx) => AlertDialog(
                                                         title: const Text(
                                                           'Add this pill?',
                                                         ),
@@ -751,13 +794,15 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
                                         padding: const EdgeInsets.all(14),
                                         decoration: BoxDecoration(
                                           color: _card,
-                                          borderRadius:
-                                              BorderRadius.circular(18),
+                                          borderRadius: BorderRadius.circular(
+                                            18,
+                                          ),
                                         ),
                                         child: const Text(
                                           'No pills added yet.',
-                                          style:
-                                              TextStyle(color: Colors.white70),
+                                          style: TextStyle(
+                                            color: Colors.white70,
+                                          ),
                                         ),
                                       ),
                                     for (int i = 0; i < _myNames.length; i++)
@@ -768,13 +813,27 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
                                               '${_myDoseTimes24h[i].length}× per day',
                                           showAddButton: false,
                                           onTap: () {
+                                            final isCustom =
+                                                i < _myNameLocked.length &&
+                                                _myNameLocked[i] == false;
+
+                                            final savedCustomInfo =
+                                                (i < _myCustomInfo.length)
+                                                ? _myCustomInfo[i].trim()
+                                                : '';
+
+                                            final infoText = isCustom
+                                                ? (savedCustomInfo.isNotEmpty
+                                                      ? savedCustomInfo
+                                                      : 'No custom pill info added yet.')
+                                                : 'Medication details available in the main pill info panel.';
+
                                             _openDetails(
                                               name: _myNames[i],
                                               isCatalog: false,
                                               addEnabled: false,
-                                              info:
-                                                  'Custom pill (info will appear here later when RxNorm is added).',
-                                              myPillIndex: i, // ✅ supply uses this
+                                              info: infoText,
+                                              myPillIndex: i,
                                             );
                                           },
                                         ),

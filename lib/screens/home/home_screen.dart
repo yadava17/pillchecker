@@ -2234,6 +2234,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _doseTimes.isNotEmpty && _doseTimes.any((t) => t != null);
 
   void _handlePrimaryAction() async {
+    FocusManager.instance.primaryFocus?.unfocus();
     if (_step == _ConfigStep.name) {
       if (_nameController.text.trim().isEmpty) return;
       setState(() => _step = _ConfigStep.config);
@@ -2291,6 +2292,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // ---------------- SAVE pill ----------------
   Future<void> _savePill() async {
+    FocusManager.instance.primaryFocus?.unfocus();
     _showPillLabelAfterSlide();
 
     final name = _nameController.text.trim();
@@ -2428,6 +2430,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _updatePill() async {
+    FocusManager.instance.primaryFocus?.unfocus();
     final pillIndex = _editingIndex;
 
     // ✅ Guard against stale edit index (ex: deleted pill)
@@ -3610,6 +3613,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         : Offset.zero;
 
     final bottomSlidDown = (_configOpen || _infoOpen || _searchOpen);
+
     final showPillNameBackPlate =
         pillNames.isNotEmpty && _wheelSelectedIndex != 0;
     final bottomDecorOpacity = (!bottomSlidDown && showPillNameBackPlate)
@@ -4382,138 +4386,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ),
                       ),
                     ),
-
-                    // --- CALENDAR BUTTON (left side-zone tab) ---
-                    AnimatedPositioned(
-                      duration: const Duration(milliseconds: 320),
-                      curve: Curves.easeInOutCubic,
-                      left: sideZoneButtonsHidden ? -s(110) : s(-10),
-                      bottom: s(460),
-                      child: IgnorePointer(
-                        ignoring: sideZoneButtonsHidden,
-                        child: AnimatedOpacity(
-                          duration: const Duration(milliseconds: 180),
-                          curve: Curves.easeInOut,
-                          opacity: sideZoneButtonsHidden ? 0.0 : 1.0,
-                          child: Material(
-                            color: const Color(0xFF1E3A8A),
-                            borderRadius: BorderRadius.only(
-                              topRight: Radius.circular(s(18)),
-                              bottomRight: Radius.circular(s(18)),
-                            ),
-                            elevation: 3,
-                            child: InkWell(
-                              borderRadius: BorderRadius.only(
-                                topRight: Radius.circular(s(18)),
-                                bottomRight: Radius.circular(s(18)),
-                              ),
-                              onTap: _openCalendarScreen,
-                              child: SizedBox(
-                                width: s(72),
-                                height: s(58),
-                                child: Center(
-                                  child: Icon(
-                                    Icons.calendar_month_rounded,
-                                    size: s(30),
-                                    color: Colors.white,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-
-                    // --- STREAK BUTTON (right side-zone tab) ---
-                    AnimatedPositioned(
-                      duration: const Duration(milliseconds: 320),
-                      curve: Curves.easeInOutCubic,
-                      right: sideZoneButtonsHidden ? -s(110) : s(-10),
-                      bottom: s(460),
-                      child: IgnorePointer(
-                        ignoring: sideZoneButtonsHidden,
-                        child: AnimatedOpacity(
-                          duration: const Duration(milliseconds: 180),
-                          curve: Curves.easeInOut,
-                          opacity: sideZoneButtonsHidden ? 0.0 : 1.0,
-                          child: Material(
-                            color: const Color.fromARGB(251, 88, 255, 85),
-                            borderRadius: BorderRadius.only(
-                              topLeft: Radius.circular(s(18)),
-                              bottomLeft: Radius.circular(s(18)),
-                            ),
-                            elevation: 3,
-                            child: InkWell(
-                              borderRadius: BorderRadius.only(
-                                topLeft: Radius.circular(s(18)),
-                                bottomLeft: Radius.circular(s(18)),
-                              ),
-                              onTap: () async {
-                                await showDialog<void>(
-                                  context: context,
-                                  builder: (ctx) => AlertDialog(
-                                    title: const Text('Streaks'),
-                                    content: const Text('Coming soon!'),
-                                    actions: [
-                                      TextButton(
-                                        onPressed: () => Navigator.pop(ctx),
-                                        child: const Text('OK'),
-                                      ),
-                                    ],
-                                  ),
-                                );
-                              },
-                              child: SizedBox(
-                                width: s(72),
-                                height: s(58),
-                                child: Center(
-                                  child: Transform.translate(
-                                    offset: Offset(-s(4), 0),
-                                    child: SizedBox(
-                                      width: s(34),
-                                      height: s(34),
-                                      child: Stack(
-                                        alignment: Alignment.center,
-                                        children: [
-                                          Positioned(
-                                            top: s(14),
-                                            left: s(12),
-                                            child: Container(
-                                              width: s(15),
-                                              height: s(15),
-                                              decoration: const BoxDecoration(
-                                                color: const Color.fromARGB(
-                                                  255,
-                                                  255,
-                                                  177,
-                                                  74,
-                                                ),
-                                                shape: BoxShape.circle,
-                                              ),
-                                            ),
-                                          ),
-                                          Icon(
-                                            Icons.whatshot_rounded,
-                                            size: s(34),
-                                            color: const Color.fromARGB(
-                                              255,
-                                              255,
-                                              116,
-                                              66,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
                   ],
                 ),
               ),
@@ -4805,6 +4677,138 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   : MediaQuery.of(context).size.height + s(50),
               height: configH,
               child: _configPanel(),
+            ),
+
+            // --- CALENDAR BUTTON (left side-zone tab) ---
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOutCubic,
+              left: sideZoneButtonsHidden ? -s(110) : s(-10),
+              bottom: s(460),
+              child: IgnorePointer(
+                ignoring: sideZoneButtonsHidden,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeInOut,
+                  opacity: sideZoneButtonsHidden ? 0.0 : 1.0,
+                  child: Material(
+                    color: const Color(0xFF1E3A8A),
+                    borderRadius: BorderRadius.only(
+                      topRight: Radius.circular(s(18)),
+                      bottomRight: Radius.circular(s(18)),
+                    ),
+                    elevation: 3,
+                    child: InkWell(
+                      borderRadius: BorderRadius.only(
+                        topRight: Radius.circular(s(18)),
+                        bottomRight: Radius.circular(s(18)),
+                      ),
+                      onTap: _openCalendarScreen,
+                      child: SizedBox(
+                        width: s(72),
+                        height: s(58),
+                        child: Center(
+                          child: Icon(
+                            Icons.calendar_month_rounded,
+                            size: s(30),
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            // --- STREAK BUTTON (right side-zone tab) ---
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeInOutCubic,
+              right: sideZoneButtonsHidden ? -s(110) : s(-10),
+              bottom: s(460),
+              child: IgnorePointer(
+                ignoring: sideZoneButtonsHidden,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeInOut,
+                  opacity: sideZoneButtonsHidden ? 0.0 : 1.0,
+                  child: Material(
+                    color: const Color.fromARGB(251, 88, 255, 85),
+                    borderRadius: BorderRadius.only(
+                      topLeft: Radius.circular(s(18)),
+                      bottomLeft: Radius.circular(s(18)),
+                    ),
+                    elevation: 3,
+                    child: InkWell(
+                      borderRadius: BorderRadius.only(
+                        topLeft: Radius.circular(s(18)),
+                        bottomLeft: Radius.circular(s(18)),
+                      ),
+                      onTap: () async {
+                        await showDialog<void>(
+                          context: context,
+                          builder: (ctx) => AlertDialog(
+                            title: const Text('Streaks'),
+                            content: const Text('Coming soon!'),
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(ctx),
+                                child: const Text('OK'),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                      child: SizedBox(
+                        width: s(72),
+                        height: s(58),
+                        child: Center(
+                          child: Transform.translate(
+                            offset: Offset(-s(4), 0),
+                            child: SizedBox(
+                              width: s(34),
+                              height: s(34),
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  Positioned(
+                                    top: s(14),
+                                    left: s(11),
+                                    child: Container(
+                                      width: s(15),
+                                      height: s(15),
+                                      decoration: const BoxDecoration(
+                                        color: const Color.fromARGB(
+                                          255,
+                                          255,
+                                          177,
+                                          74,
+                                        ),
+                                        shape: BoxShape.circle,
+                                      ),
+                                    ),
+                                  ),
+                                  Icon(
+                                    Icons.whatshot_rounded,
+                                    size: s(34),
+                                    color: const Color.fromARGB(
+                                      255,
+                                      255,
+                                      116,
+                                      66,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
             ),
 
             // --- TUTORIAL OVERLAY (absolute topmost) ---
