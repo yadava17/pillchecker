@@ -107,9 +107,13 @@ class AdherenceService {
     });
   }
 
-  /// Missed → taken + overridden + log override.
-  Future<void> overrideDose(int doseEventId) async {
+  /// Sets a dose to taken or missed, allowing repeated overrides/corrections.
+  Future<void> setDoseStatusForOverride({
+    required int doseEventId,
+    required String finalStatus, // 'taken' or 'missed'
+  }) async {
     final db = await _database;
+
     await db.transaction((txn) async {
       final cur = await txn.query(
         'dose_events',
@@ -118,20 +122,49 @@ class AdherenceService {
         limit: 1,
       );
       if (cur.isEmpty) return;
-      if ((cur.first['status'] as String) != 'missed') return;
 
-      await txn.update(
-        'dose_events',
-        {
-          'status': 'taken',
-          'is_overridden': 1,
-          'taken_at': DateTime.now().toUtc().toIso8601String(),
-        },
-        where: 'id = ?',
+      await txn.delete(
+        'adherence_logs',
+        where: 'dose_event_id = ?',
         whereArgs: [doseEventId],
       );
-      await _insertLog(txn, doseEventId, 'override');
+
+      if (finalStatus == 'taken') {
+        await txn.update(
+          'dose_events',
+          {
+            'status': 'taken',
+            'is_overridden': 1,
+            'taken_at': DateTime.now().toUtc().toIso8601String(),
+          },
+          where: 'id = ?',
+          whereArgs: [doseEventId],
+        );
+
+        await _insertLog(txn, doseEventId, 'override');
+      } else {
+        await txn.update(
+          'dose_events',
+          {
+            'status': 'missed',
+            'is_overridden': 0,
+            'taken_at': null,
+          },
+          where: 'id = ?',
+          whereArgs: [doseEventId],
+        );
+
+        await _insertLog(txn, doseEventId, 'missed');
+      }
     });
+  }
+
+  /// Convenience wrapper: mark a dose taken through override flow.
+  Future<void> overrideDose(int doseEventId) async {
+    await setDoseStatusForOverride(
+      doseEventId: doseEventId,
+      finalStatus: 'taken',
+    );
   }
 
   /// Auto-mark planned doses as missed after a grace period past planned local time.
@@ -139,10 +172,33 @@ class AdherenceService {
     Duration grace = const Duration(hours: 2),
   }) async {
     final db = await _database;
-    final rows = await db.query('dose_events', where: "status = 'planned'");
+
+    final rows = await db.rawQuery('''
+SELECT
+  e.id,
+  e.planned_at,
+  e.status,
+  m.created_at
+FROM dose_events e
+INNER JOIN medications m ON m.id = e.medication_id
+WHERE e.status = 'planned'
+''');
+
     final now = DateTime.now();
+
     for (final r in rows) {
       final planned = DateTime.parse(r['planned_at']! as String).toLocal();
+      final created = DateTime.parse(r['created_at']! as String).toLocal();
+
+      final createdIsToday =
+          created.year == now.year &&
+          created.month == now.month &&
+          created.day == now.day;
+
+      if (createdIsToday) {
+        continue; // never miss a pill on its first day
+      }
+
       if (now.isAfter(planned.add(grace))) {
         await markMissed(r['id']! as int);
       }
@@ -184,6 +240,19 @@ LIMIT ?
         loggedAtLocal: loggedUtc.toLocal(),
       );
     }).toList();
+  }
+
+  Future<DoseEventRecord?> latestMissedForMedication(int medicationId) async {
+    final db = await _database;
+    final rows = await db.query(
+      'dose_events',
+      where: 'medication_id = ? AND status = ?',
+      whereArgs: [medicationId, 'missed'],
+      orderBy: 'planned_at DESC',
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return DoseEventRecord.fromMap(rows.first);
   }
 
   /// First missed event on [localDay] for medication (for override UX).

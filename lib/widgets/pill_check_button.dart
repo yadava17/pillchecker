@@ -5,13 +5,15 @@ class PillCheckButton extends StatefulWidget {
   const PillCheckButton({
     super.key,
     required this.checked,
+    required this.missed,
     required this.onChecked,
     this.size = 135,
-    this.baseColor = const Color(0xFFFF002E), // bright red
-    this.fillColor = const Color(0xFF59FF56), // ✅ match outer green (#59FF56)
+    this.baseColor = const Color(0xFFFF002E),
+    this.fillColor = const Color(0xFF59FF56),
   });
 
   final bool checked;
+  final bool missed;
   final VoidCallback onChecked;
   final double size;
   final Color baseColor;
@@ -65,8 +67,8 @@ class _PillCheckButtonState extends State<PillCheckButton>
   void didUpdateWidget(covariant PillCheckButton oldWidget) {
     super.didUpdateWidget(oldWidget);
 
-    // If parent resets checked -> clear animations
-    if (oldWidget.checked && !widget.checked) {
+    if ((oldWidget.checked || oldWidget.missed) &&
+        (!widget.checked && !widget.missed)) {
       _fired = false;
       _isHolding = false;
       _holdCtrl.value = 0;
@@ -75,12 +77,14 @@ class _PillCheckButtonState extends State<PillCheckButton>
 
     if (!oldWidget.checked && widget.checked) {
       _holdCtrl.value = 1.0;
-      _popCtrl.value = 1.0; // ✅ keep same final size even after rebuilds
+      _popCtrl.value = 1.0;
     }
 
-    // If parent sets checked true, force full fill
-    if (!oldWidget.checked && widget.checked) {
-      _holdCtrl.value = 1.0;
+    if (!oldWidget.missed && widget.missed) {
+      _fired = false;
+      _isHolding = false;
+      _holdCtrl.value = 0.0;
+      _popCtrl.value = 0.0;
     }
   }
 
@@ -92,21 +96,19 @@ class _PillCheckButtonState extends State<PillCheckButton>
   }
 
   void _startHold() {
-    if (widget.checked) return;
+    if (widget.checked || widget.missed) return;
     _isHolding = true;
     _fired = false;
 
-    // fill up while holding
     _holdCtrl.forward();
     setState(() {});
   }
 
   void _endHold() {
-    if (widget.checked) return;
+    if (widget.checked || widget.missed) return;
 
     _isHolding = false;
 
-    // if not finished, drain back down
     if (_holdCtrl.value < 1.0) {
       _holdCtrl.reverseDuration = const Duration(milliseconds: 350);
       _holdCtrl.reverse();
@@ -117,37 +119,30 @@ class _PillCheckButtonState extends State<PillCheckButton>
 
   @override
   Widget build(BuildContext context) {
-    final popScale = Tween<double>(begin: 1.0, end: 1.16).animate(
-      // ✅ bigger pop
-      CurvedAnimation(parent: _popCtrl, curve: Curves.easeOutBack),
-    );
+    const fullCoverScale = 175.0 / 135.0; // covers the full outer ring
 
     return GestureDetector(
       onTapDown: (_) => _startHold(),
       onTapUp: (_) => _endHold(),
       onTapCancel: _endHold,
       child: AnimatedBuilder(
-        animation: Listenable.merge([_holdCtrl, _popCtrl]),
+        animation: _holdCtrl,
         builder: (context, _) {
-          final progress = widget.checked ? 1.0 : _holdCtrl.value;
+          final showMissed = widget.missed;
+          final progress = showMissed
+              ? 0.0
+              : (widget.checked ? 1.0 : _holdCtrl.value);
 
-          // If your dark red ring is 155 and this button is 135:
-          // 155 / 135 = 1.148...
-          const coverScale = 155.0 / 135.0; // adjust if you change sizes later
+          final visuallyComplete =
+              showMissed || widget.checked || _holdCtrl.value >= 0.999;
 
-          final baseScale = widget.checked ? coverScale : 1.0;
-
-          // When checked, still allow the pop to add on top of the cover scale
-          final scaleValue = widget.checked
-              ? (baseScale * popScale.value)
-              : 1.0;
+          final scaleValue = visuallyComplete ? fullCoverScale : 1.0;
 
           return Transform.scale(
             scale: scaleValue,
             child: SizedBox(
               width: widget.size,
               height: widget.size,
-
               child: CustomPaint(
                 painter: _PieFillPainter(
                   progress: progress,
@@ -155,13 +150,49 @@ class _PillCheckButtonState extends State<PillCheckButton>
                   fillColor: widget.fillColor,
                 ),
                 child: Center(
-                  child: AnimatedOpacity(
-                    duration: const Duration(milliseconds: 180),
-                    opacity: (progress >= 1.0) ? 1.0 : 0.0,
-                    child: CustomPaint(
-                      size: Size(widget.size * 0.55, widget.size * 0.55),
-                      painter: _CheckPainter(), // ✅ thicker check
-                    ),
+                  child: Transform.translate(
+                    offset: Offset(-widget.size * 0.01, 0),
+                    child: showMissed
+                        ? Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.warning_rounded,
+                                color: const Color(0xFFFFDF59),
+                                size: widget.size * 0.34,
+                              ),
+                              SizedBox(height: widget.size * 0.02),
+                              FittedBox(
+                                fit: BoxFit.scaleDown,
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                  ),
+                                  child: Text(
+                                    'Missed',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      fontFamily: 'Amaranth',
+                                      fontSize: widget.size * 0.18,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          )
+                        : AnimatedOpacity(
+                            duration: const Duration(milliseconds: 120),
+                            opacity: (progress >= 1.0) ? 1.0 : 0.0,
+                            child: CustomPaint(
+                              size: Size(
+                                widget.size * 0.55,
+                                widget.size * 0.55,
+                              ),
+                              painter: _CheckPainter(),
+                            ),
+                          ),
                   ),
                 ),
               ),

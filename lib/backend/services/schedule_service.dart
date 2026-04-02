@@ -64,10 +64,18 @@ class ScheduleService {
     return rows.first;
   }
 
-  /// Ensures dose rows exist for [daysAhead] calendar days starting from today (local).
-  /// Skips duplicates via UNIQUE(medication_id, planned_at).
+  // lib/backend/services/schedule_service.dart
+
+  /// Ensures dose rows exist for a rolling window that includes
+  /// yesterday + today + upcoming days.
+  ///
+  /// We include [daysBack] because PillChecker's active dose cycle can still
+  /// belong to the previous local day (2 hours before the first dose).
+  /// Without that backfill, morning checks can fail because the current
+  /// cycle's dose_event row does not exist yet.
   Future<void> ensureDoseEventsForMedication(
     int medicationId, {
+    int daysBack = 1,
     int daysAhead = 8,
   }) async {
     final db = await _database;
@@ -79,11 +87,15 @@ class ScheduleService {
         .map((e) => e.toString())
         .toList();
 
-    final today = localDateOnly(DateTime.now());
+    final startDay = localDateOnly(
+      DateTime.now(),
+    ).subtract(Duration(days: daysBack));
+
+    final totalDays = daysBack + daysAhead;
 
     await db.transaction((txn) async {
-      for (var d = 0; d < daysAhead; d++) {
-        final day = today.add(Duration(days: d));
+      for (var d = 0; d < totalDays; d++) {
+        final day = startDay.add(Duration(days: d));
         if (!dayIncludedInMask(daysMask, day)) continue;
 
         for (var doseIndex = 0; doseIndex < times.length; doseIndex++) {

@@ -18,6 +18,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
   static const Color _divider = Color.fromARGB(255, 158, 52, 69);
   static const Color _card = Color(0xFF98404F);
   static const Color _statusGreen = Color(0xFF59FF56);
+  static const Color _statusYellow = Color(0xFFFFDF59);
+  static const Color _statusRed = Color(0xFFFF002E);
 
   late Future<List<HistoryEntry>> _future;
 
@@ -44,7 +46,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 
   Color _statusColor(String label) {
-    if (label == 'Missed') return _statusGreen;
+    if (label == 'Taken (Overridden)') return _statusYellow;
+    if (label == 'Missed') return _statusRed;
     if (label.startsWith('Taken')) return _statusGreen;
     return Colors.white;
   }

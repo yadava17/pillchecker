@@ -28,6 +28,10 @@ import 'package:pillchecker/backend/services/medication_prefs_mirror.dart';
 import 'package:pillchecker/backend/services/prefs_migration.dart';
 import 'package:pillchecker/backend/services/schedule_service.dart';
 import 'package:pillchecker/backend/utils/local_date_time.dart';
+import 'package:pillchecker/screens/calendar/calendar_screen.dart';
+import 'package:pillchecker/widgets/multi_dose_override_dialog.dart';
+import 'package:pillchecker/backend/models/dose_event_record.dart';
+import 'package:pillchecker/widgets/tutorial_spotlight_overlay.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -60,6 +64,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   static const _pillNameLockedKey = 'pill_name_locked_v1'; // JSON List<bool>
 
+  static const _doseHistoryKey = 'dose_history_v1';
+
   // -------- supply in-memory state (aligned with pillNames) --------
   List<bool> pillSupplyEnabled = [];
   List<int> pillSupplyLeft = [];
@@ -86,6 +92,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   );
 
   Map<String, dynamic> _lastCheckMapCache = {};
+  int _lastDoseBarMissedMask = 0;
+
+  Map<DateTime, List<String>> _doseHistory = {};
+
+  List<DateTime> medicationCreatedAts = [];
+  Map<String, dynamic> _lastMissedMapCache = {};
 
   void _refreshCheckMapFuture() {
     if (!mounted) return;
@@ -116,6 +128,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _timesPerDay = 1;
   TimeOfDay? _singleDoseTime;
   List<TimeOfDay?> _doseTimes = [];
+
+  bool _tutorialActive = false;
+  int _tutorialIndex = 0;
 
   // -------- supply draft (current config flow) --------
   bool _supplyTrackOn = false;
@@ -156,6 +171,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   int _pillboxResetToken = 0;
 
+  static const _pillCustomInfoKey = 'pill_custom_info_v1';
+
+  List<String> pillCustomInfo = [];
+  final TextEditingController _customInfoController = TextEditingController();
+
+  // lib/screens/home/home_screen.dart
+
+  int _lastDoseBarTotalDoses = 2;
+  int _lastDoseBarActiveDoseIndex = 0;
+  int _lastDoseBarCheckedMask = 0;
+  bool _hasDoseBarCache = false;
+
   // Pillbox-only scale (1.0 = current size). Try 0.90 or 0.85.
   static const double _pillboxScale = 0.75;
   final pbScale = _pillboxScale;
@@ -182,8 +209,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    _customInfoController.addListener(() => setState(() {}));
     WidgetsBinding.instance.addObserver(this);
     _lastSeenDay = DateTime.now();
+    unawaited(_loadDoseHistory());
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -211,6 +240,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _customInfoController.dispose();
     _pillboxSlideTimer?.cancel();
     _nameFocus.dispose();
 
@@ -376,6 +406,69 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
   }
 
+  void _alignCustomInfoToCount(int count) {
+    while (pillCustomInfo.length < count) {
+      pillCustomInfo.add('');
+    }
+    if (pillCustomInfo.length > count) {
+      pillCustomInfo.removeRange(count, pillCustomInfo.length);
+    }
+  }
+
+  Future<void> _loadCustomInfoFromPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    pillCustomInfo = List<String>.from(
+      prefs.getStringList(_pillCustomInfoKey) ?? const <String>[],
+    );
+    _alignCustomInfoToCount(pillNames.length);
+  }
+
+  double _infoFontSizeFor(String text, {double base = 15}) {
+    final len = text.trim().length;
+    if (len > 900) return 11.5;
+    if (len > 700) return 12.0;
+    if (len > 520) return 12.8;
+    if (len > 360) return 13.5;
+    if (len > 220) return 14.0;
+    return base;
+  }
+
+  double _extraInfoHeightFor(String text, double Function(double) s) {
+    final len = text.trim().length;
+    if (len > 900) return s(170);
+    if (len > 700) return s(140);
+    if (len > 520) return s(110);
+    if (len > 360) return s(80);
+    if (len > 220) return s(50);
+    return 0;
+  }
+
+  double _configPanelHeight(double Function(double) s) {
+    if (_step == _ConfigStep.name) {
+      return s(330);
+    }
+
+    if (_step == _ConfigStep.doses) {
+      return Platform.isAndroid ? s(620) : s(560);
+    }
+
+    return Platform.isAndroid ? s(520) : s(480);
+  }
+
+  double _infoPanelHeight(double Function(double) s) {
+    final idx = _centerPillIndex;
+    final isCustom =
+        idx != null &&
+        idx < pillNameLocked.length &&
+        pillNameLocked[idx] == false;
+
+    final infoText = (isCustom && idx != null && idx < pillCustomInfo.length)
+        ? pillCustomInfo[idx]
+        : '';
+
+    return s(520) + (isCustom ? _extraInfoHeightFor(infoText, s) : 0);
+  }
+
   // Replace your existing _resyncNotifsAfterPillChange() with this:
   Future<void> _resyncNotifsAfterPillChange() async {
     unawaited(_rebuild2DayNotifWindowAndReMuteChecked(tag: 'pill-change'));
@@ -438,6 +531,164 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await prefs.setString(kLastCycleStartKey, currentIso);
 
     debugPrint('CYCLE RESET: $lastIso -> $currentIso (cleared checkMap)');
+  }
+
+  void _startTutorial() {
+    FocusManager.instance.primaryFocus?.unfocus();
+
+    setState(() {
+      _tutorialActive = true;
+      _tutorialIndex = 0;
+
+      _configOpen = false;
+      _infoOpen = false;
+      _searchOpen = false;
+      _pendingSlot = false;
+    });
+  }
+
+  void _closeTutorial() {
+    if (!mounted) return;
+    setState(() {
+      _tutorialActive = false;
+      _tutorialIndex = 0;
+    });
+  }
+
+  void _nextTutorialStep(int totalSteps) {
+    if (_tutorialIndex >= totalSteps - 1) {
+      _closeTutorial();
+      return;
+    }
+
+    setState(() => _tutorialIndex++);
+  }
+
+  void _prevTutorialStep() {
+    if (_tutorialIndex <= 0) return;
+    setState(() => _tutorialIndex--);
+  }
+
+  List<_TutorialStep> _tutorialStepsForLayout({
+    required Size size,
+    required double Function(double) s,
+    required double designW,
+    required double topShift,
+  }) {
+    Rect rectFromTop({
+      required double left,
+      required double top,
+      required double width,
+      required double height,
+    }) {
+      return Rect.fromLTWH(left, top, width, height);
+    }
+
+    Rect rectFromBottom({
+      required double right,
+      required double bottom,
+      required double width,
+      required double height,
+    }) {
+      return Rect.fromLTWH(
+        size.width - right - width,
+        size.height - bottom - height,
+        width,
+        height,
+      );
+    }
+
+    final checkLeft = _leftFromDesignRight(135, 137, size, s, designW) - s(4);
+
+    return [
+      _TutorialStep(
+        title: 'Directory',
+        description:
+            'Use this button to open the Directory. You can browse the catalogue, check My Pills, and add medications from there.',
+        targetRect: rectFromTop(
+          left: s(-10),
+          top: s(45) + topShift,
+          width: s(80),
+          height: s(75),
+        ),
+      ),
+      _TutorialStep(
+        title: 'Settings',
+        description:
+            'Open Settings to change reminders, supply tracking, feedback, credits, and to run this tutorial again later.',
+        targetRect: rectFromTop(
+          left: s(340),
+          top: s(45) + topShift,
+          width: s(80),
+          height: s(75),
+        ),
+      ),
+      _TutorialStep(
+        title: 'Pill Wheel',
+        description:
+            'The wheel is where you move between pills. The highlighted pill in the middle is the active one. The + on the wheel lets you start adding a pill.',
+        targetRect: Rect.fromCenter(
+          center: Offset(size.width / 2, size.height - s(235)),
+          width: s(400),
+          height: s(465),
+        ),
+      ),
+      _TutorialStep(
+        title: 'Check Button',
+        description:
+            'Hold this button to check the current dose. When a dose is missed, this button turns red and shows Missed instead.',
+        targetRect: rectFromTop(
+          left: checkLeft - s(12),
+          top: size.height - s(100) - s(150),
+          width: s(165),
+          height: s(165),
+        ),
+      ),
+      _TutorialStep(
+        title: 'Info',
+        description:
+            'Tap this button to open the pill info panel, view details, edit a pill, or delete it.',
+        targetRect: rectFromTop(
+          left: s(0),
+          top: size.height - s(5) - s(86),
+          width: s(120),
+          height: s(82),
+        ),
+      ),
+      _TutorialStep(
+        title: 'Warnings & Overrides',
+        description:
+            'Tap here for warning actions like override, mark missed, and open adherence history. Multiple-dose pills also get a multi-dose override option here.',
+        targetRect: rectFromBottom(
+          right: s(0),
+          bottom: s(5),
+          width: s(120),
+          height: s(82),
+        ),
+      ),
+      _TutorialStep(
+        title: 'Calendar',
+        description:
+            'This tab opens the calendar view so you can review adherence by day.',
+        targetRect: rectFromTop(
+          left: s(-10),
+          top: size.height - s(460) - s(58),
+          width: s(72),
+          height: s(58),
+        ),
+      ),
+      _TutorialStep(
+        title: 'Streaks',
+        description:
+            'This section is for streaks and progress features. Coming soon!',
+        targetRect: rectFromBottom(
+          right: s(-10),
+          bottom: s(460),
+          width: s(72),
+          height: s(58),
+        ),
+      ),
+    ];
   }
 
   // ---------------- helpers: dose lists ----------------
@@ -521,6 +772,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _infoOpen = false;
       _configOpen = true;
 
+      _customInfoController.text =
+          (!_lockPillName && pillIndex < pillCustomInfo.length)
+          ? pillCustomInfo[pillIndex]
+          : '';
+
       _supplyPromptedThisFlow = false;
       _maybeAutoPromptSupply();
 
@@ -560,6 +816,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<Map<String, dynamic>> _loadCheckMap() async {
     if (pillNames.isEmpty) {
       _lastCheckMapCache = {};
+      _lastMissedMapCache = {};
       return {};
     }
     if (medicationIds.length != pillNames.length) {
@@ -573,6 +830,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _hydrateMedicationsFromDatabase() async {
     final meds = await _medService.getAll();
     medicationIds = meds.map((m) => m.id).toList();
+    medicationCreatedAts = meds.map((m) => m.createdAt).toList();
+    _alignMedicationCreatedAtsToCount(pillNames.length);
     pillNames = meds.map((m) => m.name).toList();
     pillTimes = [];
     pillDoseTimes = [];
@@ -620,32 +879,82 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<Map<String, dynamic>> _deriveCheckMapFromDatabase() async {
     final map = <String, dynamic>{};
+    final missedMap = <String, dynamic>{};
+
     final now = DateTime.now();
     for (var i = 0; i < pillNames.length; i++) {
       if (i >= medicationIds.length) continue;
+
       final doses = _doseTimesForPill(i);
       if (doses.isEmpty) continue;
+
       final w = _computeDoseWindow(now: now, dosesSorted: doses);
       final cycleDay = DateTime(
         w.cycleStart.year,
         w.cycleStart.month,
         w.cycleStart.day,
       );
+      final cycleIso = w.cycleStart.toIso8601String();
+
       final mid = medicationIds[i];
       final events = await _adherenceService
           .getDoseEventsForMedicationOnLocalDay(
             medicationId: mid,
             localDay: cycleDay,
           );
-      var mask = 0;
+
+      var takenMask = 0;
+      var missedMask = 0;
+
       for (final e in events) {
         if (e.status == 'taken') {
-          mask |= (1 << e.doseIndex);
+          takenMask |= (1 << e.doseIndex);
+        } else if (e.status == 'missed') {
+          missedMask |= (1 << e.doseIndex);
         }
       }
-      map['$i'] = _packCycleAndMask(w.cycleStart.toIso8601String(), mask);
+
+      map['$i'] = _packCycleAndMask(cycleIso, takenMask);
+      missedMap['$i'] = _packCycleAndMask(cycleIso, missedMask);
     }
+
+    _lastMissedMapCache = missedMap;
     return map;
+  }
+
+  Future<void> _loadDoseHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_doseHistoryKey);
+    if (raw == null || raw.isEmpty) return;
+
+    final decoded = jsonDecode(raw) as Map<String, dynamic>;
+    final result = <DateTime, List<String>>{};
+    for (final entry in decoded.entries) {
+      final day = DateTime.parse(entry.key);
+      result[DateTime(day.year, day.month, day.day)] = (entry.value as List)
+          .cast<String>();
+    }
+
+    if (mounted) {
+      setState(() => _doseHistory = result);
+    }
+  }
+
+  Future<void> _saveDoseHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    final encoded = <String, dynamic>{};
+    for (final entry in _doseHistory.entries) {
+      encoded[entry.key.toIso8601String()] = entry.value;
+    }
+    await prefs.setString(_doseHistoryKey, jsonEncode(encoded));
+  }
+
+  void _recordDoseHistory(String pillName) {
+    final now = DateTime.now();
+    final dayKey = DateTime(now.year, now.month, now.day);
+    _doseHistory[dayKey] ??= <String>[];
+    _doseHistory[dayKey]!.add(pillName);
+    _saveDoseHistory();
   }
 
   Future<void> _saveCheckMap(Map<String, dynamic> map) async {
@@ -896,6 +1205,144 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return (parsed.mask & (1 << doseIndex)) != 0;
   }
 
+  bool _isFirstDayForMedication(int pillIndex) {
+    if (pillIndex < 0 || pillIndex >= medicationCreatedAts.length) return false;
+
+    final created = medicationCreatedAts[pillIndex].toLocal();
+    final now = DateTime.now();
+
+    return created.year == now.year &&
+        created.month == now.month &&
+        created.day == now.day;
+  }
+
+  bool _isDoseMarkedMissedSync(int pillIndex, String cycleIso, int doseIndex) {
+    final stored = _lastMissedMapCache['$pillIndex'] as String?;
+    final parsed = _readCycleAndMask(stored);
+    if (parsed.cycleIso != cycleIso) return false;
+    return (parsed.mask & (1 << doseIndex)) != 0;
+  }
+
+  bool _isCurrentDoseMissed({
+    required int pillIndex,
+    required Map<String, dynamic> map,
+    Duration grace = const Duration(hours: 2),
+  }) {
+    if (_isFirstDayForMedication(pillIndex)) return false;
+
+    final doses = _doseTimesForPill(pillIndex);
+    if (doses.isEmpty) return false;
+
+    final now = DateTime.now();
+    final w = _computeDoseWindow(now: now, dosesSorted: doses);
+    final cycleIso = w.cycleStart.toIso8601String();
+
+    final alreadyChecked = _isDoseCheckedSync(
+      map,
+      pillIndex,
+      cycleIso,
+      w.doseIndex,
+    );
+    if (alreadyChecked) return false;
+
+    final explicitlyMissed = _isDoseMarkedMissedSync(
+      pillIndex,
+      cycleIso,
+      w.doseIndex,
+    );
+    if (explicitlyMissed) return true;
+
+    final cycleDay = DateTime(
+      w.cycleStart.year,
+      w.cycleStart.month,
+      w.cycleStart.day,
+    );
+    final plannedAt = _atTime(cycleDay, doses[w.doseIndex]);
+
+    return now.isAfter(plannedAt.add(grace));
+  }
+
+  Future<void> _openMultiDoseOverride() async {
+    final pillIndex = _centerPillIndex;
+    if (pillIndex == null || pillIndex >= medicationIds.length) return;
+
+    if (_isFirstDayForMedication(pillIndex)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Multiple dose override is not available on the first day.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    final doses = _doseTimesForPill(pillIndex);
+    if (doses.length <= 1) return;
+
+    final mid = medicationIds[pillIndex];
+    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final cycleDay = DateTime(
+      w.cycleStart.year,
+      w.cycleStart.month,
+      w.cycleStart.day,
+    );
+
+    await _scheduleService.ensureDoseEventsForMedication(mid);
+    final events = await _adherenceService.getDoseEventsForMedicationOnLocalDay(
+      medicationId: mid,
+      localDay: cycleDay,
+    );
+
+    final eventsByDose = <int, DoseEventRecord>{
+      for (final e in events) e.doseIndex: e,
+    };
+
+    int initialTakenMask = 0;
+    for (int i = 0; i < doses.length; i++) {
+      final e = eventsByDose[i];
+      if (e != null && e.status == 'taken') {
+        initialTakenMask |= (1 << i);
+      }
+    }
+
+    if (!mounted) return;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => MultiDoseOverrideDialog(
+        pillName: pillNames[pillIndex],
+        totalDoses: doses.length,
+        initialTakenMask: initialTakenMask,
+        onDone: (takenMask) async {
+          for (int i = 0; i < doses.length; i++) {
+            final ev = eventsByDose[i];
+            if (ev == null) continue;
+
+            final shouldBeTaken = (takenMask & (1 << i)) != 0;
+
+            await _adherenceService.setDoseStatusForOverride(
+              doseEventId: ev.id,
+              finalStatus: shouldBeTaken ? 'taken' : 'missed',
+            );
+          }
+
+          final map = await _deriveCheckMapFromDatabase();
+          await _saveCheckMap(map);
+          _setCheckMapAndRebuild(map);
+          _refreshCheckMapFuture();
+          _scheduleCenteredDoseBoundaryRefresh();
+
+          unawaited(
+            _rebuild2DayNotifWindowAndReMuteChecked(tag: 'multi-dose-override'),
+          );
+        },
+      ),
+    );
+  }
+
   // ---------------- dose window logic ----------------
   ({
     int doseIndex,
@@ -1072,18 +1519,35 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final doses = _doseTimesForPill(pillIndex);
     if (doses.isEmpty) return;
 
-    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
-    final next = w.windowEnd;
+    final now = DateTime.now();
+    final w = _computeDoseWindow(now: now, dosesSorted: doses);
 
-    final diff = next.difference(DateTime.now());
+    final cycleDay = DateTime(
+      w.cycleStart.year,
+      w.cycleStart.month,
+      w.cycleStart.day,
+    );
+    final plannedAt = _atTime(cycleDay, doses[w.doseIndex]);
+    final missAt = plannedAt.add(const Duration(hours: 2));
+
+    DateTime next = w.windowEnd;
+    if (missAt.isAfter(now) && missAt.isBefore(next)) {
+      next = missAt;
+    }
+
+    final diff = next.difference(now);
     if (diff.inMilliseconds <= 50) {
       if (!mounted) return;
+      unawaited(_adherenceService.autoMarkMissedPastPlanned());
+      _checkMapFuture = _loadCheckMap();
       setState(() {});
       return;
     }
 
-    _doseBoundaryTimer = Timer(diff, () {
+    _doseBoundaryTimer = Timer(diff, () async {
       if (!mounted) return;
+
+      await _adherenceService.autoMarkMissedPastPlanned();
 
       _checkMapFuture = _loadCheckMap();
       setState(() {});
@@ -1339,29 +1803,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   // ---------------- onboarding ----------------
-  Future<void> _showWelcomeThenOpenConfig(SharedPreferences prefs) async {
+  Future<void> _showWelcomeTutorialPrompt(SharedPreferences prefs) async {
     final alreadySeen = prefs.getBool(_seenPromptKey) ?? false;
     if (alreadySeen) return;
 
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('Welcome!'),
-        content: const Text('Configure your first pill.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('OK'),
+    final wantsTutorial =
+        await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) => AlertDialog(
+            title: const Text('Welcome to PillChecker!'),
+            content: const Text('Would you like a tutorial?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Not now'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Start tutorial'),
+              ),
+            ],
           ),
-        ],
-      ),
-    );
+        ) ??
+        false;
 
     await prefs.setBool(_seenPromptKey, true);
 
     if (!mounted) return;
-    _startAddFlow(createNewSlot: true);
+    if (wantsTutorial) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _startTutorial();
+      });
+    }
   }
 
   void _cacheSupplyBadgeIfShowing() {
@@ -1402,6 +1877,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
 
     await _hydrateMedicationsFromDatabase();
+    await _loadCustomInfoFromPrefs();
 
     await _scheduleService.ensureDoseEventsForMedications(medicationIds);
     await _adherenceService.autoMarkMissedPastPlanned();
@@ -1431,7 +1907,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (pillNames.isEmpty && mounted) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         if (!mounted) return;
-        await _showWelcomeThenOpenConfig(prefs);
+        await _showWelcomeTutorialPrompt(prefs);
       });
     }
   }
@@ -1481,6 +1957,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // times/day + step
       _timesPerDay = tp;
       _singleDoseTime = null;
+
+      _customInfoController.text = '';
 
       if (tp == 1) {
         _step = _ConfigStep.config;
@@ -1597,6 +2075,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _supplyInitialDraft = 0;
       _lockPillName = true;
       _searchOpen = false;
+      _customInfoController.text = '';
 
       _selectedPillInfo = resolvedInfo;
       _nameController.text = resolvedName;
@@ -1637,6 +2116,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _configOpen = true;
       _step = _ConfigStep.name;
 
+      _customInfoController.text = '';
       _nameController.text = '';
       _timesPerDay = 1;
       _singleDoseTime = null;
@@ -1835,6 +2315,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _alignSupplyListsToCount(pillNames.length);
 
     final updatedNames = [...pillNames, name];
+    final updatedCustomInfo = [
+      ...pillCustomInfo,
+      _lockPillName ? '' : _customInfoController.text.trim(),
+    ];
+    await prefs.setStringList(_pillCustomInfoKey, updatedCustomInfo);
     await prefs.setStringList(_pillNamesKey, updatedNames);
 
     final effectiveTrack = (_supplyModeGlobal == 'on')
@@ -1899,17 +2384,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _setCheckMapAndRebuild(checkMap);
     _refreshCheckMapFuture();
 
+    _alignMedicationCreatedAtsToCount(pillNames.length);
     // ✅ Rebuild notif window
     await _resyncNotifsAfterPillChange();
 
     if (!mounted) return;
     setState(() {
       medicationIds = [...medicationIds, med.id];
+      medicationCreatedAts = [...medicationCreatedAts, med.createdAt];
       pillSupplyEnabled = [...pillSupplyEnabled];
       pillSupplyLeft = [...pillSupplyLeft];
       pillSupplyInitial = [...pillSupplyInitial];
       pillSupplyLowSent = [...pillSupplyLowSent];
       pillNameLocked = updatedNameLocked;
+      pillCustomInfo = updatedCustomInfo;
 
       pillNames = updatedNames;
       pillTimes = updatedTimes;
@@ -2048,6 +2536,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       updatedDoseTimes[pillIndex] = doseStrings;
     }
 
+    final updatedCustomInfo = [...pillCustomInfo];
+    if (pillIndex < updatedCustomInfo.length) {
+      updatedCustomInfo[pillIndex] = isLocked
+          ? ''
+          : _customInfoController.text.trim();
+    }
+    await prefs.setStringList(_pillCustomInfoKey, updatedCustomInfo);
+
     await prefs.setStringList(_pillNamesKey, updatedNames);
     await prefs.setStringList(_pillTimesKey, updatedTimes);
     await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
@@ -2127,6 +2623,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       pillSupplyInitial = [...pillSupplyInitial];
       pillSupplyLowSent = [...pillSupplyLowSent];
       _cacheSupplyBadgeIfShowing();
+      pillCustomInfo = updatedCustomInfo;
 
       pillNames = updatedNames;
       pillTimes = updatedTimes;
@@ -2202,6 +2699,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final updatedDoseTimes = [...pillDoseTimes];
     if (slot < updatedDoseTimes.length) updatedDoseTimes.removeAt(slot);
 
+    _alignMedicationCreatedAtsToCount(pillNames.length);
+
+    final updatedCreatedAts = [...medicationCreatedAts];
+    if (slot < updatedCreatedAts.length) {
+      updatedCreatedAts.removeAt(slot);
+    }
+
+    while (updatedCreatedAts.length > updatedNames.length) {
+      updatedCreatedAts.removeLast();
+    }
+    while (updatedCreatedAts.length < updatedNames.length) {
+      updatedCreatedAts.add(DateTime.fromMillisecondsSinceEpoch(0));
+    }
+
     // ✅ supply lists must remove the same slot too (guarded)
     _alignSupplyListsToCount(pillNames.length);
 
@@ -2238,6 +2749,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _saveSupplyListsToPrefs();
 
     final updatedNameLocked = [...pillNameLocked]..removeAt(slot);
+    final updatedCustomInfo = [...pillCustomInfo]..removeAt(slot);
+    await prefs.setStringList(_pillCustomInfoKey, updatedCustomInfo);
     await prefs.setString(_pillNameLockedKey, jsonEncode(updatedNameLocked));
 
     // Decide new centered wheel index BEFORE setState
@@ -2262,10 +2775,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {
       medicationIds = updatedMedIds;
+      medicationCreatedAts = updatedCreatedAts;
       pillSupplyEnabled = [...pillSupplyEnabled];
       pillSupplyLeft = [...pillSupplyLeft];
       pillSupplyInitial = [...pillSupplyInitial];
       pillSupplyLowSent = [...pillSupplyLowSent];
+      pillCustomInfo = updatedCustomInfo;
       pillNames = updatedNames;
       pillNameLocked = updatedNameLocked;
       pillTimes = updatedTimes;
@@ -2274,6 +2789,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _editingIndex = newEditingIndex;
       _wheelSelectedIndex = newWheelIndex;
       _infoOpen = false; // close dashboard panel after delete
+      _showPillLabel = updatedNames.isNotEmpty;
     });
 
     final checkMap = await _deriveCheckMapFromDatabase();
@@ -2305,77 +2821,47 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  Future<void> _onWarningOverrideTap() async {
-    final pillIndex = _centerPillIndex;
-    if (pillIndex == null) return;
-    if (pillIndex >= medicationIds.length) return;
+  Future<void> _refreshForDateJumpIfNeeded() async {
+    final now = DateTime.now();
+    final dayKey = now.year * 10000 + now.month * 100 + now.day;
 
-    final doses = _doseTimesForPill(pillIndex);
-    if (doses.isEmpty) return;
+    if (dayKey == _lastSeenDayKey) return;
+    _lastSeenDayKey = dayKey;
 
-    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
-    final cycleDay = DateTime(
-      w.cycleStart.year,
-      w.cycleStart.month,
-      w.cycleStart.day,
-    );
-    final mid = medicationIds[pillIndex];
-
-    await _scheduleService.ensureDoseEventsForMedication(mid);
-    final missed = await _adherenceService.firstMissedOnLocalDay(
-      medicationId: mid,
-      localDay: cycleDay,
-    );
-
-    if (missed == null) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('No missed dose to override for this pill.'),
-        ),
-      );
-      return;
-    }
-
+    await _refreshAdherenceFromDb();
     if (!mounted) return;
 
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Override missed dose?'),
-        content: const Text(
-          'Mark this missed dose as taken (overridden)? '
-          'This will show in History as Taken (Overridden).',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Override'),
-          ),
-        ],
-      ),
-    );
-
-    if (!mounted) return;
-    if (confirmed != true) return;
-
-    await _adherenceService.overrideDose(missed.id);
-    final map = await _deriveCheckMapFromDatabase();
-    await _saveCheckMap(map);
-    _setCheckMapAndRebuild(map);
     _refreshCheckMapFuture();
+
+    final newToday = _debugDayOverride ?? (now.weekday % 7);
+
+    _rearmDailyCircleDelay();
+    _armDailyCircleDelay();
+    _startNewDaySequence(today: newToday);
+
+    unawaited(_rebuild2DayNotifWindowAndReMuteChecked(tag: 'date-jump'));
+
+    _scheduleGlobalBoundaryRefresh();
+    unawaited(_scheduleGlobalDayBoundaryRefresh());
   }
 
-  Future<void> _markCurrentDoseMissed() async {
+  void _alignMedicationCreatedAtsToCount(int count) {
+    while (medicationCreatedAts.length < count) {
+      // Safe fallback so old pills don't crash delete/update flows.
+      medicationCreatedAts.add(DateTime.fromMillisecondsSinceEpoch(0));
+    }
+    if (medicationCreatedAts.length > count) {
+      medicationCreatedAts.removeRange(count, medicationCreatedAts.length);
+    }
+  }
+
+  Future<void> _onWarningOverrideTap() async {
     final pillIndex = _centerPillIndex;
     if (pillIndex == null || pillIndex >= medicationIds.length) return;
 
     final doses = _doseTimesForPill(pillIndex);
     if (doses.isEmpty) return;
+
     final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
     final cycleDay = DateTime(
       w.cycleStart.year,
@@ -2391,13 +2877,97 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       medicationId: mid,
       plannedAtUtcIso: plannedIso,
     );
-    if (ev == null || ev.status != 'planned') return;
 
-    await _adherenceService.markMissed(ev.id);
+    if (ev == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No current dose found for this pill.')),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Mark current dose taken?'),
+        content: const Text(
+          'This will set the current dose to taken. You can change it again later if needed.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Confirm'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted) return;
+    if (confirmed != true) return;
+
+    await _adherenceService.setDoseStatusForOverride(
+      doseEventId: ev.id,
+      finalStatus: 'taken',
+    );
+
     final map = await _deriveCheckMapFromDatabase();
     await _saveCheckMap(map);
     _setCheckMapAndRebuild(map);
     _refreshCheckMapFuture();
+    _scheduleCenteredDoseBoundaryRefresh();
+  }
+
+  Future<void> _markCurrentDoseMissed() async {
+    final pillIndex = _centerPillIndex;
+    if (pillIndex == null || pillIndex >= medicationIds.length) return;
+
+    if (_isFirstDayForMedication(pillIndex)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('A pill cannot be marked missed on its first day.'),
+        ),
+      );
+      return;
+    }
+
+    final doses = _doseTimesForPill(pillIndex);
+    if (doses.isEmpty) return;
+
+    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final cycleDay = DateTime(
+      w.cycleStart.year,
+      w.cycleStart.month,
+      w.cycleStart.day,
+    );
+    final tod = doses[w.doseIndex];
+    final plannedIso = plannedAtUtcIsoForSlot(cycleDay, tod);
+    final mid = medicationIds[pillIndex];
+
+    await _scheduleService.ensureDoseEventsForMedication(mid);
+    final ev = await _adherenceService.findDoseEventForPlannedUtc(
+      medicationId: mid,
+      plannedAtUtcIso: plannedIso,
+    );
+
+    if (ev == null) return;
+
+    await _adherenceService.setDoseStatusForOverride(
+      doseEventId: ev.id,
+      finalStatus: 'missed',
+    );
+
+    final map = await _deriveCheckMapFromDatabase();
+    await _saveCheckMap(map);
+    _setCheckMapAndRebuild(map);
+    _refreshCheckMapFuture();
+    _scheduleCenteredDoseBoundaryRefresh();
   }
 
   Future<void> _openHistoryScreen() async {
@@ -2416,12 +2986,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (centered == null || centered >= medicationIds.length) {
       return;
     }
+
+    final isMultiDose = _doseTimesForPill(centered).length > 1;
+
     final action = await showModalBottomSheet<String>(
       context: context,
       builder: (ctx) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (isMultiDose)
+              ListTile(
+                leading: const Icon(Icons.pie_chart),
+                title: const Text('Multiple dose override'),
+                onTap: () => Navigator.pop(ctx, 'multi_override'),
+              ),
             ListTile(
               leading: const Icon(Icons.check_circle_outline),
               title: const Text('Override missed dose'),
@@ -2441,8 +3020,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
     );
+
     if (!mounted || action == null) return;
 
+    if (action == 'multi_override') {
+      await _openMultiDoseOverride();
+      return;
+    }
     if (action == 'override') {
       await _onWarningOverrideTap();
       return;
@@ -2457,12 +3041,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   // ---------------- CHECK current dose ----------------
+  // lib/screens/home/home_screen.dart
+
   Future<void> _checkCenteredPill() async {
     final pillIndex = _centerPillIndex;
     if (pillIndex == null) return;
     if (pillIndex >= medicationIds.length) return;
 
-    // 1) Figure out which dose we’re checking (and the current cycle key)
     final doses = _doseTimesForPill(pillIndex);
     final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
 
@@ -2477,35 +3062,45 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final plannedIso = plannedAtUtcIsoForSlot(cycleDay, tod);
     final mid = medicationIds[pillIndex];
 
-    await _scheduleService.ensureDoseEventsForMedication(mid);
+    // Important: make sure the previous-cycle day is backfilled too.
+    await _scheduleService.ensureDoseEventsForMedication(mid, daysBack: 1);
+
     final ev = await _adherenceService.findDoseEventForPlannedUtc(
       medicationId: mid,
       plannedAtUtcIso: plannedIso,
     );
-    if (ev == null) return;
+
+    if (ev == null) {
+      debugPrint(
+        'CHECK FAILED in HomeScreen._checkCenteredPill: '
+        'pillIndex=$pillIndex '
+        'medicationId=$mid '
+        'doseIndex=$doseIndex '
+        'cycleDay=$cycleDay '
+        'plannedIso=$plannedIso '
+        'doses=${doses.map(_timeToStr).toList()}',
+      );
+      return;
+    }
+
     await _adherenceService.confirmTaken(ev.id);
 
     final map = await _deriveCheckMapFromDatabase();
     await _saveCheckMap(map);
 
-    // keep your existing UI/cache refresh flow
     _setCheckMapAndRebuild(map);
     _refreshCheckMapFuture();
     _checkMapFuture = _loadCheckMap();
 
-    // NEW notif system: cancel remaining notifications for today for this pill.
-    // If you want “checking dose 1 mutes dose 2+ too”, set muteRemainingDoses: true.
     await NotificationService.muteToday(
       pillSlot: pillIndex,
       doseIndex: doseIndex,
       dosesPerDay: doses.length,
-      muteRemainingDoses:
-          false, // change to true if you want “one check mutes rest of day”
+      muteRemainingDoses: false,
     );
 
     unawaited(_consumeOneSupplyIfEnabled(pillIndex));
 
-    // 5) Everything else unchanged
     _scheduleCenteredDoseBoundaryRefresh();
 
     _labelTimer?.cancel();
@@ -2515,7 +3110,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _labelOverride = null);
     });
 
+    _recordDoseHistory(pillNames[pillIndex]);
+
     if (mounted) setState(() {});
+  }
+
+  Future<void> _openCalendarScreen() async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CalendarScreen(adherenceService: _adherenceService),
+      ),
+    );
+
+    if (!mounted) return;
+    await _refreshForDateJumpIfNeeded();
   }
 
   // ---------------- config panel UI ----------------
@@ -2545,402 +3154,405 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           borderRadius: BorderRadius.circular(26),
         ),
         padding: const EdgeInsets.all(16),
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            return SingleChildScrollView(
-              child: ConstrainedBox(
-                constraints: BoxConstraints(minHeight: constraints.maxHeight),
-                child: Column(
-                  children: [
-                    // ---------------- HEADER ROW ----------------
-                    Row(
-                      children: [
-                        Container(
-                          width: 52,
-                          height: 52,
-                          decoration: BoxDecoration(
-                            color: white,
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          child: Center(
-                            child: Image.asset(
-                              'assets/images/pill_placeholder.png',
-                              width: 36,
-                              height: 36,
-                              fit: BoxFit.contain,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // ---------------- HEADER ROW ----------------
+              Row(
+                children: [
+                  Container(
+                    width: 52,
+                    height: 52,
+                    decoration: BoxDecoration(
+                      color: white,
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Center(
+                      child: Image.asset(
+                        'assets/images/pill_placeholder.png',
+                        width: 36,
+                        height: 36,
+                        fit: BoxFit.contain,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: (_step == _ConfigStep.name)
+                        ? TextField(
+                            focusNode: _nameFocus,
+                            controller: _nameController,
+                            style: const TextStyle(color: white, fontSize: 18),
+                            decoration: const InputDecoration(
+                              hintText: 'Pill name...',
+                              hintStyle: TextStyle(color: Colors.white70),
+                              border: InputBorder.none,
                             ),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: (_step == _ConfigStep.name)
-                              ? TextField(
-                                  focusNode: _nameFocus,
-                                  controller: _nameController,
+                          )
+                        : (_lockPillName
+                              ? Text(
+                                  _nameController.text.trim(),
                                   style: const TextStyle(
                                     color: white,
-                                    fontSize: 18,
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.w600,
                                   ),
-                                  decoration: const InputDecoration(
-                                    hintText: 'Pill name...',
-                                    hintStyle: TextStyle(color: Colors.white70),
-                                    border: InputBorder.none,
-                                  ),
+                                  overflow: TextOverflow.ellipsis,
                                 )
-                              : (_lockPillName
-                                    // ✅ Locked name (search-picked): NO edit button
-                                    ? Text(
-                                        _nameController.text.trim(),
-                                        style: const TextStyle(
-                                          color: white,
-                                          fontSize: 22,
-                                          fontWeight: FontWeight.w600,
+                              : InkWell(
+                                  onTap: _editNameAgain,
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          _nameController.text.trim(),
+                                          style: const TextStyle(
+                                            color: white,
+                                            fontSize: 22,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                          overflow: TextOverflow.ellipsis,
                                         ),
-                                        overflow: TextOverflow.ellipsis,
-                                      )
-                                    // ✅ Custom / normal: allow editing name
-                                    : InkWell(
-                                        onTap: _editNameAgain,
-                                        child: Row(
-                                          children: [
-                                            Expanded(
-                                              child: Text(
-                                                _nameController.text.trim(),
-                                                style: const TextStyle(
-                                                  color: white,
-                                                  fontSize: 22,
-                                                  fontWeight: FontWeight.w600,
-                                                ),
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                            ),
-                                            const SizedBox(width: 8),
-                                            const Icon(
-                                              Icons.edit,
-                                              color: Colors.white70,
-                                              size: 20,
-                                            ),
-                                          ],
-                                        ),
-                                      )),
-                        ),
-                        IconButton(
-                          onPressed: _cancelAddFlow,
-                          icon: const Icon(Icons.close, color: white),
-                        ),
-                      ],
-                    ),
-
-                    const SizedBox(height: 10),
-
-                    // ---------------- INFO BOX ----------------
-                    Container(
-                      width: double.infinity,
-                      height: 140,
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.12),
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                      alignment: Alignment.center,
-                      child: Text(
-                        _selectedPillInfo ?? 'Placeholder info area',
-                        style: const TextStyle(color: Colors.white70),
-                      ),
-                    ),
-
-                    const SizedBox(height: 12),
-
-                    // ---------------- SUPPLY TRACKING (shows on CONFIG + DOSES) ----------------
-                    if (_step != _ConfigStep.name &&
-                        _supplyModeGlobal != 'off') ...[
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.12),
-                          borderRadius: BorderRadius.circular(18),
-                        ),
-                        child: Column(
-                          children: [
-                            // ---------------- HEADER ROW ----------------
-                            if (_supplyModeGlobal == 'decide') ...[
-                              // ✅ Decide mode: show Track supply + switch
-                              Row(
-                                children: [
-                                  const Text(
-                                    'Track supply',
-                                    style: TextStyle(
-                                      color: white,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  GestureDetector(
-                                    onTap: _showSupplyInfoDialog,
-                                    child: const Icon(
-                                      Icons.info_outline,
-                                      color: Colors.white70,
-                                      size: 20,
-                                    ),
-                                  ),
-                                  const Spacer(),
-                                  Switch(
-                                    value: _supplyTrackOn,
-                                    onChanged: (v) async {
-                                      if (!mounted) return;
-
-                                      if (!v) {
-                                        setState(() {
-                                          _supplyTrackOn = false;
-                                          _supplyLeftDraft = 0;
-                                          _supplyInitialDraft = 0;
-                                        });
-                                        return;
-                                      }
-
-                                      setState(() => _supplyTrackOn = true);
-                                      await _editSupplyDialog(
-                                        setInitialToo: true,
-                                      );
-
-                                      if (!mounted) return;
-                                      if (_supplyLeftDraft <= 0) {
-                                        setState(() => _supplyTrackOn = false);
-                                      }
-                                    },
-                                  ),
-                                ],
-                              ),
-                            ] else ...[
-                              // ✅ Always On: NO switch row, just label
-                              Row(
-                                children: [
-                                  const Text(
-                                    'Supply',
-                                    style: TextStyle(
-                                      color: white,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  GestureDetector(
-                                    onTap: _showSupplyInfoDialog,
-                                    child: const Icon(
-                                      Icons.info_outline,
-                                      color: Colors.white70,
-                                      size: 20,
-                                    ),
-                                  ),
-                                  const Spacer(),
-                                  const Text(
-                                    'Always On',
-                                    style: TextStyle(
-                                      color: Colors.white70,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                            ],
-
-                            // ---------------- SUPPLY LEFT ROW ----------------
-                            if ((_supplyModeGlobal == 'on') ||
-                                (_supplyModeGlobal == 'decide' &&
-                                    _supplyTrackOn)) ...[
-                              const SizedBox(height: 8),
-                              InkWell(
-                                onTap: () =>
-                                    _editSupplyDialog(setInitialToo: false),
-                                child: Row(
-                                  children: [
-                                    const Text(
-                                      'Supply left',
-                                      style: TextStyle(
+                                      ),
+                                      const SizedBox(width: 8),
+                                      const Icon(
+                                        Icons.edit,
                                         color: Colors.white70,
-                                        fontWeight: FontWeight.w700,
+                                        size: 20,
                                       ),
-                                    ),
-                                    const Spacer(),
-                                    Text(
-                                      _supplyLeftDraft.toString(),
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 18,
-                                        fontWeight: FontWeight.w900,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    const Icon(
-                                      Icons.edit,
-                                      color: Colors.white70,
-                                      size: 18,
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                    ],
+                                    ],
+                                  ),
+                                )),
+                  ),
+                  IconButton(
+                    onPressed: _cancelAddFlow,
+                    icon: const Icon(Icons.close, color: white),
+                  ),
+                ],
+              ),
 
-                    // ---------------- CONFIG STEP ----------------
-                    if (_step == _ConfigStep.config) ...[
-                      // Times per day
-                      Row(
-                        children: [
-                          const Icon(Icons.schedule, color: white),
-                          const SizedBox(width: 10),
-                          const Text(
-                            'Times per day',
-                            style: TextStyle(color: white),
-                          ),
-                          const Spacer(),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                            decoration: BoxDecoration(
-                              color: white,
-                              borderRadius: BorderRadius.circular(12),
+              const SizedBox(height: 10),
+
+              AnimatedSize(
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeInOut,
+                child: Container(
+                  width: double.infinity,
+                  height: _step == _ConfigStep.name ? 120 : 120,
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: _lockPillName
+                      ? SingleChildScrollView(
+                          child: Text(
+                            (_selectedPillInfo != null &&
+                                    _selectedPillInfo!.trim().isNotEmpty)
+                                ? _selectedPillInfo!
+                                : 'Medication info unavailable right now.',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: _infoFontSizeFor(
+                                _selectedPillInfo ?? '',
+                              ),
+                              height: 1.25,
                             ),
-                            child: DropdownButton<int>(
-                              value: _timesPerDay,
-                              underline: const SizedBox.shrink(),
-                              items: List.generate(6, (i) => i + 1)
-                                  .map(
-                                    (n) => DropdownMenuItem(
-                                      value: n,
-                                      child: Text('$n'),
-                                    ),
-                                  )
-                                  .toList(),
-                              onChanged: (v) {
-                                if (v == null) return;
-                                setState(() {
-                                  _timesPerDay = v;
-                                  _singleDoseTime = null;
-                                  _doseTimes = [];
-                                });
+                          ),
+                        )
+                      : TextField(
+                          controller: _customInfoController,
+                          expands: true,
+                          minLines: null,
+                          maxLines: null,
+                          textAlignVertical: TextAlignVertical.top,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: _infoFontSizeFor(
+                              _customInfoController.text,
+                              base: 15,
+                            ),
+                            height: 1.25,
+                          ),
+                          decoration: const InputDecoration(
+                            hintText: 'Edit pill info here',
+                            hintStyle: TextStyle(color: Colors.white70),
+                            border: InputBorder.none,
+                            isCollapsed: true,
+                          ),
+                        ),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              if (_step != _ConfigStep.name && _supplyModeGlobal != 'off') ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: Column(
+                    children: [
+                      if (_supplyModeGlobal == 'decide') ...[
+                        Row(
+                          children: [
+                            const Text(
+                              'Track supply',
+                              style: TextStyle(
+                                color: white,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            GestureDetector(
+                              onTap: _showSupplyInfoDialog,
+                              child: const Icon(
+                                Icons.info_outline,
+                                color: Colors.white70,
+                                size: 20,
+                              ),
+                            ),
+                            const Spacer(),
+                            Switch(
+                              value: _supplyTrackOn,
+                              onChanged: (v) async {
+                                if (!mounted) return;
+
+                                if (!v) {
+                                  setState(() {
+                                    _supplyTrackOn = false;
+                                    _supplyLeftDraft = 0;
+                                    _supplyInitialDraft = 0;
+                                  });
+                                  return;
+                                }
+
+                                setState(() => _supplyTrackOn = true);
+                                await _editSupplyDialog(setInitialToo: true);
+
+                                if (!mounted) return;
+                                if (_supplyLeftDraft <= 0) {
+                                  setState(() => _supplyTrackOn = false);
+                                }
                               },
                             ),
-                          ),
-                        ],
-                      ),
-
-                      const SizedBox(height: 10),
-
-                      // Single time picker (only when 1x/day)
-                      if (_timesPerDay == 1)
-                        Container(
-                          height: 48,
-                          decoration: BoxDecoration(
-                            color: white,
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(14),
-                            onTap: _pickTimeSingle,
-                            child: Center(
-                              child: Text(
-                                _singleDoseTime == null
-                                    ? 'Pick time'
-                                    : _fmt(_singleDoseTime!),
-                                style: const TextStyle(
-                                  color: cardColor,
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 18,
-                                ),
+                          ],
+                        ),
+                      ] else ...[
+                        Row(
+                          children: [
+                            const Text(
+                              'Supply',
+                              style: TextStyle(
+                                color: white,
+                                fontWeight: FontWeight.w700,
                               ),
                             ),
-                          ),
-                        ),
-                    ],
-
-                    // ---------------- DOSES STEP ----------------
-                    if (_step == _ConfigStep.doses)
-                      SizedBox(
-                        height: 220,
-                        child: ListView.separated(
-                          itemCount: _timesPerDay,
-                          separatorBuilder: (_, __) =>
-                              const SizedBox(height: 10),
-                          itemBuilder: (context, i) {
-                            final t = _doseTimes[i];
-                            return Container(
-                              decoration: BoxDecoration(
-                                color: white,
-                                borderRadius: BorderRadius.circular(16),
+                            const SizedBox(width: 6),
+                            GestureDetector(
+                              onTap: _showSupplyInfoDialog,
+                              child: const Icon(
+                                Icons.info_outline,
+                                color: Colors.white70,
+                                size: 20,
                               ),
-                              child: ListTile(
-                                title: Text(
-                                  'Dose ${i + 1}',
-                                  style: const TextStyle(
-                                    color: cardColor,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                subtitle: Text(
-                                  t == null ? 'Tap to set time' : _fmt(t),
-                                  style: const TextStyle(color: cardColor),
-                                ),
-                                trailing: const Icon(
-                                  Icons.schedule,
-                                  color: cardColor,
-                                ),
-                                onTap: () => _pickDoseTime(i),
+                            ),
+                            const Spacer(),
+                            const Text(
+                              'Always On',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontWeight: FontWeight.w700,
                               ),
-                            );
-                          },
+                            ),
+                          ],
                         ),
-                      )
-                    else
-                      const SizedBox(height: 12),
+                        const SizedBox(height: 8),
+                      ],
 
-                    // ---------------- PRIMARY BUTTON ----------------
-                    SizedBox(
-                      width: double.infinity,
-                      height: 56,
-                      child: Material(
-                        color: green,
-                        borderRadius: BorderRadius.circular(18),
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(18),
-                          onTap: _handlePrimaryAction,
+                      if ((_supplyModeGlobal == 'on') ||
+                          (_supplyModeGlobal == 'decide' &&
+                              _supplyTrackOn)) ...[
+                        const SizedBox(height: 8),
+                        InkWell(
+                          onTap: () => _editSupplyDialog(setInitialToo: false),
                           child: Row(
                             children: [
-                              const SizedBox(width: 16),
-                              Expanded(
-                                child: Center(
-                                  child: Text(
-                                    titleText,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 22,
-                                      fontWeight: FontWeight.w800,
-                                    ),
-                                  ),
+                              const Text(
+                                'Supply left',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontWeight: FontWeight.w700,
                                 ),
                               ),
-                              const SizedBox(
-                                width: 56,
-                                height: 56,
-                                child: Icon(
-                                  Icons.add,
+                              const Spacer(),
+                              Text(
+                                _supplyLeftDraft.toString(),
+                                style: const TextStyle(
                                   color: Colors.white,
-                                  size: 34,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w900,
                                 ),
+                              ),
+                              const SizedBox(width: 8),
+                              const Icon(
+                                Icons.edit,
+                                color: Colors.white70,
+                                size: 18,
                               ),
                             ],
                           ),
                         ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
+
+              if (_step == _ConfigStep.config) ...[
+                Row(
+                  children: [
+                    const Icon(Icons.schedule, color: white),
+                    const SizedBox(width: 10),
+                    const Text('Times per day', style: TextStyle(color: white)),
+                    const Spacer(),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      decoration: BoxDecoration(
+                        color: white,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: DropdownButton<int>(
+                        value: _timesPerDay,
+                        underline: const SizedBox.shrink(),
+                        items: List.generate(6, (i) => i + 1)
+                            .map(
+                              (n) =>
+                                  DropdownMenuItem(value: n, child: Text('$n')),
+                            )
+                            .toList(),
+                        onChanged: (v) {
+                          if (v == null) return;
+                          setState(() {
+                            _timesPerDay = v;
+                            _singleDoseTime = null;
+                            _doseTimes = [];
+                          });
+                        },
                       ),
                     ),
                   ],
                 ),
+
+                const SizedBox(height: 10),
+
+                if (_timesPerDay == 1)
+                  Container(
+                    height: 48,
+                    decoration: BoxDecoration(
+                      color: white,
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(14),
+                      onTap: _pickTimeSingle,
+                      child: Center(
+                        child: Text(
+                          _singleDoseTime == null
+                              ? 'Pick time'
+                              : _fmt(_singleDoseTime!),
+                          style: const TextStyle(
+                            color: cardColor,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 18,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+
+              if (_step == _ConfigStep.doses)
+                Column(
+                  children: [
+                    for (int i = 0; i < _timesPerDay; i++) ...[
+                      Builder(
+                        builder: (context) {
+                          final t = _doseTimes[i];
+                          return Container(
+                            decoration: BoxDecoration(
+                              color: white,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: ListTile(
+                              title: Text(
+                                'Dose ${i + 1}',
+                                style: const TextStyle(
+                                  color: cardColor,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              subtitle: Text(
+                                t == null ? 'Tap to set time' : _fmt(t),
+                                style: const TextStyle(color: cardColor),
+                              ),
+                              trailing: const Icon(
+                                Icons.schedule,
+                                color: cardColor,
+                              ),
+                              onTap: () => _pickDoseTime(i),
+                            ),
+                          );
+                        },
+                      ),
+                      if (i < _timesPerDay - 1) const SizedBox(height: 10),
+                    ],
+                  ],
+                )
+              else
+                const SizedBox(height: 12),
+
+              SizedBox(
+                width: double.infinity,
+                height: 56,
+                child: Material(
+                  color: green,
+                  borderRadius: BorderRadius.circular(18),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(18),
+                    onTap: _handlePrimaryAction,
+                    child: Row(
+                      children: [
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: Center(
+                            child: Text(
+                              titleText,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 22,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(
+                          width: 56,
+                          height: 56,
+                          child: Icon(Icons.add, color: Colors.white, size: 34),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
               ),
-            );
-          },
+            ],
+          ),
         ),
       ),
     );
@@ -2963,12 +3575,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ? rawScale.clamp(0.78, 1.12)
         : rawScale.clamp(0.8, 1.3);
 
+    final buildDayKey =
+        DateTime.now().year * 10000 +
+        DateTime.now().month * 100 +
+        DateTime.now().day;
+
+    if (buildDayKey != _lastSeenDayKey) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        unawaited(_refreshForDateJumpIfNeeded());
+      });
+    }
+
     double s(double v) => v * scale;
     double fs(double v) => v * scale;
 
-    final configH = _step == _ConfigStep.doses
-        ? (Platform.isAndroid ? s(620) : s(560))
-        : (Platform.isAndroid ? s(520) : s(480));
+    final configH = _configPanelHeight(s);
+    final infoPanelH = _infoPanelHeight(s);
 
     final double stripW = s(800);
     final double stripH = s(1383);
@@ -2987,7 +3610,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         : Offset.zero;
 
     final bottomSlidDown = (_configOpen || _infoOpen || _searchOpen);
-    final bottomDecorOpacity = bottomSlidDown ? 0.0 : 1.0;
+    final showPillNameBackPlate =
+        pillNames.isNotEmpty && _wheelSelectedIndex != 0;
+    final bottomDecorOpacity = (!bottomSlidDown && showPillNameBackPlate)
+        ? 1.0
+        : 0.0;
+
+    final sideZoneButtonsHidden = _configOpen || _infoOpen || _searchOpen;
 
     final wheelLocked = _pendingSlot;
 
@@ -3002,6 +3631,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final displaySupplyValue = showSupplyBadge
         ? supplyLeftValue
         : _supplyBadgeCacheValue;
+
+    final tutorialSteps = _tutorialStepsForLayout(
+      size: size,
+      s: s,
+      designW: designW,
+      topShift: topShift,
+    );
 
     final supplyNumberColor = (displaySupplyValue <= 0)
         ? const Color.fromARGB(255, 255, 30, 71) // red
@@ -3130,8 +3766,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   int totalDoses = doses.length;
                   int activeDoseIndex = 0;
                   int mask = 0;
-                  int checkedCount = 0;
-                  bool dayCompleteForPill = false;
+                  int missedMask = 0;
 
                   if (showLeft) {
                     final w = _computeDoseWindow(
@@ -3140,14 +3775,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     );
 
                     final cycleIso = w.cycleStart.toIso8601String();
+
                     final stored = map['$idx'] as String?;
                     final parsed = _readCycleAndMask(stored);
-
                     mask = (parsed.cycleIso == cycleIso) ? parsed.mask : 0;
-                    checkedCount = _bitCount(mask).clamp(0, totalDoses);
-                    dayCompleteForPill = checkedCount >= totalDoses;
+
+                    final storedMissed = _lastMissedMapCache['$idx'] as String?;
+                    final parsedMissed = _readCycleAndMask(storedMissed);
+                    missedMask = (parsedMissed.cycleIso == cycleIso)
+                        ? parsedMissed.mask
+                        : 0;
+
                     activeDoseIndex = w.doseIndex;
+
+                    _lastDoseBarTotalDoses = totalDoses;
+                    _lastDoseBarActiveDoseIndex = activeDoseIndex;
+                    _lastDoseBarCheckedMask = mask;
+                    _lastDoseBarMissedMask = missedMask;
+                    _hasDoseBarCache = true;
                   }
+
+                  final barTotalDoses = showLeft
+                      ? totalDoses
+                      : (_hasDoseBarCache ? _lastDoseBarTotalDoses : 2);
+
+                  final barActiveDoseIndex = showLeft
+                      ? activeDoseIndex
+                      : (_hasDoseBarCache ? _lastDoseBarActiveDoseIndex : 0);
+
+                  final barCheckedMask = showLeft
+                      ? mask
+                      : (_hasDoseBarCache ? _lastDoseBarCheckedMask : 0);
+
+                  final barMissedMask = showLeft
+                      ? missedMask
+                      : (_hasDoseBarCache ? _lastDoseBarMissedMask : 0);
 
                   final allDone = _areAllPillsComplete(map);
 
@@ -3173,9 +3835,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           height: s(70),
                           child: IgnorePointer(
                             child: DoseProgressSideBar(
-                              totalDoses: totalDoses,
-                              activeDoseIndex: activeDoseIndex,
-                              checkedMask: mask,
+                              totalDoses: barTotalDoses,
+                              activeDoseIndex: barActiveDoseIndex,
+                              checkedMask: barCheckedMask,
+                              missedMask: barMissedMask,
                               height: s(70),
                             ),
                           ),
@@ -3508,7 +4171,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
                     // --- CHECK BUTTON (last so it gets touches) ---
                     Positioned(
-                      left: _leftFromDesignRight(135, 137, size, s, designW),
+                      left:
+                          _leftFromDesignRight(135, 137, size, s, designW) -
+                          s(1),
                       bottom: s(100),
                       child: FutureBuilder<Map<String, dynamic>>(
                         future: _checkMapFuture,
@@ -3516,10 +4181,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           final pillIndex = _centerPillIndex;
                           final map = snap.data ?? {};
 
-                          // only keep this line if you actually declared _lastCheckMapCache
                           _lastCheckMapCache = map;
 
                           bool checked = false;
+                          bool missed = false;
+                          String checkButtonKey = 'check_empty';
+
                           if (pillIndex != null) {
                             final doses = _doseTimesForPill(pillIndex);
                             final w = _computeDoseWindow(
@@ -3534,6 +4201,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                               cycleIso,
                               w.doseIndex,
                             );
+
+                            missed = _isCurrentDoseMissed(
+                              pillIndex: pillIndex,
+                              map: map,
+                            );
+
+                            checkButtonKey =
+                                'check_${pillIndex}_${cycleIso}_${w.doseIndex}_${checked ? 1 : 0}_${missed ? 1 : 0}';
                           }
 
                           final bool disable =
@@ -3545,7 +4220,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           return AbsorbPointer(
                             absorbing: disable,
                             child: PillCheckButton(
+                              key: ValueKey(checkButtonKey),
                               checked: checked,
+                              missed: missed,
                               onChecked: _checkCenteredPill,
                               size: s(135),
                               baseColor: const Color(0xFFFF002E),
@@ -3679,8 +4356,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ),
                     // --- WARNING ICON (bottom-right) ---
                     Positioned(
-                      right: s(5),
-                      bottom: s(5),
+                      right: s(10),
+                      bottom: s(8),
                       child: IgnorePointer(
                         ignoring: _configOpen || _infoOpen,
                         child: Opacity(
@@ -3697,6 +4374,138 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                     Icons.warning_rounded,
                                     size: s(75),
                                     color: const Color(0xFFE72447),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    // --- CALENDAR BUTTON (left side-zone tab) ---
+                    AnimatedPositioned(
+                      duration: const Duration(milliseconds: 320),
+                      curve: Curves.easeInOutCubic,
+                      left: sideZoneButtonsHidden ? -s(110) : s(-10),
+                      bottom: s(460),
+                      child: IgnorePointer(
+                        ignoring: sideZoneButtonsHidden,
+                        child: AnimatedOpacity(
+                          duration: const Duration(milliseconds: 180),
+                          curve: Curves.easeInOut,
+                          opacity: sideZoneButtonsHidden ? 0.0 : 1.0,
+                          child: Material(
+                            color: const Color(0xFF1E3A8A),
+                            borderRadius: BorderRadius.only(
+                              topRight: Radius.circular(s(18)),
+                              bottomRight: Radius.circular(s(18)),
+                            ),
+                            elevation: 3,
+                            child: InkWell(
+                              borderRadius: BorderRadius.only(
+                                topRight: Radius.circular(s(18)),
+                                bottomRight: Radius.circular(s(18)),
+                              ),
+                              onTap: _openCalendarScreen,
+                              child: SizedBox(
+                                width: s(72),
+                                height: s(58),
+                                child: Center(
+                                  child: Icon(
+                                    Icons.calendar_month_rounded,
+                                    size: s(30),
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    // --- STREAK BUTTON (right side-zone tab) ---
+                    AnimatedPositioned(
+                      duration: const Duration(milliseconds: 320),
+                      curve: Curves.easeInOutCubic,
+                      right: sideZoneButtonsHidden ? -s(110) : s(-10),
+                      bottom: s(460),
+                      child: IgnorePointer(
+                        ignoring: sideZoneButtonsHidden,
+                        child: AnimatedOpacity(
+                          duration: const Duration(milliseconds: 180),
+                          curve: Curves.easeInOut,
+                          opacity: sideZoneButtonsHidden ? 0.0 : 1.0,
+                          child: Material(
+                            color: const Color.fromARGB(251, 88, 255, 85),
+                            borderRadius: BorderRadius.only(
+                              topLeft: Radius.circular(s(18)),
+                              bottomLeft: Radius.circular(s(18)),
+                            ),
+                            elevation: 3,
+                            child: InkWell(
+                              borderRadius: BorderRadius.only(
+                                topLeft: Radius.circular(s(18)),
+                                bottomLeft: Radius.circular(s(18)),
+                              ),
+                              onTap: () async {
+                                await showDialog<void>(
+                                  context: context,
+                                  builder: (ctx) => AlertDialog(
+                                    title: const Text('Streaks'),
+                                    content: const Text('Coming soon!'),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () => Navigator.pop(ctx),
+                                        child: const Text('OK'),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                              child: SizedBox(
+                                width: s(72),
+                                height: s(58),
+                                child: Center(
+                                  child: Transform.translate(
+                                    offset: Offset(-s(4), 0),
+                                    child: SizedBox(
+                                      width: s(34),
+                                      height: s(34),
+                                      child: Stack(
+                                        alignment: Alignment.center,
+                                        children: [
+                                          Positioned(
+                                            top: s(14),
+                                            left: s(12),
+                                            child: Container(
+                                              width: s(15),
+                                              height: s(15),
+                                              decoration: const BoxDecoration(
+                                                color: const Color.fromARGB(
+                                                  255,
+                                                  255,
+                                                  177,
+                                                  74,
+                                                ),
+                                                shape: BoxShape.circle,
+                                              ),
+                                            ),
+                                          ),
+                                          Icon(
+                                            Icons.whatshot_rounded,
+                                            size: s(34),
+                                            color: const Color.fromARGB(
+                                              255,
+                                              255,
+                                              116,
+                                              66,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
@@ -3838,7 +4647,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       child: InkWell(
                         borderRadius: BorderRadius.circular(s(999)),
                         onTap: () async {
-                          final changed = await Navigator.push<bool>(
+                          final result = await Navigator.push<Object?>(
                             context,
                             MaterialPageRoute(
                               builder: (_) => const SettingsScreen(),
@@ -3847,11 +4656,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
                           if (!mounted) return;
 
-                          debugPrint(
-                            'HOME: settings returned changed=$changed',
-                          );
-
-                          if (changed == true) {
+                          if (result == true) {
                             await NotificationService.loadUserNotificationSettings();
                             await _loadSupplyGlobalSettings();
                             await _rebuild2DayNotifWindow(
@@ -3862,6 +4667,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             );
                             _scheduleGlobalBoundaryRefresh();
                             unawaited(_scheduleGlobalDayBoundaryRefresh());
+                          } else if (result == 'tutorial') {
+                            _startTutorial();
                           }
                         },
                         child: SizedBox(
@@ -3938,7 +4745,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               top: _infoOpen
                   ? s(165)
                   : MediaQuery.of(context).size.height + s(50),
-              height: s(520),
+              height: infoPanelH,
               child: Builder(
                 builder: (_) {
                   final idx = _centerPillIndex;
@@ -3948,6 +4755,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ? <TimeOfDay>[]
                       : _doseTimesForPill(idx);
                   final doseLabels = doses.map(_fmt).toList();
+
+                  final isCustomPill =
+                      idx != null &&
+                      idx < pillNameLocked.length &&
+                      pillNameLocked[idx] == false;
+
+                  final customInfoText =
+                      (idx != null && idx < pillCustomInfo.length)
+                      ? pillCustomInfo[idx]
+                      : '';
 
                   return PillInfoPanel(
                     pillName: name,
@@ -3960,6 +4777,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     },
                     onDelete: idx == null ? null : _deleteCenteredPill,
                     rxNormService: _rxNormService,
+                    isCustomPill: isCustomPill,
+                    customInfoText: customInfoText,
 
                     // ✅ Hide supply section entirely when global mode is Always Off
                     supplyTrackingOn:
@@ -3987,6 +4806,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               height: configH,
               child: _configPanel(),
             ),
+
+            // --- TUTORIAL OVERLAY (absolute topmost) ---
+            if (_tutorialActive)
+              Positioned.fill(
+                child: TutorialSpotlightOverlay(
+                  targetRect: tutorialSteps[_tutorialIndex].targetRect,
+                  title: tutorialSteps[_tutorialIndex].title,
+                  description: tutorialSteps[_tutorialIndex].description,
+                  stepNumber: _tutorialIndex + 1,
+                  totalSteps: tutorialSteps.length,
+                  onBack: _tutorialIndex == 0 ? null : _prevTutorialStep,
+                  onNext: () => _nextTutorialStep(tutorialSteps.length),
+                  onClose: _closeTutorial,
+                  isLast: _tutorialIndex == tutorialSteps.length - 1,
+                  cardAtTop: _tutorialIndex >= 2 && _tutorialIndex <= 5,
+                ),
+              ),
           ],
         ),
       ),
@@ -4027,4 +4863,16 @@ class DayCompleteCircle extends StatelessWidget {
       ),
     );
   }
+}
+
+class _TutorialStep {
+  const _TutorialStep({
+    required this.title,
+    required this.description,
+    required this.targetRect,
+  });
+
+  final String title;
+  final String description;
+  final Rect targetRect;
 }

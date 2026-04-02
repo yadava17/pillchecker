@@ -14,6 +14,8 @@ class PillInfoPanel extends StatefulWidget {
     required this.rxNormService,
     this.supplyTrackingOn = false,
     this.supplyLeft = 0,
+    this.isCustomPill = false,
+    this.customInfoText = '',
   });
 
   final String pillName;
@@ -25,6 +27,9 @@ class PillInfoPanel extends StatefulWidget {
   final bool supplyTrackingOn;
   final int supplyLeft;
 
+  final bool isCustomPill;
+  final String customInfoText;
+
   @override
   State<PillInfoPanel> createState() => _PillInfoPanelState();
 }
@@ -35,15 +40,29 @@ class _PillInfoPanelState extends State<PillInfoPanel> {
   @override
   void initState() {
     super.initState();
-    _detailsFuture = _loadDetails();
+    _detailsFuture = widget.isCustomPill ? Future.value(null) : _loadDetails();
   }
 
   @override
   void didUpdateWidget(covariant PillInfoPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.pillName != widget.pillName) {
-      _detailsFuture = _loadDetails();
+    if (oldWidget.pillName != widget.pillName ||
+        oldWidget.isCustomPill != widget.isCustomPill ||
+        oldWidget.customInfoText != widget.customInfoText) {
+      _detailsFuture = widget.isCustomPill
+          ? Future.value(null)
+          : _loadDetails();
     }
+  }
+
+  double _infoFontSizeFor(String text, {double base = 14}) {
+    final len = text.trim().length;
+    if (len > 900) return 11.5;
+    if (len > 700) return 12.0;
+    if (len > 520) return 12.6;
+    if (len > 360) return 13.0;
+    if (len > 220) return 13.5;
+    return base;
   }
 
   Future<MedicationDetails?> _loadDetails() async {
@@ -124,49 +143,60 @@ class _PillInfoPanelState extends State<PillInfoPanel> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.12),
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                      child: FutureBuilder<MedicationDetails?>(
-                        future: _detailsFuture,
-                        builder: (context, snap) {
-                          if (snap.connectionState == ConnectionState.waiting) {
-                            return const SizedBox(
-                              height: 38,
-                              child: Center(
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
+                    AnimatedSize(
+                      duration: const Duration(milliseconds: 180),
+                      curve: Curves.easeInOut,
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(18),
+                        ),
+                        child: widget.isCustomPill
+                            ? Text(
+                                widget.customInfoText.trim().isEmpty
+                                    ? 'Edit pill info here.'
+                                    : widget.customInfoText.trim(),
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: _infoFontSizeFor(
+                                    widget.customInfoText,
+                                  ),
+                                  height: 1.25,
                                 ),
-                              ),
-                            );
-                          }
+                              )
+                            : FutureBuilder<MedicationDetails?>(
+                                future: _detailsFuture,
+                                builder: (context, snap) {
+                                  if (snap.connectionState ==
+                                      ConnectionState.waiting) {
+                                    return const SizedBox(
+                                      height: 38,
+                                      child: Center(
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      ),
+                                    );
+                                  }
 
-                          final d = snap.data;
-                          if (d == null) {
-                            return const Text(
-                              'RxNorm details not available right now.\n\n'
-                              'This pill may not match RxNorm results (or you need internet).',
-                              style: TextStyle(
-                                color: Colors.white70,
-                                fontSize: 15,
-                                height: 1.25,
-                              ),
-                            );
-                          }
+                                  final d = snap.data;
+                                  final text =
+                                      d?.userFriendlyInfoText ??
+                                      'RxNorm details not available right now.\n\n'
+                                          'This pill may not match RxNorm results (or you need internet).';
 
-                          return Text(
-                            d.userFriendlyInfoText,
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 14,
-                              height: 1.25,
-                            ),
-                          );
-                        },
+                                  return Text(
+                                    text,
+                                    style: TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: _infoFontSizeFor(text),
+                                      height: 1.25,
+                                    ),
+                                  );
+                                },
+                              ),
                       ),
                     ),
                     const SizedBox(height: 12),

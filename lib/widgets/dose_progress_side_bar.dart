@@ -7,12 +7,14 @@ class DoseProgressSideBar extends StatelessWidget {
     required this.totalDoses,
     required this.activeDoseIndex,
     required this.checkedMask,
+    required this.missedMask,
     this.height = 68,
   });
 
-  final int totalDoses; // 2..6 for your use case
-  final int activeDoseIndex; // current dose window index
-  final int checkedMask; // bitmask from HomeScreen check map
+  final int totalDoses;
+  final int activeDoseIndex;
+  final int checkedMask;
+  final int missedMask;
   final double height;
 
   int _bitCount(int x) {
@@ -59,6 +61,7 @@ class DoseProgressSideBar extends StatelessWidget {
                   painter: _DosePiePainter(
                     totalDoses: doses,
                     checkedMask: checkedMask,
+                    missedMask: missedMask,
                   ),
                 ),
                 if (complete)
@@ -93,10 +96,15 @@ class DoseProgressSideBar extends StatelessWidget {
 }
 
 class _DosePiePainter extends CustomPainter {
-  _DosePiePainter({required this.totalDoses, required this.checkedMask});
+  _DosePiePainter({
+    required this.totalDoses,
+    required this.checkedMask,
+    required this.missedMask,
+  });
 
   final int totalDoses;
   final int checkedMask;
+  final int missedMask;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -111,10 +119,13 @@ class _DosePiePainter extends CustomPainter {
 
     for (int i = 0; i < totalDoses; i++) {
       final filled = (checkedMask & (1 << i)) != 0;
+      final missed = (missedMask & (1 << i)) != 0;
 
       fillPaint.color = filled
           ? const Color(0xFF59FF56)
-          : const Color.fromARGB(90, 255, 255, 255);
+          : missed
+              ? const Color(0xFFFF002E)
+              : const Color.fromARGB(90, 255, 255, 255);
 
       canvas.drawArc(
         rect,
@@ -162,6 +173,7 @@ class _DosePiePainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _DosePiePainter oldDelegate) {
     return oldDelegate.totalDoses != totalDoses ||
-        oldDelegate.checkedMask != checkedMask;
+        oldDelegate.checkedMask != checkedMask ||
+        oldDelegate.missedMask != missedMask;
   }
 }
