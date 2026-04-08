@@ -513,7 +513,7 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
               // ✅ logo
               Positioned(
                 top: Platform.isAndroid ? 10 : 0,
-                left: Platform.isAndroid ? 112 : 82,
+                left: Platform.isAndroid ? 80 : 82,
                 child: Opacity(
                   opacity: 0.75,
                   child: Image.asset(
@@ -527,7 +527,7 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
 
               // ✅ title
               Positioned(
-                top: Platform.isAndroid ? 23 : 34,
+                top: Platform.isAndroid ? 28 : 34,
                 left: Platform.isAndroid ? 168 : 158,
                 right: 24,
                 child: Text(
