@@ -512,7 +512,7 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
 
               // ✅ logo
               Positioned(
-                top: Platform.isAndroid ? -8 : -18,
+                top: Platform.isAndroid ? -4 : -12,
                 left: Platform.isAndroid ? 45 : 50,
                 child: Opacity(
                   opacity: 0.75,
