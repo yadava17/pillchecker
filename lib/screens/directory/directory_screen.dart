@@ -512,8 +512,8 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
 
               // ✅ logo
               Positioned(
-                top: Platform.isAndroid ? 6 : -2,
-                left: Platform.isAndroid ? 65 : 70,
+                top: Platform.isAndroid ? -8 : -18,
+                left: Platform.isAndroid ? 45 : 50,
                 child: Opacity(
                   opacity: 0.75,
                   child: Image.asset(
@@ -528,7 +528,7 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
               // ✅ title
               Positioned(
                 top: Platform.isAndroid ? 32 : 38,
-                left: Platform.isAndroid ? 150 : 145,
+                left: Platform.isAndroid ? 120 : 115,
                 right: 24,
                 child: Text(
                   'PillChecker',
