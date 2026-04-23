@@ -133,10 +133,12 @@ class _PillCheckButtonState extends State<PillCheckButton>
               ? 0.0
               : (widget.checked ? 1.0 : _holdCtrl.value);
 
-          final visuallyComplete =
-              showMissed || widget.checked || _holdCtrl.value >= 0.999;
+          // Only use the oversized scale for the completed/check state.
+          // Do NOT scale the missed state, or the red circle overflows the layout.
+          final isFillComplete =
+              widget.checked || (!showMissed && _holdCtrl.value >= 0.999);
 
-          final scaleValue = visuallyComplete ? fullCoverScale : 1.0;
+          final scaleValue = isFillComplete ? fullCoverScale : 1.0;
 
           return Transform.scale(
             scale: scaleValue,
