@@ -51,6 +51,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       'pill_check_state'; // json map: pillIndex -> "cycleIso|mask"
   static const _seenPromptKey = 'seen_first_pill_prompt';
 
+  static const _pillMissedKey = 'pill_missed_state_v1';
+
   static const _pillDoseTimesKey =
       'pill_dose_times_v2'; // JSON: List<List<String>>
 
@@ -102,7 +104,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _refreshCheckMapFuture() {
     if (!mounted) return;
     setState(() {
-      _checkMapFuture = _loadCheckMap();
+      _checkMapFuture = Future.value(Map<String, dynamic>.from(_checkMapCache));
     });
   }
 
@@ -327,13 +329,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // Low supply notification (once) when it goes under threshold
     final alreadySent = pillSupplyLowSent[pillIndex];
 
-    // ✅ only warn when we CROSS into low territory and we had real supply
-    final shouldWarnLow =
-        !alreadySent && newLeft > 0 && newLeft < _supplyLowThreshold;
+    // Fire only when crossing from above the user threshold into
+    // the low zone (at-or-below threshold, but still above 0).
+    final crossedIntoLow =
+        oldLeft > _supplyLowThreshold &&
+        newLeft > 0 &&
+        newLeft <= _supplyLowThreshold;
+
+    final shouldWarnLow = !alreadySent && crossedIntoLow;
 
     if (shouldWarnLow) {
       setState(() => pillSupplyLowSent[pillIndex] = true);
       unawaited(_saveSupplyListsToPrefs());
+
+      debugPrint(
+        'LOW SUPPLY WARNING: pill=${pillNames[pillIndex]} '
+        'oldLeft=$oldLeft newLeft=$newLeft threshold=$_supplyLowThreshold',
+      );
 
       unawaited(
         NotificationService.scheduleLowSupplyWarning(
@@ -510,27 +522,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _startNewDaySequence(today: today);
   }
 
-  Future<void> _maybeResetForNewCycle() async {
+  Future<void> _syncCurrentCycleAnchorOnly() async {
     final prefs = await SharedPreferences.getInstance();
+    final cycleStart = _globalCycleStartForNow(DateTime.now());
 
-    final now = DateTime.now();
-    final cycleStart = _globalCycleStartForNow(now);
-    if (cycleStart == null) return;
+    if (cycleStart == null) {
+      await prefs.remove(kLastCycleStartKey);
+      return;
+    }
 
-    final currentIso = cycleStart.toIso8601String();
-    final lastIso = prefs.getString(kLastCycleStartKey);
+    await prefs.setString(kLastCycleStartKey, cycleStart.toIso8601String());
+  }
 
-    if (lastIso == currentIso) return; // same cycle, nothing to do
-
-    // New cycle/day → clear check state so notifications can schedule again
-    final cleared = <String, dynamic>{};
-    await _saveCheckMap(cleared);
-    _setCheckMapAndRebuild(cleared);
-    _refreshCheckMapFuture();
-
-    await prefs.setString(kLastCycleStartKey, currentIso);
-
-    debugPrint('CYCLE RESET: $lastIso -> $currentIso (cleared checkMap)');
+  Future<void> _maybeResetForNewCycle() async {
+    // ✅ Do NOT clear local masks here anymore.
+    // HomeScreen already ignores stale masks when the stored cycleIso
+    // does not match the currently computed cycleIso.
+    await _syncCurrentCycleAnchorOnly();
   }
 
   void _startTutorial() {
@@ -617,7 +625,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         description:
             'Open Settings to change reminders, supply tracking, feedback, credits, and to run this tutorial again later.',
         targetRect: rectFromTop(
-          left: Platform.isIOS ? s(350) : s(340),
+          left: s(350),
           top: s(45) + topShift,
           width: s(80),
           height: s(75),
@@ -696,13 +704,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (pillIndex < 0 || pillIndex >= pillDoseTimes.length) {
       return [const TimeOfDay(hour: 8, minute: 0)];
     }
-    final list = pillDoseTimes[pillIndex];
-    final times = list.map(_strToTime).toList();
 
-    times.sort(
-      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
-    );
-    return times;
+    final list = pillDoseTimes[pillIndex];
+    return list.map(_strToTime).toList(growable: false);
   }
 
   ({
@@ -715,27 +719,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     bool dayComplete,
   })
   _getActiveDoseStateForPill(int pillIndex) {
-    final now = DateTime.now();
+    final doses = _doseTimesForPill(pillIndex);
 
-    final doses = _doseTimesForPill(pillIndex); // sorted TimeOfDay list
-    final w = _computeDoseWindow(now: now, dosesSorted: doses);
+    final state = _getDisplayedDoseStateForPill(
+      pillIndex: pillIndex,
+      doses: doses,
+      takenMap: _lastCheckMapCache,
+      missedMap: _lastMissedMapCache,
+    );
 
-    final cycleIso = w.cycleStart.toIso8601String();
-
-    // read stored mask for this pill
-    final stored = _lastCheckMapCache['$pillIndex'] as String?;
-    final parsed = _readCycleAndMask(stored);
-
-    final mask = (parsed.cycleIso == cycleIso) ? parsed.mask : 0;
-
-    final doseChecked = (mask & (1 << w.doseIndex)) != 0;
+    final mask = state.takenMask;
     final doneCount = _bitCount(mask);
+    final doseChecked = (mask & (1 << state.doseIndex)) != 0;
     final dayComplete = doneCount >= doses.length;
 
     return (
-      doseIndex: w.doseIndex,
+      doseIndex: state.doseIndex,
       totalDoses: doses.length,
-      cycleIso: cycleIso,
+      cycleIso: state.cycleIso,
       mask: mask,
       doneCount: doneCount,
       doseChecked: doseChecked,
@@ -814,17 +815,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // ---------------- helpers: check map ----------------
   Future<Map<String, dynamic>> _loadCheckMap() async {
-    if (pillNames.isEmpty) {
-      _lastCheckMapCache = {};
-      _lastMissedMapCache = {};
-      return {};
+    if (_checkMapCache.isNotEmpty || pillNames.isEmpty) {
+      return Map<String, dynamic>.from(_checkMapCache);
     }
-    if (medicationIds.length != pillNames.length) {
-      await _hydrateMedicationsFromDatabase();
-    }
-    final map = await _deriveCheckMapFromDatabase();
-    _lastCheckMapCache = map;
-    return map;
+
+    await _loadLocalDailyState();
+    return Map<String, dynamic>.from(_checkMapCache);
   }
 
   Future<void> _hydrateMedicationsFromDatabase() async {
@@ -849,11 +845,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final sch = await _scheduleService.getScheduleForMedication(m.id);
       var times = <String>['08:00'];
       if (sch != null) {
-        times =
-            (jsonDecode(sch['times_json']! as String) as List)
-                .map((e) => e.toString())
-                .toList()
-              ..sort((a, b) => a.compareTo(b));
+        times = (jsonDecode(sch['times_json']! as String) as List)
+            .map((e) => e.toString())
+            .toList();
       }
       pillDoseTimes.add(times);
       pillTimes.add(times.isNotEmpty ? times.first : '08:00');
@@ -869,12 +863,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _refreshAdherenceFromDb() async {
     if (medicationIds.isEmpty) return;
+
+    // Keep DB/history/calendar healthy in the background,
+    // but do NOT rebuild HomeScreen state from the DB.
     await _scheduleService.ensureDoseEventsForMedications(medicationIds);
     await _adherenceService.autoMarkMissedPastPlanned();
-    final map = await _deriveCheckMapFromDatabase();
-    await _saveCheckMap(map);
-    if (!mounted) return;
-    _setCheckMapAndRebuild(map);
   }
 
   Future<Map<String, dynamic>> _deriveCheckMapFromDatabase() async {
@@ -888,7 +881,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final doses = _doseTimesForPill(i);
       if (doses.isEmpty) continue;
 
-      final w = _computeDoseWindow(now: now, dosesSorted: doses);
+      final w = _computeDoseWindow(now: now, dosesSorted: doses, pillIndex: i);
       final cycleDay = DateTime(
         w.cycleStart.year,
         w.cycleStart.month,
@@ -897,20 +890,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final cycleIso = w.cycleStart.toIso8601String();
 
       final mid = medicationIds[i];
-      final events = await _adherenceService
-          .getDoseEventsForMedicationOnLocalDay(
-            medicationId: mid,
-            localDay: cycleDay,
-          );
-
       var takenMask = 0;
       var missedMask = 0;
 
-      for (final e in events) {
+      for (int doseIndex = 0; doseIndex < doses.length; doseIndex++) {
+        final plannedIso = plannedAtUtcIsoForOrderedDose(
+          cycleDay,
+          doses,
+          doseIndex,
+        );
+
+        final e = await _adherenceService.findDoseEventForPlannedUtc(
+          medicationId: mid,
+          plannedAtUtcIso: plannedIso,
+        );
+
+        if (e == null) continue;
+
         if (e.status == 'taken') {
-          takenMask |= (1 << e.doseIndex);
+          takenMask |= (1 << doseIndex);
         } else if (e.status == 'missed') {
-          missedMask |= (1 << e.doseIndex);
+          missedMask |= (1 << doseIndex);
         }
       }
 
@@ -969,6 +969,221 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return (cycleIso: parts[0], mask: int.tryParse(parts[1]) ?? 0);
   }
 
+  Map<String, dynamic> _decodeMaskMap(String? raw) {
+    if (raw == null || raw.isEmpty) return <String, dynamic>{};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        return Map<String, dynamic>.from(decoded);
+      }
+    } catch (_) {}
+    return <String, dynamic>{};
+  }
+
+  Future<void> _saveLocalDailyState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_pillCheckKey, jsonEncode(_checkMapCache));
+    await prefs.setString(_pillMissedKey, jsonEncode(_lastMissedMapCache));
+  }
+
+  Future<void> _loadLocalDailyState() async {
+    final prefs = await SharedPreferences.getInstance();
+    _checkMapCache = _decodeMaskMap(prefs.getString(_pillCheckKey));
+    _lastCheckMapCache = Map<String, dynamic>.from(_checkMapCache);
+    _lastMissedMapCache = _decodeMaskMap(prefs.getString(_pillMissedKey));
+    _checkMapFuture = Future.value(Map<String, dynamic>.from(_checkMapCache));
+  }
+
+  void _publishLocalDailyState() {
+    _lastCheckMapCache = Map<String, dynamic>.from(_checkMapCache);
+    if (!mounted) return;
+    setState(() {
+      _checkMapFuture = Future.value(Map<String, dynamic>.from(_checkMapCache));
+    });
+  }
+
+  void _setLocalDoseStatus({
+    required int pillIndex,
+    required String cycleIso,
+    required int doseIndex,
+    required String status, // 'taken' | 'missed'
+  }) {
+    final takenParsed = _readCycleAndMask(
+      _checkMapCache['$pillIndex'] as String?,
+    );
+    final missedParsed = _readCycleAndMask(
+      _lastMissedMapCache['$pillIndex'] as String?,
+    );
+
+    var takenMask = takenParsed.cycleIso == cycleIso ? takenParsed.mask : 0;
+    var missedMask = missedParsed.cycleIso == cycleIso ? missedParsed.mask : 0;
+
+    final bit = 1 << doseIndex;
+
+    if (status == 'taken') {
+      takenMask |= bit;
+      missedMask &= ~bit;
+    } else {
+      missedMask |= bit;
+      takenMask &= ~bit;
+    }
+
+    _checkMapCache['$pillIndex'] = _packCycleAndMask(cycleIso, takenMask);
+    _lastMissedMapCache['$pillIndex'] = _packCycleAndMask(cycleIso, missedMask);
+  }
+
+  Future<void> _persistTakenToDb({
+    required int medicationId,
+    required String plannedIso,
+  }) async {
+    await _scheduleService.ensureDoseEventsForMedication(
+      medicationId,
+      daysBack: 1,
+    );
+    final ev = await _adherenceService.findDoseEventForPlannedUtc(
+      medicationId: medicationId,
+      plannedAtUtcIso: plannedIso,
+    );
+    if (ev == null) return;
+    if (ev.status == 'planned') {
+      await _adherenceService.confirmTaken(ev.id);
+    } else if (ev.status != 'taken') {
+      await _adherenceService.setDoseStatusForOverride(
+        doseEventId: ev.id,
+        finalStatus: 'taken',
+      );
+    }
+  }
+
+  Future<void> _persistMissedToDb({
+    required int medicationId,
+    required String plannedIso,
+  }) async {
+    await _scheduleService.ensureDoseEventsForMedication(
+      medicationId,
+      daysBack: 1,
+    );
+    final ev = await _adherenceService.findDoseEventForPlannedUtc(
+      medicationId: medicationId,
+      plannedAtUtcIso: plannedIso,
+    );
+    if (ev == null) return;
+    if (ev.status != 'missed') {
+      await _adherenceService.setDoseStatusForOverride(
+        doseEventId: ev.id,
+        finalStatus: 'missed',
+      );
+    }
+  }
+
+  int _maskForCycle(Map<String, dynamic> map, int pillIndex, String cycleIso) {
+    final stored = map['$pillIndex'] as String?;
+    final parsed = _readCycleAndMask(stored);
+    return parsed.cycleIso == cycleIso ? parsed.mask : 0;
+  }
+
+  ({
+    int doseIndex,
+    DateTime cycleStart,
+    String cycleIso,
+    int takenMask,
+    int missedMask,
+    int resolvedMask,
+  })
+  _getDisplayedDoseStateForPill({
+    required int pillIndex,
+    required List<TimeOfDay> doses,
+    required Map<String, dynamic> takenMap,
+    required Map<String, dynamic> missedMap,
+    DateTime? now,
+  }) {
+    final currentNow = now ?? DateTime.now();
+    final w = _computeDoseWindow(
+      now: currentNow,
+      dosesSorted: doses,
+      pillIndex: pillIndex,
+    );
+
+    final cycleIso = w.cycleStart.toIso8601String();
+    final takenMask = _maskForCycle(takenMap, pillIndex, cycleIso);
+    final missedMask = _maskForCycle(missedMap, pillIndex, cycleIso);
+    final resolvedMask = takenMask | missedMask;
+
+    if (doses.isEmpty) {
+      return (
+        doseIndex: 0,
+        cycleStart: w.cycleStart,
+        cycleIso: cycleIso,
+        takenMask: takenMask,
+        missedMask: missedMask,
+        resolvedMask: resolvedMask,
+      );
+    }
+
+    final cycleDay = DateTime(
+      w.cycleStart.year,
+      w.cycleStart.month,
+      w.cycleStart.day,
+    );
+
+    // Find the first unresolved dose in this cycle.
+    int? nextUnresolvedIndex;
+    for (int i = 0; i < doses.length; i++) {
+      if ((resolvedMask & (1 << i)) == 0) {
+        nextUnresolvedIndex = i;
+        break;
+      }
+    }
+
+    // If all doses already have a state, keep the last dose active until reset.
+    if (nextUnresolvedIndex == null) {
+      return (
+        doseIndex: doses.length - 1,
+        cycleStart: w.cycleStart,
+        cycleIso: cycleIso,
+        takenMask: takenMask,
+        missedMask: missedMask,
+        resolvedMask: resolvedMask,
+      );
+    }
+
+    // If the very first dose is still unresolved, it should stay active.
+    if (nextUnresolvedIndex == 0) {
+      return (
+        doseIndex: 0,
+        cycleStart: w.cycleStart,
+        cycleIso: cycleIso,
+        takenMask: takenMask,
+        missedMask: missedMask,
+        resolvedMask: resolvedMask,
+      );
+    }
+
+    // Otherwise, keep showing the PREVIOUS dose until 2 hours before the
+    // next unresolved dose. Then switch to the next unresolved dose.
+    final previousIndex = nextUnresolvedIndex - 1;
+
+    final nextPlannedAt = plannedAtLocalForOrderedDose(
+      cycleDay,
+      doses,
+      nextUnresolvedIndex,
+    );
+    final switchAt = nextPlannedAt.subtract(const Duration(hours: 2));
+
+    final activeIndex = currentNow.isBefore(switchAt)
+        ? previousIndex
+        : nextUnresolvedIndex;
+
+    return (
+      doseIndex: activeIndex,
+      cycleStart: w.cycleStart,
+      cycleIso: cycleIso,
+      takenMask: takenMask,
+      missedMask: missedMask,
+      resolvedMask: resolvedMask,
+    );
+  }
+
   List<TimeOfDay> _doseTimesForPillFromLists(
     List<List<String>> doseTimes24h,
     int pillIndex,
@@ -977,13 +1192,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return [const TimeOfDay(hour: 8, minute: 0)];
     }
 
-    final list = doseTimes24h[pillIndex];
-    final times = list.map(_strToTime).toList();
-
-    times.sort(
-      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
-    );
-    return times;
+    return doseTimes24h[pillIndex].map(_strToTime).toList(growable: false);
   }
 
   Future<void> _muteAlreadyCheckedDosesToday({
@@ -998,7 +1207,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (doses.isEmpty) continue;
 
       // What cycle are we currently in for THIS pill?
-      final w = _computeDoseWindow(now: now, dosesSorted: doses);
+      final w = _computeDoseWindow(
+        now: now,
+        dosesSorted: doses,
+        pillIndex: pillIndex,
+      );
       final cycleIsoNow = w.cycleStart.toIso8601String();
 
       final stored = checkMap['$pillIndex'] as String?;
@@ -1118,16 +1331,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             : <String>['08:00'];
 
         // Build sorted TimeOfDay list for this pill
-        final dosesSorted = rawTimes.map(_strToTime).toList()
-          ..sort(
-            (a, b) =>
-                (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
-          );
+        final dosesSorted = rawTimes.map(_strToTime).toList(growable: false);
 
         if (dosesSorted.isEmpty) continue;
 
         // What cycle are we in right now (based on your 2-hours-before-first-dose rule)?
-        final w = _computeDoseWindow(now: now, dosesSorted: dosesSorted);
+        final w = _computeDoseWindow(
+          now: now,
+          dosesSorted: dosesSorted,
+          pillIndex: pillIndex,
+        );
         final cycleIsoNow = w.cycleStart.toIso8601String();
 
         final stored = map['$pillIndex'] as String?;
@@ -1167,7 +1380,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (total == 0) return 0;
 
-    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final w = _computeDoseWindow(
+      now: DateTime.now(),
+      dosesSorted: doses,
+      pillIndex: pillIndex,
+    );
     final cycleIso = w.cycleStart.toIso8601String();
 
     final stored = map['$pillIndex'] as String?;
@@ -1234,30 +1451,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (doses.isEmpty) return false;
 
     final now = DateTime.now();
-    final w = _computeDoseWindow(now: now, dosesSorted: doses);
-    final cycleIso = w.cycleStart.toIso8601String();
-
-    final alreadyChecked = _isDoseCheckedSync(
-      map,
-      pillIndex,
-      cycleIso,
-      w.doseIndex,
+    final state = _getDisplayedDoseStateForPill(
+      pillIndex: pillIndex,
+      doses: doses,
+      takenMap: map,
+      missedMap: _lastMissedMapCache,
+      now: now,
     );
+
+    final cycleIso = state.cycleIso;
+
+    final alreadyChecked = (state.takenMask & (1 << state.doseIndex)) != 0;
     if (alreadyChecked) return false;
 
-    final explicitlyMissed = _isDoseMarkedMissedSync(
-      pillIndex,
-      cycleIso,
-      w.doseIndex,
-    );
+    final explicitlyMissed = (state.missedMask & (1 << state.doseIndex)) != 0;
     if (explicitlyMissed) return true;
 
     final cycleDay = DateTime(
-      w.cycleStart.year,
-      w.cycleStart.month,
-      w.cycleStart.day,
+      state.cycleStart.year,
+      state.cycleStart.month,
+      state.cycleStart.day,
     );
-    final plannedAt = _atTime(cycleDay, doses[w.doseIndex]);
+
+    final plannedAt = plannedAtLocalForOrderedDose(
+      cycleDay,
+      doses,
+      state.doseIndex,
+    );
 
     return now.isAfter(plannedAt.add(grace));
   }
@@ -1281,31 +1501,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final doses = _doseTimesForPill(pillIndex);
     if (doses.length <= 1) return;
 
-    final mid = medicationIds[pillIndex];
-    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final state = _getDisplayedDoseStateForPill(
+      pillIndex: pillIndex,
+      doses: doses,
+      takenMap: _checkMapCache,
+      missedMap: _lastMissedMapCache,
+      now: DateTime.now(),
+    );
+
     final cycleDay = DateTime(
-      w.cycleStart.year,
-      w.cycleStart.month,
-      w.cycleStart.day,
+      state.cycleStart.year,
+      state.cycleStart.month,
+      state.cycleStart.day,
     );
 
-    await _scheduleService.ensureDoseEventsForMedication(mid);
-    final events = await _adherenceService.getDoseEventsForMedicationOnLocalDay(
-      medicationId: mid,
-      localDay: cycleDay,
-    );
-
-    final eventsByDose = <int, DoseEventRecord>{
-      for (final e in events) e.doseIndex: e,
-    };
-
-    int initialTakenMask = 0;
-    for (int i = 0; i < doses.length; i++) {
-      final e = eventsByDose[i];
-      if (e != null && e.status == 'taken') {
-        initialTakenMask |= (1 << i);
-      }
-    }
+    final initialTakenMask = state.takenMask;
 
     if (!mounted) return;
 
@@ -1317,22 +1527,53 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         totalDoses: doses.length,
         initialTakenMask: initialTakenMask,
         onDone: (takenMask) async {
+          final oldTakenMask = state.takenMask;
+          final oldMissedMask = state.missedMask;
+
           for (int i = 0; i < doses.length; i++) {
-            final ev = eventsByDose[i];
-            if (ev == null) continue;
-
             final shouldBeTaken = (takenMask & (1 << i)) != 0;
+            final oldWasTaken = (oldTakenMask & (1 << i)) != 0;
+            final oldWasMissed = (oldMissedMask & (1 << i)) != 0;
 
-            await _adherenceService.setDoseStatusForOverride(
-              doseEventId: ev.id,
-              finalStatus: shouldBeTaken ? 'taken' : 'missed',
+            _setLocalDoseStatus(
+              pillIndex: pillIndex,
+              cycleIso: state.cycleIso,
+              doseIndex: i,
+              status: shouldBeTaken ? 'taken' : 'missed',
             );
+
+            if (!oldWasTaken && shouldBeTaken) {
+              await _consumeOneSupplyIfEnabled(pillIndex);
+            } else if (oldWasTaken && !shouldBeTaken) {
+              await _applySupplyDeltaIfEnabled(pillIndex: pillIndex, delta: 1);
+            }
+
+            final plannedIso = plannedAtUtcIsoForOrderedDose(
+              cycleDay,
+              doses,
+              i,
+            );
+
+            if (shouldBeTaken) {
+              unawaited(
+                _persistTakenToDb(
+                  medicationId: medicationIds[pillIndex],
+                  plannedIso: plannedIso,
+                ),
+              );
+            } else if (oldWasTaken || !oldWasMissed) {
+              unawaited(
+                _persistMissedToDb(
+                  medicationId: medicationIds[pillIndex],
+                  plannedIso: plannedIso,
+                ),
+              );
+            }
           }
 
-          final map = await _deriveCheckMapFromDatabase();
-          await _saveCheckMap(map);
-          _setCheckMapAndRebuild(map);
-          _refreshCheckMapFuture();
+          await _saveLocalDailyState();
+          await _syncCurrentCycleAnchorOnly();
+          _publishLocalDailyState();
           _scheduleCenteredDoseBoundaryRefresh();
 
           unawaited(
@@ -1350,33 +1591,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     DateTime windowEnd,
     DateTime cycleStart,
   })
-  _computeDoseWindow({
+  _computeDoseWindowFromCycleStart({
     required DateTime now,
+    required DateTime cycleStart,
     required List<TimeOfDay> dosesSorted,
   }) {
-    final first = dosesSorted.first;
-    final day = DateTime(now.year, now.month, now.day);
-
-    final cycleStartToday = _atTime(
-      day,
-      first,
-    ).subtract(const Duration(hours: 2));
-
-    final cycleStart = now.isBefore(cycleStartToday)
-        ? cycleStartToday.subtract(const Duration(days: 1))
-        : cycleStartToday;
-
     final cycleDay = DateTime(
       cycleStart.year,
       cycleStart.month,
       cycleStart.day,
     );
 
-    final doseInstants = dosesSorted
-        .map((t) => _atTime(cycleDay, t))
-        .toList(growable: false);
+    final doseInstants = List<DateTime>.generate(
+      dosesSorted.length,
+      (i) => plannedAtLocalForOrderedDose(cycleDay, dosesSorted, i),
+      growable: false,
+    );
 
-    final windowStarts = doseInstants.map((d) => _minusMinutes(d, 30)).toList();
+    final windowStarts = doseInstants
+        .map((d) => _minusMinutes(d, 30))
+        .toList(growable: false);
 
     final nextCycleStart = cycleStart.add(const Duration(days: 1));
     final windowEnds = <DateTime>[
@@ -1400,6 +1634,49 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       windowStart: windowStarts[0],
       windowEnd: windowEnds[0],
       cycleStart: cycleStart,
+    );
+  }
+
+  ({
+    int doseIndex,
+    DateTime windowStart,
+    DateTime windowEnd,
+    DateTime cycleStart,
+  })
+  _computeDoseWindow({
+    required DateTime now,
+    required List<TimeOfDay> dosesSorted,
+    required int pillIndex,
+  }) {
+    final first = dosesSorted.first;
+    final day = DateTime(now.year, now.month, now.day);
+
+    final cycleStartToday = _atTime(
+      day,
+      first,
+    ).subtract(const Duration(hours: 2));
+
+    // ✅ First-day clamp:
+    // if this pill was created today and we're still before today's cycle start,
+    // do NOT fall back to yesterday's cycle.
+    if (pillIndex != null &&
+        _isFirstDayForMedication(pillIndex) &&
+        now.isBefore(cycleStartToday)) {
+      return _computeDoseWindowFromCycleStart(
+        now: now,
+        cycleStart: cycleStartToday,
+        dosesSorted: dosesSorted,
+      );
+    }
+
+    final cycleStart = now.isBefore(cycleStartToday)
+        ? cycleStartToday.subtract(const Duration(days: 1))
+        : cycleStartToday;
+
+    return _computeDoseWindowFromCycleStart(
+      now: now,
+      cycleStart: cycleStart,
+      dosesSorted: dosesSorted,
     );
   }
 
@@ -1446,7 +1723,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final doses = _doseTimesForPill(i);
       if (doses.isEmpty) continue;
 
-      final w = _computeDoseWindow(now: now, dosesSorted: doses);
+      final w = _computeDoseWindow(now: now, dosesSorted: doses, pillIndex: i);
       final candidate = w.windowEnd;
 
       if (candidate.isAfter(now)) {
@@ -1520,17 +1797,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (doses.isEmpty) return;
 
     final now = DateTime.now();
-    final w = _computeDoseWindow(now: now, dosesSorted: doses);
+    final state = _getDisplayedDoseStateForPill(
+      pillIndex: pillIndex,
+      doses: doses,
+      takenMap: _lastCheckMapCache,
+      missedMap: _lastMissedMapCache,
+      now: now,
+    );
 
     final cycleDay = DateTime(
-      w.cycleStart.year,
-      w.cycleStart.month,
-      w.cycleStart.day,
+      state.cycleStart.year,
+      state.cycleStart.month,
+      state.cycleStart.day,
     );
-    final plannedAt = _atTime(cycleDay, doses[w.doseIndex]);
+
+    final plannedAt = plannedAtLocalForOrderedDose(
+      cycleDay,
+      doses,
+      state.doseIndex,
+    );
+
     final missAt = plannedAt.add(const Duration(hours: 2));
 
-    DateTime next = w.windowEnd;
+    DateTime next = state.cycleStart.add(const Duration(days: 1));
     if (missAt.isAfter(now) && missAt.isBefore(next)) {
       next = missAt;
     }
@@ -1641,6 +1930,62 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
   }
 
+  Future<void> _applySupplyDeltaIfEnabled({
+    required int pillIndex,
+    required int delta,
+  }) async {
+    if (delta == 0) return;
+    if (pillIndex < 0 || pillIndex >= pillNames.length) return;
+
+    _alignSupplyListsToCount(pillNames.length);
+    if (!_effectiveSupplyOn(pillIndex)) return;
+
+    final oldLeft = pillSupplyLeft[pillIndex];
+    final newLeft = (oldLeft + delta).clamp(0, 1000000);
+    if (newLeft == oldLeft) return;
+
+    if (!mounted) return;
+    setState(() {
+      pillSupplyLeft[pillIndex] = newLeft;
+
+      if (delta > 0 && newLeft > _supplyLowThreshold) {
+        pillSupplyLowSent[pillIndex] = false;
+      }
+    });
+
+    if (delta > 0) {
+      if (newLeft > 0) {
+        unawaited(
+          NotificationService.cancelOutOfSupplyWarning(pillSlot: pillIndex),
+        );
+      }
+      if (newLeft >= _supplyLowThreshold) {
+        unawaited(
+          NotificationService.cancelLowSupplyWarning(pillSlot: pillIndex),
+        );
+      }
+    }
+
+    await _persistSupplyLists();
+  }
+
+  Future<void> _adjustSupplyForStatusTransition({
+    required int pillIndex,
+    required String fromStatus,
+    required String toStatus,
+  }) async {
+    if (fromStatus == toStatus) return;
+
+    if (toStatus == 'taken' && fromStatus != 'taken') {
+      await _consumeOneSupplyIfEnabled(pillIndex);
+      return;
+    }
+
+    if (fromStatus == 'taken' && toStatus != 'taken') {
+      await _applySupplyDeltaIfEnabled(pillIndex: pillIndex, delta: 1);
+    }
+  }
+
   Future<void> _saveSupplyListsToPrefs() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_pillSupplyEnabledKey, jsonEncode(pillSupplyEnabled));
@@ -1693,8 +2038,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
-
     unawaited(_refreshAdherenceFromDb());
+    unawaited(_syncCurrentCycleAnchorOnly());
 
     final now = DateTime.now();
     final dayKey = now.year * 10000 + now.month * 100 + now.day;
@@ -1709,6 +2054,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _armDailyCircleDelay();
     unawaited(_rebuild2DayNotifWindowAndReMuteChecked(tag: 'resume'));
     _startNewDaySequence(today: newToday);
+
+    // ✅ Keep the current local check/missed masks as-is.
+    // The active HomeScreen logic will ignore stale cycleIso values on its own.
+    _publishLocalDailyState();
   }
 
   void _rearmDailyCircleDelay() {
@@ -1738,16 +2087,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final prefs = await SharedPreferences.getInstance();
 
     final mode = prefs.getString(kSupplyModeKey) ?? 'decide';
-
-    // User chooses the number where it should turn yellow / notify ("when supply is at:")
-    // We store +1 internally because our logic uses "< threshold"
     final lowUser = (prefs.getInt(kSupplyLowThresholdKey) ?? 10).clamp(5, 999);
-    final lowForLessThanLogic = lowUser + 1;
 
     if (!mounted) return;
     setState(() {
       _supplyModeGlobal = mode;
-      _supplyLowThreshold = lowForLessThanLogic;
+      _supplyLowThreshold = lowUser;
     });
   }
 
@@ -1787,6 +2132,38 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _labelTimer = null;
     if (!mounted) return;
     setState(() => _labelOverride = null);
+  }
+
+  String _truncateCenterLabel(String raw, {int maxChars = 16}) {
+    final text = raw.trim();
+    if (text.length <= maxChars) return text;
+
+    // Keep total displayed length at 16 including "..."
+    final keep = maxChars - 3;
+    return '${text.substring(0, keep)}...';
+  }
+
+  bool _centerLabelIsTruncated(String raw, {int maxChars = 16}) {
+    return raw.trim().length > maxChars;
+  }
+
+  Future<void> _showFullCenterLabelDialog(String fullText) async {
+    final text = fullText.trim();
+    if (text.isEmpty) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Pill Name'),
+        content: Text(text),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _editNameAgain() {
@@ -1882,8 +2259,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _scheduleService.ensureDoseEventsForMedications(medicationIds);
     await _adherenceService.autoMarkMissedPastPlanned();
 
-    final loadedMap = await _deriveCheckMapFromDatabase();
-    await _saveCheckMap(loadedMap);
+    await _loadLocalDailyState();
+
+    // One-time fallback for older installs that only have DB-derived state.
+    if (_checkMapCache.isEmpty &&
+        _lastMissedMapCache.isEmpty &&
+        pillNames.isNotEmpty) {
+      final loadedMap = await _deriveCheckMapFromDatabase();
+      _checkMapCache = loadedMap;
+      _lastCheckMapCache = Map<String, dynamic>.from(loadedMap);
+      await _saveLocalDailyState();
+      await _syncCurrentCycleAnchorOnly();
+    }
 
     await MedicationPrefsMirror.write(
       pillNames: pillNames,
@@ -1896,13 +2283,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       pillNameLocked: pillNameLocked,
     );
 
+    await _syncCurrentCycleAnchorOnly();
     if (!mounted) return;
     setState(() {
-      _checkMapCache = loadedMap;
-      _checkMapFuture = Future.value(loadedMap);
+      _checkMapFuture = Future.value(Map<String, dynamic>.from(_checkMapCache));
     });
 
     unawaited(_rebuild2DayNotifWindowAndReMuteChecked(tag: 'initial-load'));
+    await _syncCurrentCycleAnchorOnly();
 
     if (pillNames.isEmpty && mounted) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -2303,11 +2691,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final List<TimeOfDay> doses = (_timesPerDay == 1)
         ? <TimeOfDay>[_singleDoseTime!]
-        : _doseTimes.whereType<TimeOfDay>().toList();
-
-    doses.sort(
-      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
-    );
+        : _doseTimes.whereType<TimeOfDay>().toList(growable: false);
 
     final doseStrings = doses.map(_timeToStr).toList();
     final firstDose = doses.first;
@@ -2412,6 +2796,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _selectedPillInfo = null;
     });
 
+    await _syncCurrentCycleAnchorOnly();
+
     await MedicationPrefsMirror.write(
       pillNames: pillNames,
       pillTimesFirst: pillTimes,
@@ -2456,11 +2842,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final List<TimeOfDay> doses = (_timesPerDay == 1)
         ? <TimeOfDay>[_singleDoseTime!]
-        : _doseTimes.whereType<TimeOfDay>().toList();
-
-    doses.sort(
-      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
-    );
+        : _doseTimes.whereType<TimeOfDay>().toList(growable: false);
 
     final doseStrings = doses.map(_timeToStr).toList();
     final firstDose = doses.first;
@@ -2489,7 +2871,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     // If refilled back above threshold, allow low-warning again + cancel pending warnings
-    if (effectiveTrack && _supplyLeftDraft >= _supplyLowThreshold) {
+    if (effectiveTrack && _supplyLeftDraft > _supplyLowThreshold) {
       pillSupplyLowSent[pillIndex] = false;
       unawaited(
         NotificationService.cancelLowSupplyWarning(pillSlot: pillIndex),
@@ -2566,7 +2948,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
 
       // ✅ if user refilled above threshold, allow future warnings again
-      if (_supplyLeftDraft >= _supplyLowThreshold) {
+      if (_supplyLeftDraft > _supplyLowThreshold) {
         pillSupplyLowSent[pillIndex] = false;
         unawaited(
           NotificationService.cancelLowSupplyWarning(pillSlot: pillIndex),
@@ -2637,6 +3019,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _configOpen = false;
       _step = _ConfigStep.name;
     });
+
+    await _syncCurrentCycleAnchorOnly();
 
     await MedicationPrefsMirror.write(
       pillNames: pillNames,
@@ -2775,6 +3159,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
 
+    await _syncCurrentCycleAnchorOnly();
+
     if (!mounted) return;
     setState(() {
       medicationIds = updatedMedIds;
@@ -2831,7 +3217,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (dayKey == _lastSeenDayKey) return;
     _lastSeenDayKey = dayKey;
 
+    await _syncCurrentCycleAnchorOnly();
     await _refreshAdherenceFromDb();
+
     if (!mounted) return;
 
     _refreshCheckMapFuture();
@@ -2846,6 +3234,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _scheduleGlobalBoundaryRefresh();
     unawaited(_scheduleGlobalDayBoundaryRefresh());
+
+    // ✅ Do not wipe local masks on date jumps.
+    _publishLocalDailyState();
   }
 
   void _alignMedicationCreatedAtsToCount(int count) {
@@ -2865,29 +3256,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final doses = _doseTimesForPill(pillIndex);
     if (doses.isEmpty) return;
 
-    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
-    final cycleDay = DateTime(
-      w.cycleStart.year,
-      w.cycleStart.month,
-      w.cycleStart.day,
+    final state = _getDisplayedDoseStateForPill(
+      pillIndex: pillIndex,
+      doses: doses,
+      takenMap: _checkMapCache,
+      missedMap: _lastMissedMapCache,
+      now: DateTime.now(),
     );
-    final tod = doses[w.doseIndex];
-    final plannedIso = plannedAtUtcIsoForSlot(cycleDay, tod);
-    final mid = medicationIds[pillIndex];
-
-    await _scheduleService.ensureDoseEventsForMedication(mid);
-    final ev = await _adherenceService.findDoseEventForPlannedUtc(
-      medicationId: mid,
-      plannedAtUtcIso: plannedIso,
-    );
-
-    if (ev == null) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No current dose found for this pill.')),
-      );
-      return;
-    }
 
     if (!mounted) return;
 
@@ -2911,19 +3286,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ),
     );
 
-    if (!mounted) return;
-    if (confirmed != true) return;
+    if (!mounted || confirmed != true) return;
 
-    await _adherenceService.setDoseStatusForOverride(
-      doseEventId: ev.id,
-      finalStatus: 'taken',
+    final cycleDay = DateTime(
+      state.cycleStart.year,
+      state.cycleStart.month,
+      state.cycleStart.day,
+    );
+    final plannedIso = plannedAtUtcIsoForOrderedDose(
+      cycleDay,
+      doses,
+      state.doseIndex,
     );
 
-    final map = await _deriveCheckMapFromDatabase();
-    await _saveCheckMap(map);
-    _setCheckMapAndRebuild(map);
-    _refreshCheckMapFuture();
+    final wasTaken = (state.takenMask & (1 << state.doseIndex)) != 0;
+
+    _setLocalDoseStatus(
+      pillIndex: pillIndex,
+      cycleIso: state.cycleIso,
+      doseIndex: state.doseIndex,
+      status: 'taken',
+    );
+    await _saveLocalDailyState();
+    await _syncCurrentCycleAnchorOnly();
+    _publishLocalDailyState();
+
+    if (!wasTaken) {
+      unawaited(_consumeOneSupplyIfEnabled(pillIndex));
+    }
+
     _scheduleCenteredDoseBoundaryRefresh();
+
+    unawaited(
+      _persistTakenToDb(
+        medicationId: medicationIds[pillIndex],
+        plannedIso: plannedIso,
+      ),
+    );
   }
 
   Future<void> _markCurrentDoseMissed() async {
@@ -2943,34 +3342,49 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final doses = _doseTimesForPill(pillIndex);
     if (doses.isEmpty) return;
 
-    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final state = _getDisplayedDoseStateForPill(
+      pillIndex: pillIndex,
+      doses: doses,
+      takenMap: _checkMapCache,
+      missedMap: _lastMissedMapCache,
+      now: DateTime.now(),
+    );
+
     final cycleDay = DateTime(
-      w.cycleStart.year,
-      w.cycleStart.month,
-      w.cycleStart.day,
+      state.cycleStart.year,
+      state.cycleStart.month,
+      state.cycleStart.day,
     );
-    final tod = doses[w.doseIndex];
-    final plannedIso = plannedAtUtcIsoForSlot(cycleDay, tod);
-    final mid = medicationIds[pillIndex];
-
-    await _scheduleService.ensureDoseEventsForMedication(mid);
-    final ev = await _adherenceService.findDoseEventForPlannedUtc(
-      medicationId: mid,
-      plannedAtUtcIso: plannedIso,
+    final plannedIso = plannedAtUtcIsoForOrderedDose(
+      cycleDay,
+      doses,
+      state.doseIndex,
     );
 
-    if (ev == null) return;
+    final wasTaken = (state.takenMask & (1 << state.doseIndex)) != 0;
 
-    await _adherenceService.setDoseStatusForOverride(
-      doseEventId: ev.id,
-      finalStatus: 'missed',
+    _setLocalDoseStatus(
+      pillIndex: pillIndex,
+      cycleIso: state.cycleIso,
+      doseIndex: state.doseIndex,
+      status: 'missed',
     );
+    await _saveLocalDailyState();
+    await _syncCurrentCycleAnchorOnly();
+    _publishLocalDailyState();
 
-    final map = await _deriveCheckMapFromDatabase();
-    await _saveCheckMap(map);
-    _setCheckMapAndRebuild(map);
-    _refreshCheckMapFuture();
+    if (wasTaken) {
+      unawaited(_applySupplyDeltaIfEnabled(pillIndex: pillIndex, delta: 1));
+    }
+
     _scheduleCenteredDoseBoundaryRefresh();
+
+    unawaited(
+      _persistMissedToDb(
+        medicationId: medicationIds[pillIndex],
+        plannedIso: plannedIso,
+      ),
+    );
   }
 
   Future<void> _openHistoryScreen() async {
@@ -2981,7 +3395,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ),
     );
     if (!mounted) return;
-    await _refreshAdherenceFromDb();
+
+    // Keep history/calendar DB fresh in background,
+    // but do not let DB overwrite HomeScreen UI state.
+    unawaited(_refreshAdherenceFromDb());
+    _publishLocalDailyState();
   }
 
   Future<void> _openWarningActions() async {
@@ -3052,48 +3470,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (pillIndex >= medicationIds.length) return;
 
     final doses = _doseTimesForPill(pillIndex);
-    final w = _computeDoseWindow(now: DateTime.now(), dosesSorted: doses);
+    final state = _getDisplayedDoseStateForPill(
+      pillIndex: pillIndex,
+      doses: doses,
+      takenMap: _checkMapCache,
+      missedMap: _lastMissedMapCache,
+      now: DateTime.now(),
+    );
 
-    final doseIndex = w.doseIndex;
+    final doseIndex = state.doseIndex;
 
     final cycleDay = DateTime(
-      w.cycleStart.year,
-      w.cycleStart.month,
-      w.cycleStart.day,
+      state.cycleStart.year,
+      state.cycleStart.month,
+      state.cycleStart.day,
     );
-    final tod = doses[doseIndex];
-    final plannedIso = plannedAtUtcIsoForSlot(cycleDay, tod);
-    final mid = medicationIds[pillIndex];
-
-    // Important: make sure the previous-cycle day is backfilled too.
-    await _scheduleService.ensureDoseEventsForMedication(mid, daysBack: 1);
-
-    final ev = await _adherenceService.findDoseEventForPlannedUtc(
-      medicationId: mid,
-      plannedAtUtcIso: plannedIso,
+    final plannedIso = plannedAtUtcIsoForOrderedDose(
+      cycleDay,
+      doses,
+      doseIndex,
     );
 
-    if (ev == null) {
-      debugPrint(
-        'CHECK FAILED in HomeScreen._checkCenteredPill: '
-        'pillIndex=$pillIndex '
-        'medicationId=$mid '
-        'doseIndex=$doseIndex '
-        'cycleDay=$cycleDay '
-        'plannedIso=$plannedIso '
-        'doses=${doses.map(_timeToStr).toList()}',
-      );
-      return;
-    }
-
-    await _adherenceService.confirmTaken(ev.id);
-
-    final map = await _deriveCheckMapFromDatabase();
-    await _saveCheckMap(map);
-
-    _setCheckMapAndRebuild(map);
-    _refreshCheckMapFuture();
-    _checkMapFuture = _loadCheckMap();
+    // LOCAL FIRST
+    _setLocalDoseStatus(
+      pillIndex: pillIndex,
+      cycleIso: state.cycleIso,
+      doseIndex: doseIndex,
+      status: 'taken',
+    );
+    await _saveLocalDailyState();
+    await _syncCurrentCycleAnchorOnly();
+    _publishLocalDailyState();
 
     await NotificationService.muteToday(
       pillSlot: pillIndex,
@@ -3115,7 +3522,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _recordDoseHistory(pillNames[pillIndex]);
 
-    if (mounted) setState(() {});
+    // BACKGROUND DB WRITE
+    unawaited(
+      _persistTakenToDb(
+        medicationId: medicationIds[pillIndex],
+        plannedIso: plannedIso,
+      ),
+    );
   }
 
   Future<void> _openCalendarScreen() async {
@@ -3645,9 +4058,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final supplyNumberColor = (displaySupplyValue <= 0)
         ? const Color.fromARGB(255, 255, 30, 71) // red
-        : (displaySupplyValue < _supplyLowThreshold)
+        : (displaySupplyValue <= _supplyLowThreshold)
         ? const Color.fromARGB(255, 255, 226, 109) // yellow
-        : const Color.fromARGB(245, 255, 255, 255); // your off-white
+        : const Color.fromARGB(
+            245,
+            255,
+            255,
+            255,
+          ); // your off-white// your off-white
 
     return Scaffold(
       resizeToAvoidBottomInset: false,
@@ -3765,6 +4183,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ? _doseTimesForPill(idx!)
                       : <TimeOfDay>[];
 
+                  if (hasRealPill) {
+                    debugPrint(
+                      'PILL DEBUG idx=$idx firstDay=${_isFirstDayForMedication(idx)} '
+                      'doses=${doses.map(_fmt).toList()} createdAt=${medicationCreatedAts[idx].toLocal()} now=${DateTime.now()}',
+                    );
+                  }
+
                   final showLeft = hasRealPill && doses.length > 1;
 
                   int totalDoses = doses.length;
@@ -3773,24 +4198,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   int missedMask = 0;
 
                   if (showLeft) {
-                    final w = _computeDoseWindow(
+                    final state = _getDisplayedDoseStateForPill(
+                      pillIndex: idx!,
+                      doses: doses,
+                      takenMap: map,
+                      missedMap: _lastMissedMapCache,
                       now: DateTime.now(),
-                      dosesSorted: doses,
                     );
 
-                    final cycleIso = w.cycleStart.toIso8601String();
-
-                    final stored = map['$idx'] as String?;
-                    final parsed = _readCycleAndMask(stored);
-                    mask = (parsed.cycleIso == cycleIso) ? parsed.mask : 0;
-
-                    final storedMissed = _lastMissedMapCache['$idx'] as String?;
-                    final parsedMissed = _readCycleAndMask(storedMissed);
-                    missedMask = (parsedMissed.cycleIso == cycleIso)
-                        ? parsedMissed.mask
-                        : 0;
-
-                    activeDoseIndex = w.doseIndex;
+                    mask = state.takenMask;
+                    missedMask = state.missedMask;
+                    activeDoseIndex = state.doseIndex;
 
                     _lastDoseBarTotalDoses = totalDoses;
                     _lastDoseBarActiveDoseIndex = activeDoseIndex;
@@ -4193,18 +4611,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
                           if (pillIndex != null) {
                             final doses = _doseTimesForPill(pillIndex);
-                            final w = _computeDoseWindow(
-                              now: DateTime.now(),
-                              dosesSorted: doses,
-                            );
-                            final cycleIso = w.cycleStart.toIso8601String();
 
-                            checked = _isDoseCheckedSync(
-                              map,
-                              pillIndex,
-                              cycleIso,
-                              w.doseIndex,
+                            final state = _getDisplayedDoseStateForPill(
+                              pillIndex: pillIndex,
+                              doses: doses,
+                              takenMap: map,
+                              missedMap: _lastMissedMapCache,
+                              now: DateTime.now(),
                             );
+
+                            checked =
+                                (state.takenMask & (1 << state.doseIndex)) != 0;
 
                             missed = _isCurrentDoseMissed(
                               pillIndex: pillIndex,
@@ -4212,7 +4629,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             );
 
                             checkButtonKey =
-                                'check_${pillIndex}_${cycleIso}_${w.doseIndex}_${checked ? 1 : 0}_${missed ? 1 : 0}';
+                                'check_${pillIndex}_${state.cycleIso}_${state.doseIndex}_${checked ? 1 : 0}_${missed ? 1 : 0}';
                           }
 
                           final bool disable =
@@ -4396,29 +4813,39 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               left: s(0),
               right: s(0),
               bottom: s(477),
-              child: IgnorePointer(
-                child: AnimatedOpacity(
-                  duration: const Duration(milliseconds: 120),
-                  curve: Curves.easeInOut,
-                  opacity: _showPillLabel ? 1.0 : 0.0,
-                  child: Center(
-                    child: Builder(
-                      builder: (context) {
-                        String displayName =
-                            _labelOverride ?? _centerPillName();
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 120),
+                curve: Curves.easeInOut,
+                opacity: _showPillLabel ? 1.0 : 0.0,
+                child: Center(
+                  child: Builder(
+                    builder: (context) {
+                      final fullLabel = _labelOverride ?? _centerPillName();
+                      final isTruncated = _centerLabelIsTruncated(fullLabel);
+                      final displayLabel = _truncateCenterLabel(fullLabel);
 
-                        return Text(
-                          displayName,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontFamily: 'Amaranth',
-                            fontSize: fs(25),
-                            color: const Color.fromARGB(225, 255, 255, 255),
-                            fontWeight: FontWeight.w400,
+                      return GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: isTruncated
+                            ? () => _showFullCenterLabelDialog(fullLabel)
+                            : null,
+                        child: Padding(
+                          padding: EdgeInsets.symmetric(horizontal: s(12)),
+                          child: Text(
+                            displayLabel,
+                            textAlign: TextAlign.center,
+                            maxLines: 1,
+                            overflow: TextOverflow.clip,
+                            style: TextStyle(
+                              fontFamily: 'Amaranth',
+                              fontSize: fs(25),
+                              color: const Color.fromARGB(225, 255, 255, 255),
+                              fontWeight: FontWeight.w400,
+                            ),
                           ),
-                        );
-                      },
-                    ),
+                        ),
+                      );
+                    },
                   ),
                 ),
               ),

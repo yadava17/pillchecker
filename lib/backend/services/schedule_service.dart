@@ -83,9 +83,11 @@ class ScheduleService {
     if (sch == null) return;
 
     final daysMask = sch['days_mask'] as int;
-    final times = (jsonDecode(sch['times_json']! as String) as List)
+    final timeStrings = (jsonDecode(sch['times_json']! as String) as List)
         .map((e) => e.toString())
         .toList();
+
+    final orderedTimes = timeStrings.map(parse24h).toList(growable: false);
 
     final startDay = localDateOnly(
       DateTime.now(),
@@ -98,9 +100,12 @@ class ScheduleService {
         final day = startDay.add(Duration(days: d));
         if (!dayIncludedInMask(daysMask, day)) continue;
 
-        for (var doseIndex = 0; doseIndex < times.length; doseIndex++) {
-          final tod = parse24h(times[doseIndex]);
-          final plannedIso = plannedAtUtcIsoForSlot(day, tod);
+        for (var doseIndex = 0; doseIndex < orderedTimes.length; doseIndex++) {
+          final plannedIso = plannedAtUtcIsoForOrderedDose(
+            day,
+            orderedTimes,
+            doseIndex,
+          );
 
           await txn.rawInsert(
             '''

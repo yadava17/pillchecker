@@ -85,8 +85,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final prefs = await SharedPreferences.getInstance();
 
     final mode = prefs.getString(kNotifModeKey) ?? 'standard';
-    final early = prefs.getInt(kEarlyLeadMinKey) ?? 30;
-    final late = prefs.getInt(kLateAfterMinKey) ?? 30;
+    final early = (prefs.getInt(kEarlyLeadMinKey) ?? 30).clamp(0, 120);
+    final late = (prefs.getInt(kLateAfterMinKey) ?? 30).clamp(0, 120);
 
     final supplyMode = prefs.getString(kSupplyModeKey) ?? 'decide';
     final supplyLow = (prefs.getInt(kSupplyLowThresholdKey) ?? 10).clamp(
@@ -312,8 +312,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     // saving:
     await prefs.setString(kNotifModeKey, _mode);
-    await prefs.setInt(kEarlyLeadMinKey, _earlyMin);
-    await prefs.setInt(kLateAfterMinKey, _lateMin);
+    await prefs.setInt(kEarlyLeadMinKey, _earlyMin.clamp(0, 120));
+    await prefs.setInt(kLateAfterMinKey, _lateMin.clamp(0, 120));
     await prefs.setString(kSupplyModeKey, _supplyMode);
     await prefs.setInt(kSupplyLowThresholdKey, _supplyLow);
 
@@ -578,7 +578,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           Builder(
                             builder: (context) {
                               const step = 5;
-                              const maxMin = 240;
+                              const maxMin = 120;
                               final enabled = _mode == 'standard';
 
                               return Column(

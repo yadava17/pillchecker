@@ -50,7 +50,8 @@ class PrefsMigration {
     final nameLocked = _decodeBoolList(prefs.getString(nameLockedKey));
 
     for (var i = 0; i < names.length; i++) {
-      final times = [...doseTimes[i]]..sort((a, b) => a.compareTo(b));
+      final times = List<String>.from(doseTimes[i]);
+
       final m = await medService.create(
         name: names[i],
         supplyEnabled: i < supplyEn.length ? supplyEn[i] : false,
@@ -59,6 +60,7 @@ class PrefsMigration {
         nameLocked: i < nameLocked.length ? nameLocked[i] : false,
         sortOrder: i,
       );
+
       await scheduleService.upsertSchedule(
         medicationId: m.id,
         times24hSorted: times,

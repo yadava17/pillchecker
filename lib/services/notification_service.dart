@@ -38,12 +38,12 @@ class NotificationService {
   static Duration get lateAfter => _lateAfter;
 
   // ============================================================
-  // TODAY + TOMORROW WINDOW (2 days)
+  // ROLLING WINDOW (3 days)
   // ============================================================
 
-  static const int _windowDays = 2; // today + tomorrow
-  static const int _inactivityDays = 1;
-  static const int _cancelDayBuckets = 3;
+  static const int _windowDays = 3; // today + tomorrow
+  static const int _inactivityDays = 2;
+  static const int _cancelDayBuckets = 4;
   // cancel offsets 0..2 so we safely cover both patterns:
   // (today+tomorrow) OR (tomorrow+dayAfter)
 
@@ -113,8 +113,8 @@ class NotificationService {
     final earlyMin = prefs.getInt(kEarlyLeadMinKey) ?? 30;
     final lateMin = prefs.getInt(kLateAfterMinKey) ?? 30;
 
-    _earlyLead = Duration(minutes: earlyMin.clamp(0, 240));
-    _lateAfter = Duration(minutes: lateMin.clamp(0, 240));
+    _earlyLead = Duration(minutes: earlyMin.clamp(0, 120));
+    _lateAfter = Duration(minutes: lateMin.clamp(0, 120));
 
     debugPrint(
       'NOTIF SETTINGS LOADED: mode=$_mode '
@@ -341,7 +341,7 @@ class NotificationService {
 
   static Future<void> rebuild2DayWindow({
     required List<String> pillNames,
-    required List<List<String>> doseTimes24h, // "HH:mm" per dose
+    required List<List<String>> doseTimes24h,
   }) async {
     await init();
     await _ensureExactAlarmStatus();
@@ -349,29 +349,25 @@ class NotificationService {
 
     final today = _dayOnly(DateTime.now());
 
-    // ---------------------------
-    // A) Decide whether "today" still has ANY valid future notification time
-    // If not, start scheduling from tomorrow (so you still get 2 full future days).
-    // ---------------------------
     bool hasAnythingLeftToday = false;
 
     for (int pillSlot = 0; pillSlot < pillNames.length; pillSlot++) {
       final times = doseTimes24h[pillSlot];
-      final totalDoses = times.length;
+      final occurrencesToday = _occurrencesForActualDay(
+        actualDayOffset: 0,
+        orderedTimes: times,
+      );
 
-      for (int doseIndex = 0; doseIndex < times.length; doseIndex++) {
-        final doseTime = _parse24h(times[doseIndex]);
+      for (final occ in occurrencesToday) {
+        final doseTime = occ.doseTime;
 
-        // basic/off rules
         if (_mode == 'off') break;
 
-        // MAIN
         if (!_isInPastToday(today, doseTime)) {
           hasAnythingLeftToday = true;
           break;
         }
 
-        // EARLY/LATE only matter in standard mode
         if (_mode == 'standard') {
           final earlyTime = shiftTimeOfDay(doseTime, -_earlyLead);
           final lateTime = shiftTimeOfDay(doseTime, _lateAfter);
@@ -394,10 +390,6 @@ class NotificationService {
       '(0=today+tomorrow, 1=tomorrow+dayAfter)',
     );
 
-    // ---------------------------
-    // B) Cancel existing buckets that we might have scheduled previously.
-    // We cancel offsets 0..2 to handle switching between patterns safely.
-    // ---------------------------
     for (int pillSlot = 0; pillSlot < pillNames.length; pillSlot++) {
       final dosesPerDay = doseTimes24h[pillSlot].length;
 
@@ -417,33 +409,34 @@ class NotificationService {
       }
     }
 
-    // ---------------------------
-    // C) Schedule exactly 2 days: startOffset and startOffset+1
-    // ---------------------------
-    for (int i = 0; i < _windowDays; i++) {
-      final dayOffset = startOffset + i;
-
+    for (
+      int actualDayOffset = startOffset;
+      actualDayOffset < startOffset + _windowDays;
+      actualDayOffset++
+    ) {
       for (int pillSlot = 0; pillSlot < pillNames.length; pillSlot++) {
         final pillName = pillNames[pillSlot];
         final times = doseTimes24h[pillSlot];
         final totalDoses = times.length;
 
-        for (int doseIndex = 0; doseIndex < times.length; doseIndex++) {
-          final doseTime = _parse24h(times[doseIndex]);
+        final occurrences = _occurrencesForActualDay(
+          actualDayOffset: actualDayOffset,
+          orderedTimes: times,
+        );
 
+        for (final occ in occurrences) {
           await _scheduleTripletOneDay(
-            dayOffset: dayOffset,
+            dayOffset: actualDayOffset,
             pillSlot: pillSlot,
-            doseIndex: doseIndex,
+            doseIndex: occ.doseIndex,
             totalDoses: totalDoses,
             pillName: pillName,
-            doseTime: doseTime,
+            doseTime: occ.doseTime,
           );
         }
       }
     }
 
-    // ✅ Always re-arm the inactivity warning whenever we rebuild the window
     await rescheduleInactivityWarning(doseTimes24h: doseTimes24h);
     debugPrint('NOTIF: rebuild2DayWindow complete');
   }
@@ -455,43 +448,43 @@ class NotificationService {
     await _ensureExactAlarmStatus();
     await loadUserNotificationSettings();
 
-    // Always kill old warning first (fixed ID)
     await cancel(_inactivityWarningId);
 
-    // If notifs are off OR no pills, don't schedule warning.
     if (_mode == 'off') return;
     if (doseTimes24h.isEmpty) return;
 
-    // Find the latest "late time" across all doses.
-    // - standard: use (dose + lateAfter)
-    // - basic: no late exists, so use main dose time as the "latest"
-    TimeOfDay? latest;
+    ({TimeOfDay time, int dayOffset})? latest;
 
     for (final timesForPill in doseTimes24h) {
-      for (final hhmm in timesForPill) {
-        final dose = _parse24h(hhmm);
+      final configuredOffsets = _doseDayOffsets(timesForPill);
 
-        final candidate = (_mode == 'standard')
-            ? shiftTimeOfDay(dose, _lateAfter)
-            : dose;
+      for (int i = 0; i < timesForPill.length; i++) {
+        final dose = _parse24h(timesForPill[i]);
 
-        if (latest == null || _toMins(candidate) > _toMins(latest)) {
-          latest = candidate;
+        final shifted = (_mode == 'standard')
+            ? _shiftWithDayDelta(dose, _lateAfter)
+            : (time: dose, dayDelta: 0);
+
+        final candidateDayOffset = configuredOffsets[i] + shifted.dayDelta;
+        final candidateTime = shifted.time;
+
+        if (latest == null ||
+            candidateDayOffset > latest.dayOffset ||
+            (candidateDayOffset == latest.dayOffset &&
+                _toMins(candidateTime) > _toMins(latest.time))) {
+          latest = (time: candidateTime, dayOffset: candidateDayOffset);
         }
       }
     }
 
     if (latest == null) return;
 
-    // Warning should be ~5-10 min AFTER the latest late.
-    final shifted = _shiftWithDayDelta(latest, _inactivityAfterLateBuffer);
-
     final today = _dayOnly(DateTime.now());
     final targetDay = today.add(
-      Duration(days: _inactivityDays + shifted.dayDelta),
+      Duration(days: _inactivityDays + latest.dayOffset),
     );
 
-    final when = _atLocalDayTime(targetDay, shifted.time);
+    final when = _atLocalDayTime(targetDay, latest.time);
 
     await _scheduleOneShot(
       id: _inactivityWarningId,
@@ -504,7 +497,8 @@ class NotificationService {
 
     debugPrint(
       'NOTIF: inactivity warning scheduled id=$_inactivityWarningId '
-      'when=${when.toIso8601String()} (latestBase=${latest.hour}:${latest.minute})',
+      'when=${when.toIso8601String()} '
+      'latestDayOffset=${latest.dayOffset}',
     );
   }
 
@@ -541,6 +535,60 @@ class NotificationService {
   // ============================================================
   // Test helper
   // ============================================================
+
+  static List<int> _doseDayOffsets(List<String> orderedTimes) {
+    if (orderedTimes.isEmpty) return const <int>[];
+
+    final offsets = <int>[];
+    var currentOffset = 0;
+    int? previousMinutes;
+
+    for (final hhmm in orderedTimes) {
+      final t = _parse24h(hhmm);
+      final mins = _toMins(t);
+
+      if (previousMinutes != null && mins < previousMinutes) {
+        currentOffset += 1;
+      }
+
+      offsets.add(currentOffset);
+      previousMinutes = mins;
+    }
+
+    return offsets;
+  }
+
+  static List<({int doseIndex, TimeOfDay doseTime})> _occurrencesForActualDay({
+    required int actualDayOffset,
+    required List<String> orderedTimes,
+  }) {
+    if (actualDayOffset < 0 || orderedTimes.isEmpty) {
+      return <({int doseIndex, TimeOfDay doseTime})>[];
+    }
+
+    final parsedTimes = orderedTimes.map(_parse24h).toList(growable: false);
+    final doseOffsets = _doseDayOffsets(orderedTimes);
+    final maxDoseOffset = doseOffsets.fold<int>(0, (a, b) => a > b ? a : b);
+
+    final out = <({int doseIndex, TimeOfDay doseTime})>[];
+
+    for (
+      int cycleBaseOffset = actualDayOffset - maxDoseOffset;
+      cycleBaseOffset <= actualDayOffset;
+      cycleBaseOffset++
+    ) {
+      for (int doseIndex = 0; doseIndex < parsedTimes.length; doseIndex++) {
+        final actualOffset = cycleBaseOffset + doseOffsets[doseIndex];
+        if (actualOffset != actualDayOffset) continue;
+
+        out.add((doseIndex: doseIndex, doseTime: parsedTimes[doseIndex]));
+      }
+    }
+
+    out.sort((a, b) => _toMins(a.doseTime).compareTo(_toMins(b.doseTime)));
+
+    return out;
+  }
 
   static Future<void> scheduleTestIn(Duration fromNow) async {
     await init();
