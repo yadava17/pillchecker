@@ -56,6 +56,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const _pillDoseTimesKey =
       'pill_dose_times_v2'; // JSON: List<List<String>>
 
+  static const _localStatePillSigKey = 'pill_local_state_sig_v1';
   // -------- supply prefs keys --------
   static const _pillSupplyEnabledKey =
       'pill_supply_enabled_v1'; // JSON List<bool>
@@ -706,7 +707,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     final list = pillDoseTimes[pillIndex];
-    return list.map(_strToTime).toList(growable: false);
+    if (list.isEmpty) {
+      return [const TimeOfDay(hour: 8, minute: 0)];
+    }
+
+    final times = list.map(_strToTime).toList();
+
+    times.sort(
+      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
+    );
+    return times;
   }
 
   ({
@@ -864,10 +874,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _refreshAdherenceFromDb() async {
     if (medicationIds.isEmpty) return;
 
-    // Keep DB/history/calendar healthy in the background,
-    // but do NOT rebuild HomeScreen state from the DB.
+    // Keep backend dose rows/history available for calendar/history,
+    // but do NOT let backend "missed" logic drive HomeScreen UI.
     await _scheduleService.ensureDoseEventsForMedications(medicationIds);
-    await _adherenceService.autoMarkMissedPastPlanned();
   }
 
   Future<Map<String, dynamic>> _deriveCheckMapFromDatabase() async {
@@ -978,6 +987,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     } catch (_) {}
     return <String, dynamic>{};
+  }
+
+  String _localStateSignature() {
+    // medicationIds are the safest stable identity you currently have
+    return medicationIds.join(',');
+  }
+
+  Future<void> _saveLocalStateSignature() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_localStatePillSigKey, _localStateSignature());
+  }
+
+  Future<void> _clearLocalDailyState({bool publish = true}) async {
+    _checkMapCache = <String, dynamic>{};
+    _lastCheckMapCache = <String, dynamic>{};
+    _lastMissedMapCache = <String, dynamic>{};
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_pillCheckKey);
+    await prefs.remove(_pillMissedKey);
+    await prefs.setString(_localStatePillSigKey, _localStateSignature());
+
+    if (publish) {
+      _publishLocalDailyState();
+    }
   }
 
   Future<void> _saveLocalDailyState() async {
@@ -1192,7 +1226,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return [const TimeOfDay(hour: 8, minute: 0)];
     }
 
-    return doseTimes24h[pillIndex].map(_strToTime).toList(growable: false);
+    final list = doseTimes24h[pillIndex];
+    if (list.isEmpty) {
+      return [const TimeOfDay(hour: 8, minute: 0)];
+    }
+
+    final times = list.map(_strToTime).toList();
+
+    times.sort(
+      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
+    );
+    return times;
   }
 
   Future<void> _muteAlreadyCheckedDosesToday({
@@ -1446,6 +1490,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     Duration grace = const Duration(hours: 2),
   }) {
     if (_isFirstDayForMedication(pillIndex)) return false;
+    if (pillIndex < 0 || pillIndex >= medicationCreatedAts.length) return false;
 
     final doses = _doseTimesForPill(pillIndex);
     if (doses.isEmpty) return false;
@@ -1836,11 +1881,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _doseBoundaryTimer = Timer(diff, () async {
       if (!mounted) return;
 
-      await _adherenceService.autoMarkMissedPastPlanned();
-
-      _checkMapFuture = _loadCheckMap();
-      setState(() {});
-
+      _publishLocalDailyState();
       _scheduleCenteredDoseBoundaryRefresh();
     });
   }
@@ -2038,7 +2079,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
-    unawaited(_refreshAdherenceFromDb());
     unawaited(_syncCurrentCycleAnchorOnly());
 
     final now = DateTime.now();
@@ -2257,20 +2297,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _loadCustomInfoFromPrefs();
 
     await _scheduleService.ensureDoseEventsForMedications(medicationIds);
-    await _adherenceService.autoMarkMissedPastPlanned();
+
+    // ✅ Do NOT auto-mark missed for HomeScreen startup.
+    // HomeScreen state should stay local-first.
+    // Calendar / History can still read backend logs separately.
+
+    final currentSig = _localStateSignature();
+    final savedSig = prefs.getString(_localStatePillSigKey) ?? '';
 
     await _loadLocalDailyState();
 
-    // One-time fallback for older installs that only have DB-derived state.
-    if (_checkMapCache.isEmpty &&
-        _lastMissedMapCache.isEmpty &&
-        pillNames.isNotEmpty) {
-      final loadedMap = await _deriveCheckMapFromDatabase();
-      _checkMapCache = loadedMap;
-      _lastCheckMapCache = Map<String, dynamic>.from(loadedMap);
-      await _saveLocalDailyState();
-      await _syncCurrentCycleAnchorOnly();
+    // If the pill list changed since the local home-state was saved,
+    // wipe local HomeScreen check/missed state so a new pill does not
+    // inherit stale slot-based state from an older one.
+    if (savedSig != currentSig) {
+      await _clearLocalDailyState(publish: false);
+      await prefs.setString(_localStatePillSigKey, currentSig);
     }
+    // ✅ HomeScreen stays local-first.
+    // Do NOT repopulate current-cycle UI state from the DB on cold launch.
+    // Calendar and History can still read the DB separately.
 
     await MedicationPrefsMirror.write(
       pillNames: pillNames,
@@ -2283,6 +2329,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       pillNameLocked: pillNameLocked,
     );
 
+    await _saveLocalStateSignature();
     await _syncCurrentCycleAnchorOnly();
     if (!mounted) return;
     setState(() {
@@ -2796,6 +2843,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _selectedPillInfo = null;
     });
 
+    await _clearLocalDailyState();
+    await _saveLocalStateSignature();
     await _syncCurrentCycleAnchorOnly();
 
     await MedicationPrefsMirror.write(
@@ -3020,6 +3069,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _step = _ConfigStep.name;
     });
 
+    await _clearLocalDailyState();
+    await _saveLocalStateSignature();
     await _syncCurrentCycleAnchorOnly();
 
     await MedicationPrefsMirror.write(
@@ -3186,6 +3237,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _setCheckMapAndRebuild(checkMap);
     _refreshCheckMapFuture();
 
+    await _clearLocalDailyState();
+    await _saveLocalStateSignature();
+
     await MedicationPrefsMirror.write(
       pillNames: pillNames,
       pillTimesFirst: pillTimes,
@@ -3218,7 +3272,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _lastSeenDayKey = dayKey;
 
     await _syncCurrentCycleAnchorOnly();
-    await _refreshAdherenceFromDb();
 
     if (!mounted) return;
 
@@ -4182,13 +4235,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   final doses = hasRealPill
                       ? _doseTimesForPill(idx!)
                       : <TimeOfDay>[];
-
-                  if (hasRealPill) {
-                    debugPrint(
-                      'PILL DEBUG idx=$idx firstDay=${_isFirstDayForMedication(idx)} '
-                      'doses=${doses.map(_fmt).toList()} createdAt=${medicationCreatedAts[idx].toLocal()} now=${DateTime.now()}',
-                    );
-                  }
 
                   final showLeft = hasRealPill && doses.length > 1;
 

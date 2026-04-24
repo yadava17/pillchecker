@@ -86,7 +86,11 @@ class NotificationService {
     await _configureLocalTimeZone();
 
     const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
-    const darwinInit = DarwinInitializationSettings();
+    const darwinInit = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
 
     const initSettings = InitializationSettings(
       android: androidInit,
@@ -655,6 +659,11 @@ class NotificationService {
     final suffix = pillName.trim().toLowerCase().endsWith('s') ? "'" : "'s";
     final body = '$pillName$suffix supply is running low. Make sure to refill!';
 
+    debugPrint(
+      'LOW SUPPLY IOS TEST: scheduling id=$id pill=$pillName '
+      'when=${when.toIso8601String()} mode=$_mode',
+    );
+
     await _scheduleOneShot(
       id: id,
       when: when,
@@ -793,6 +802,8 @@ class NotificationService {
     );
 
     const ios = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
       presentSound: true,
       sound: 'pillchecker_notification.wav',
     );
