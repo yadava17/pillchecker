@@ -93,6 +93,8 @@ class NotificationService {
       defaultPresentAlert: true,
       defaultPresentBadge: true,
       defaultPresentSound: true,
+      defaultPresentBanner: true,
+      defaultPresentList: true,
     );
 
     const initSettings = InitializationSettings(
@@ -808,6 +810,8 @@ class NotificationService {
       presentAlert: true,
       presentBadge: true,
       presentSound: true,
+      presentBanner: true,
+      presentList: true,
       sound: 'pillchecker_notification.wav',
     );
 
