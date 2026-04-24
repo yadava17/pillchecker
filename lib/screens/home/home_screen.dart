@@ -874,9 +874,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _refreshAdherenceFromDb() async {
     if (medicationIds.isEmpty) return;
 
-    // Keep backend dose rows/history available for calendar/history,
-    // but do NOT let backend "missed" logic drive HomeScreen UI.
     await _scheduleService.ensureDoseEventsForMedications(medicationIds);
+    await _adherenceService.autoMarkMissedPastPlanned();
   }
 
   Future<Map<String, dynamic>> _deriveCheckMapFromDatabase() async {
@@ -1881,7 +1880,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _doseBoundaryTimer = Timer(diff, () async {
       if (!mounted) return;
 
-      _publishLocalDailyState();
+      await _adherenceService.autoMarkMissedPastPlanned();
+
+      _checkMapFuture = _loadCheckMap();
+      setState(() {});
+
       _scheduleCenteredDoseBoundaryRefresh();
     });
   }
@@ -2079,7 +2082,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
-    unawaited(_syncCurrentCycleAnchorOnly());
+    unawaited(_refreshAdherenceFromDb());
 
     final now = DateTime.now();
     final dayKey = now.year * 10000 + now.month * 100 + now.day;
@@ -2297,10 +2300,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _loadCustomInfoFromPrefs();
 
     await _scheduleService.ensureDoseEventsForMedications(medicationIds);
-
-    // ✅ Do NOT auto-mark missed for HomeScreen startup.
-    // HomeScreen state should stay local-first.
-    // Calendar / History can still read backend logs separately.
+    await _adherenceService.autoMarkMissedPastPlanned();
 
     final currentSig = _localStateSignature();
     final savedSig = prefs.getString(_localStatePillSigKey) ?? '';
@@ -3272,6 +3272,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _lastSeenDayKey = dayKey;
 
     await _syncCurrentCycleAnchorOnly();
+    await _refreshAdherenceFromDb();
 
     if (!mounted) return;
 
