@@ -2848,7 +2848,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final weekProgressFillColor = weekProgressComplete
         ? const Color(0xFF59FF56)
         : const Color.fromARGB(255, 36, 251, 255);
-    final iosStreakShiftX = Platform.isIOS ? 10.0 : 0.0;
+    final iosStreakShiftX = Platform.isIOS ? 5.0 : 0.0;
     final safeCompletedDayIndexes = completedDayIndexes
         .where((day) => day >= 0 && day <= 6)
         .toSet();
@@ -3135,7 +3135,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                 openAnimDuration: const Duration(
                                   milliseconds: 750,
                                 ),
-                                openSpeedMultiplier: 7,
+                                openSpeedMultiplier: Platform.isIOS ? 8 : 7,
                               ),
                             ),
                           ),
@@ -3373,134 +3373,139 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               const Spacer(),
 
               // Bottom stats section
-              Container(
-                width: double.infinity,
-                padding: EdgeInsets.symmetric(vertical: s(10)),
-                decoration: BoxDecoration(color: _streakBand.withOpacity(0.40)),
-                child: Padding(
-                  padding: EdgeInsets.symmetric(horizontal: s(24)),
-                  child: SizedBox(
-                    height: s(118),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              SizedBox(
-                                height: s(36),
-                                child: Center(
-                                  child: Text(
-                                    'Longest Streak',
-                                    textAlign: TextAlign.center,
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontFamily: 'Amaranth',
-                                      fontSize: fs(22),
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.white,
-                                      height: 0.95,
-                                      shadows: const [
-                                        Shadow(
-                                          blurRadius: 2,
-                                          offset: Offset(1.5, 1),
-                                          color: Color.fromARGB(100, 0, 0, 0),
-                                        ),
-                                      ],
+              Transform.translate(
+                offset: Offset(0, Platform.isIOS ? -s(10) : 0),
+                child: Container(
+                  width: double.infinity,
+                  padding: EdgeInsets.symmetric(vertical: s(10)),
+                  decoration: BoxDecoration(
+                    color: _streakBand.withOpacity(0.40),
+                  ),
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(horizontal: s(24)),
+                    child: SizedBox(
+                      height: s(118),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(
+                                  height: s(36),
+                                  child: Center(
+                                    child: Text(
+                                      'Longest Streak',
+                                      textAlign: TextAlign.center,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontFamily: 'Amaranth',
+                                        fontSize: fs(22),
+                                        fontWeight: FontWeight.w700,
+                                        color: Colors.white,
+                                        height: 0.95,
+                                        shadows: const [
+                                          Shadow(
+                                            blurRadius: 2,
+                                            offset: Offset(1.5, 1),
+                                            color: Color.fromARGB(100, 0, 0, 0),
+                                          ),
+                                        ],
+                                      ),
                                     ),
                                   ),
                                 ),
-                              ),
-                              SizedBox(height: s(0)),
-                              SizedBox(
-                                height: s(66),
-                                child: Center(
-                                  child: Text(
-                                    longestStreakValue,
-                                    style: TextStyle(
-                                      fontFamily: 'Amaranth',
-                                      fontSize: fs(32),
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.white,
-                                      height: 1.0,
-                                      shadows: const [
-                                        Shadow(
-                                          blurRadius: 2,
-                                          offset: Offset(1.5, 1),
-                                          color: Color.fromARGB(100, 0, 0, 0),
-                                        ),
-                                      ],
+                                SizedBox(height: s(0)),
+                                SizedBox(
+                                  height: s(66),
+                                  child: Center(
+                                    child: Text(
+                                      longestStreakValue,
+                                      style: TextStyle(
+                                        fontFamily: 'Amaranth',
+                                        fontSize: fs(32),
+                                        fontWeight: FontWeight.w700,
+                                        color: Colors.white,
+                                        height: 1.0,
+                                        shadows: const [
+                                          Shadow(
+                                            blurRadius: 2,
+                                            offset: Offset(1.5, 1),
+                                            color: Color.fromARGB(100, 0, 0, 0),
+                                          ),
+                                        ],
+                                      ),
                                     ),
                                   ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
-                        ),
 
-                        Container(
-                          width: s(2),
-                          height: s(118),
-                          color: const Color.fromARGB(170, 0, 88, 33),
-                        ),
-
-                        Expanded(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              SizedBox(
-                                height: s(36),
-                                child: Center(
-                                  child: Text(
-                                    'Most Weeks\nCompleted',
-                                    textAlign: TextAlign.center,
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontFamily: 'Amaranth',
-                                      fontSize: fs(18),
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.white,
-                                      height: 0.95,
-                                      shadows: const [
-                                        Shadow(
-                                          blurRadius: 2,
-                                          offset: Offset(1.5, 1),
-                                          color: Color.fromARGB(100, 0, 0, 0),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              SizedBox(height: s(0)),
-                              SizedBox(
-                                height: s(66),
-                                child: Center(
-                                  child: Text(
-                                    mostWeeksCompletedValue,
-                                    style: TextStyle(
-                                      fontFamily: 'Amaranth',
-                                      fontSize: fs(32),
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.white,
-                                      height: 1.0,
-                                      shadows: const [
-                                        Shadow(
-                                          blurRadius: 2,
-                                          offset: Offset(1.5, 1),
-                                          color: Color.fromARGB(100, 0, 0, 0),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
+                          Container(
+                            width: s(2),
+                            height: s(118),
+                            color: const Color.fromARGB(170, 0, 88, 33),
                           ),
-                        ),
-                      ],
+
+                          Expanded(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(
+                                  height: s(36),
+                                  child: Center(
+                                    child: Text(
+                                      'Most Weeks\nCompleted',
+                                      textAlign: TextAlign.center,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontFamily: 'Amaranth',
+                                        fontSize: fs(18),
+                                        fontWeight: FontWeight.w700,
+                                        color: Colors.white,
+                                        height: 0.95,
+                                        shadows: const [
+                                          Shadow(
+                                            blurRadius: 2,
+                                            offset: Offset(1.5, 1),
+                                            color: Color.fromARGB(100, 0, 0, 0),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                SizedBox(height: s(0)),
+                                SizedBox(
+                                  height: s(66),
+                                  child: Center(
+                                    child: Text(
+                                      mostWeeksCompletedValue,
+                                      style: TextStyle(
+                                        fontFamily: 'Amaranth',
+                                        fontSize: fs(32),
+                                        fontWeight: FontWeight.w700,
+                                        color: Colors.white,
+                                        height: 1.0,
+                                        shadows: const [
+                                          Shadow(
+                                            blurRadius: 2,
+                                            offset: Offset(1.5, 1),
+                                            color: Color.fromARGB(100, 0, 0, 0),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -3509,36 +3514,39 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               SizedBox(height: s(22)),
 
               // Exit button
-              Padding(
-                padding: EdgeInsets.fromLTRB(s(10), 0, s(10), s(18)),
-                child: SizedBox(
-                  width: double.infinity,
-                  height: s(54),
-                  child: Material(
-                    color: _streakExitRed,
-                    borderRadius: BorderRadius.circular(s(16)),
-                    child: InkWell(
+              Transform.translate(
+                offset: Offset(0, Platform.isIOS ? -s(10) : 0),
+                child: Padding(
+                  padding: EdgeInsets.fromLTRB(s(10), 0, s(10), s(18)),
+                  child: SizedBox(
+                    width: double.infinity,
+                    height: s(54),
+                    child: Material(
+                      color: _streakExitRed,
                       borderRadius: BorderRadius.circular(s(16)),
-                      onTap: onClose,
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Text(
-                            'Exit',
-                            style: TextStyle(
-                              fontFamily: 'Amaranth',
-                              fontSize: fs(21),
-                              fontWeight: FontWeight.w700,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(s(16)),
+                        onTap: onClose,
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              'Exit',
+                              style: TextStyle(
+                                fontFamily: 'Amaranth',
+                                fontSize: fs(21),
+                                fontWeight: FontWeight.w700,
+                                color: Colors.white,
+                              ),
+                            ),
+                            SizedBox(width: s(8)),
+                            Icon(
+                              Icons.arrow_forward_rounded,
+                              size: s(24),
                               color: Colors.white,
                             ),
-                          ),
-                          SizedBox(width: s(8)),
-                          Icon(
-                            Icons.arrow_forward_rounded,
-                            size: s(24),
-                            color: Colors.white,
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -4164,6 +4172,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return messages[index];
   }
 
+  String _pickWeekCompleteMessage() {
+    return _pickRandomMessage(const [
+      'Week Complete! Good job!',
+      'Week Complete! You did it!',
+      'Week Complete! Great work!',
+      'Week Complete! Keep it going!',
+      'Week Complete! That’s a full week!',
+      'Week Complete! Proud of you!',
+      'Week Complete! Another one down!',
+      'Week Complete! You stayed consistent!',
+    ]);
+  }
+
   String _pickStreakStatusMessage(_StreakState state) {
     final current = state.currentStreak;
     final weeks = state.weeksCompleted;
@@ -4179,6 +4200,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         "You’ve got time to recover!",
         "Not over yet!",
       ]);
+    }
+
+    if (progress >= 7) {
+      return _pickWeekCompleteMessage();
     }
 
     if (current == 0 && weeks == 0 && progress == 0) {
@@ -4275,25 +4300,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       if (mounted) {
         setState(() {
-          _streakStatusMessage = 'Week complete!';
+          _streakStatusMessage = _pickWeekCompleteMessage();
         });
       } else {
-        _streakStatusMessage = 'Week complete!';
+        _streakStatusMessage = _pickWeekCompleteMessage();
       }
 
       _streakMessageTimer = Timer(const Duration(seconds: 9), () {
         if (!mounted) return;
 
         setState(() {
-          _streakStatusMessage = _pickRandomMessage(const [
-            "Let's tackle this next week!",
-            "New week, same momentum!",
-            "Run it back!",
-            "Another week starts now!",
-            "Keep the rhythm going!",
-            "Time for the next one!",
-            "Let’s stack another week!",
-          ]);
+          _streakStatusMessage = _pickWeekCompleteMessage();
         });
       });
 
@@ -8001,6 +8018,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             // --- STREAKS STORYBOARD SCREEN ---
             Positioned.fill(
               top: streaksPanelTop + (Platform.isIOS ? -s(12) : 0),
+              bottom: Platform.isIOS ? s(10) : 0,
               child: IgnorePointer(
                 ignoring: !streaksScreenVisible,
                 child: AnimatedOpacity(
