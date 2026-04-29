@@ -3135,7 +3135,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                 openAnimDuration: const Duration(
                                   milliseconds: 750,
                                 ),
-                                openSpeedMultiplier: Platform.isIOS ? 8 : 7,
+                                openSpeedMultiplier: Platform.isIOS ? 10 : 7,
                               ),
                             ),
                           ),
@@ -3374,7 +3374,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
               // Bottom stats section
               Transform.translate(
-                offset: Offset(0, Platform.isIOS ? -s(10) : 0),
+                offset: Offset(0, Platform.isIOS ? s(10) : 0),
                 child: Container(
                   width: double.infinity,
                   padding: EdgeInsets.symmetric(vertical: s(10)),
@@ -3515,7 +3515,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
               // Exit button
               Transform.translate(
-                offset: Offset(0, Platform.isIOS ? -s(10) : 0),
+                offset: Offset(0, Platform.isIOS ? s(5) : 0),
                 child: Padding(
                   padding: EdgeInsets.fromLTRB(s(10), 0, s(10), s(18)),
                   child: SizedBox(
@@ -8018,7 +8018,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             // --- STREAKS STORYBOARD SCREEN ---
             Positioned.fill(
               top: streaksPanelTop + (Platform.isIOS ? -s(12) : 0),
-              bottom: Platform.isIOS ? s(10) : 0,
+              bottom: Platform.isIOS ? s(25) : 0,
               child: IgnorePointer(
                 ignoring: !streaksScreenVisible,
                 child: AnimatedOpacity(
