@@ -2848,10 +2848,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final weekProgressFillColor = weekProgressComplete
         ? const Color(0xFF59FF56)
         : const Color.fromARGB(255, 36, 251, 255);
-    final iosStreakShiftX = Platform.isIOS
+    final streakShiftX = Platform.isIOS
         ? 5.0
         : Platform.isAndroid
-        ? 15.0
+        ? 10.0
         : 0.0;
     final safeCompletedDayIndexes = completedDayIndexes
         .where((day) => day >= 0 && day <= 6)
@@ -2886,7 +2886,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       required Color color,
     }) {
       return Positioned(
-        left: s((55.5 * day) + 2.5 + (day * 1.075) + iosStreakShiftX),
+        left: s((55.5 * day) + 2.5 + (day * 1.075)),
         top: s(8),
         child: IgnorePointer(
           child: AnimatedOpacity(
@@ -3147,81 +3147,98 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ),
                     ),
 
-                    // Blue divider line overlays for streak pillbox sections.
-                    for (final left in [
-                      55.0,
-                      111.5,
-                      168.0,
-                      224.5,
-                      281.0,
-                      337.0,
-                    ])
-                      Positioned(
-                        left: s(left + iosStreakShiftX),
-                        top: s(8),
-                        child: IgnorePointer(
-                          child: Container(
-                            width: s(2),
-                            height: s(60),
-                            decoration: BoxDecoration(
-                              color: const Color.fromARGB(255, 108, 157, 225),
-                              borderRadius: BorderRadius.circular(s(99)),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: Colors.black.withOpacity(0.18),
-                                  blurRadius: s(3),
-                                  offset: Offset(0, s(1)),
+                    // Shift all streak pillbox overlays together.
+                    // This is more reliable across real devices than shifting every left value.
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: Transform.translate(
+                          offset: Offset(s(streakShiftX), 0),
+                          child: Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              // Blue divider line overlays for streak pillbox sections.
+                              for (final left in [
+                                55.0,
+                                110.0,
+                                165.0,
+                                220.0,
+                                275.0,
+                                330.0,
+                              ])
+                                Positioned(
+                                  left: s(left),
+                                  top: s(8),
+                                  child: Container(
+                                    width: s(2),
+                                    height: s(60),
+                                    decoration: BoxDecoration(
+                                      color: const Color.fromARGB(
+                                        255,
+                                        102,
+                                        149,
+                                        214,
+                                      ),
+                                      borderRadius: BorderRadius.circular(
+                                        s(99),
+                                      ),
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: Colors.black.withOpacity(0.18),
+                                          blurRadius: s(3),
+                                          offset: Offset(0, s(1)),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
                                 ),
-                              ],
-                            ),
+
+                              // Pulsing Start / Next / End markers.
+                              if (showStartMarker)
+                                markerForDay(
+                                  day: displayStartDay!,
+                                  label: 'Start',
+                                  color: const Color(0xFF59FF56),
+                                ),
+
+                              if (showNextMarker)
+                                markerForDay(
+                                  day: safeNextRequiredDay!,
+                                  label: 'Next',
+                                  color: const Color(0xFFFFD447),
+                                ),
+
+                              if (showEndMarker)
+                                markerForDay(
+                                  day: displayEndDay!,
+                                  label: 'End',
+                                  color: const Color(0xFFFF0037),
+                                ),
+
+                              // Mini daily completion circles over the streak pillbox.
+                              if (streakDotsVisible)
+                                for (int day = 0; day < 7; day++)
+                                  Positioned(
+                                    key: ValueKey(
+                                      'streak_mini_circle_position_$day',
+                                    ),
+                                    left: s(
+                                      (21.25 + (day + (day * 55.085)) - 16.0),
+                                    ),
+                                    top: s(-50.5),
+                                    child: _StreakMiniCompletionCircle(
+                                      key: ValueKey('streak_mini_circle_$day'),
+                                      done: safeCompletedDayIndexes.contains(
+                                        day,
+                                      ),
+                                      size: s(47.5),
+                                      delay: Duration(milliseconds: day * 125),
+                                    ),
+                                  ),
+                            ],
                           ),
                         ),
                       ),
-
-                    // Pulsing Start / Next / End markers.
-                    // Put these after divider lines and before mini completion circles.
-                    if (showStartMarker)
-                      markerForDay(
-                        day: displayStartDay!,
-                        label: 'Start',
-                        color: const Color(0xFF59FF56),
-                      ),
-
-                    if (showNextMarker)
-                      markerForDay(
-                        day: safeNextRequiredDay!,
-                        label: 'Next',
-                        color: const Color(0xFFFFD447),
-                      ),
-
-                    if (showEndMarker)
-                      markerForDay(
-                        day: displayEndDay!,
-                        label: 'End',
-                        color: const Color(0xFFFF0037),
-                      ),
-
-                    // Mini daily completion circles over the streak pillbox.
-                    // They appear only after the pillbox tabs finish opening.
-                    // 0 = Sun, 1 = Mon, ... 6 = Sat.
-                    if (streakDotsVisible)
-                      for (int day = 0; day < 7; day++)
-                        Positioned(
-                          key: ValueKey('streak_mini_circle_position_$day'),
-                          left: s(
-                            (21.25 + (day + (day * 55.085)) - 16.0) +
-                                iosStreakShiftX,
-                          ),
-                          top: s(-50.5),
-                          child: IgnorePointer(
-                            child: _StreakMiniCompletionCircle(
-                              key: ValueKey('streak_mini_circle_$day'),
-                              done: safeCompletedDayIndexes.contains(day),
-                              size: s(47.5),
-                              delay: Duration(milliseconds: day * 125),
-                            ),
-                          ),
-                        ),
+                    ),
                   ],
                 ),
               ),
