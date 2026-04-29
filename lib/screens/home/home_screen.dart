@@ -2851,7 +2851,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final streakShiftX = Platform.isIOS
         ? 5.0
         : Platform.isAndroid
-        ? 10.0
+        ? 15.0
         : 0.0;
     final safeCompletedDayIndexes = completedDayIndexes
         .where((day) => day >= 0 && day <= 6)
