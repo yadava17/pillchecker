@@ -3157,16 +3157,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             clipBehavior: Clip.none,
                             children: [
                               // Blue divider line overlays for streak pillbox sections.
-                              for (final left in [
-                                55.0,
-                                110.0,
-                                165.0,
-                                220.0,
-                                275.0,
-                                330.0,
-                              ])
+                              for (int i = 0; i < 6; i++)
                                 Positioned(
-                                  left: s(left),
+                                  left: s(
+                                    [
+                                          55.0,
+                                          110.0,
+                                          165.0,
+                                          220.0,
+                                          275.0,
+                                          330.0,
+                                        ][i] +
+                                        (Platform.isAndroid ? (i * 1.5) : 0.0),
+                                  ),
                                   top: s(8),
                                   child: Container(
                                     width: s(2),
