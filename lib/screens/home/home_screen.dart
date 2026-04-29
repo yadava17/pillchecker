@@ -2848,7 +2848,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final weekProgressFillColor = weekProgressComplete
         ? const Color(0xFF59FF56)
         : const Color.fromARGB(255, 36, 251, 255);
-    final iosStreakShiftX = (Platform.isIOS || Platform.isAndroid) ? 5.0 : 0.0;
+    final iosStreakShiftX = Platform.isIOS
+        ? 5.0
+        : Platform.isAndroid
+        ? 15.0
+        : 0.0;
     final safeCompletedDayIndexes = completedDayIndexes
         .where((day) => day >= 0 && day <= 6)
         .toSet();
