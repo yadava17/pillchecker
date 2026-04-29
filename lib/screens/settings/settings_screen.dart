@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:pillchecker/backend/services/adherence_service.dart';
 import 'package:pillchecker/screens/history/history_screen.dart';
 import 'package:pillchecker/screens/settings/credits_screen.dart';
+import 'dart:convert';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -24,6 +25,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   bool _notifExpanded = false;
   bool _supplyExpanded = false;
+  bool _streaksExpanded = false;
   bool _feedbackExpanded = false;
 
   String _mode = 'standard';
@@ -40,6 +42,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   String _origSupplyMode = 'decide';
   int _origSupplyLow = 10;
+  static const String _streakStateKey = 'pill_streak_state_v1';
+
+  bool _streaksEnabled = true;
+  bool _origStreaksEnabled = true;
   final AdherenceService _adherenceService = AdherenceService();
 
   @override
@@ -81,6 +87,99 @@ class _SettingsScreenState extends State<SettingsScreen> {
     Navigator.pop(context, false);
   }
 
+  Map<String, dynamic> _decodeStreakStateMap(String? raw) {
+    if (raw == null || raw.trim().isEmpty) {
+      return <String, dynamic>{};
+    }
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        return Map<String, dynamic>.from(decoded);
+      }
+    } catch (_) {}
+
+    return <String, dynamic>{};
+  }
+
+  bool _readBoolFromMap(Map<String, dynamic> map, String key, bool fallback) {
+    final v = map[key];
+    if (v is bool) return v;
+    return fallback;
+  }
+
+  Future<void> _saveStreakSettings(SharedPreferences prefs) async {
+    final map = _decodeStreakStateMap(prefs.getString(_streakStateKey));
+
+    map['streaksEnabled'] = _streaksEnabled;
+
+    // Keep existing override setting if it exists.
+    map['overrideRestoresStreak'] = map['overrideRestoresStreak'] is bool
+        ? map['overrideRestoresStreak']
+        : true;
+
+    await prefs.setString(_streakStateKey, jsonEncode(map));
+  }
+
+  Future<void> _resetStreaksWithWarning() async {
+    final ok =
+        await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Reset streaks?'),
+            content: const Text(
+              'This will reset your current streak, longest streak, weekly progress, weeks completed, and most weeks completed back to 0. This cannot be undone.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Reset'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+
+    if (!ok) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    final map = _decodeStreakStateMap(prefs.getString(_streakStateKey));
+
+    map['streaksEnabled'] = _streaksEnabled;
+    map['overrideRestoresStreak'] = map['overrideRestoresStreak'] is bool
+        ? map['overrideRestoresStreak']
+        : true;
+
+    map['currentStreak'] = 0;
+    map['longestStreak'] = 0;
+    map['weeksCompleted'] = 0;
+    map['mostWeeksCompleted'] = 0;
+    map['weekProgress'] = 0;
+    map['weekStartDayIndex'] = null;
+    map['nextRequiredDayIndex'] = null;
+    map['lastCompletedDayKey'] = null;
+    map['pendingLostDayKey'] = null;
+    map['pendingLostStreakValue'] = null;
+    map['seenHighestStreak'] = 0;
+    map['completedDayKeys'] = <int>[];
+
+    await prefs.setString(_streakStateKey, jsonEncode(map));
+
+    if (!mounted) return;
+
+    setState(() {
+      _origStreaksEnabled = _streaksEnabled;
+    });
+
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Streaks reset.')));
+  }
+
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
 
@@ -93,6 +192,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       5,
       999,
     );
+
+    final streakMap = _decodeStreakStateMap(prefs.getString(_streakStateKey));
+    final streaksEnabled = _readBoolFromMap(streakMap, 'streaksEnabled', true);
 
     setState(() {
       _supplyMode = supplyMode;
@@ -111,6 +213,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _origEarly = early;
       _origLate = late;
 
+      _streaksEnabled = streaksEnabled;
+      _origStreaksEnabled = streaksEnabled;
+
       _loaded = true;
     });
   }
@@ -120,7 +225,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _earlyMin != _origEarly ||
       _lateMin != _origLate ||
       _supplyMode != _origSupplyMode ||
-      _supplyLow != _origSupplyLow;
+      _supplyLow != _origSupplyLow ||
+      _streaksEnabled != _origStreaksEnabled;
 
   String _hmLabel(int totalMinutes) {
     final h = totalMinutes ~/ 60;
@@ -316,6 +422,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await prefs.setInt(kLateAfterMinKey, _lateMin.clamp(0, 120));
     await prefs.setString(kSupplyModeKey, _supplyMode);
     await prefs.setInt(kSupplyLowThresholdKey, _supplyLow);
+    await _saveStreakSettings(prefs);
 
     debugPrint('SETTINGS SAVE: mode=$_mode early=$_earlyMin late=$_lateMin');
     debugPrint(
@@ -688,6 +795,84 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             ),
                             onPlus: () => setState(
                               () => _supplyLow = (_supplyLow + 1).clamp(5, 999),
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 18),
+
+                      _expandSection(
+                        title: 'Streaks',
+                        expanded: _streaksExpanded,
+                        onChanged: (v) => setState(() => _streaksExpanded = v),
+                        children: [
+                          const SizedBox(height: 6),
+
+                          SwitchListTile.adaptive(
+                            contentPadding: EdgeInsets.zero,
+                            activeColor: const Color(0xFF59FF56),
+                            value: _streaksEnabled,
+                            onChanged: (v) {
+                              setState(() {
+                                _streaksEnabled = v;
+                              });
+                            },
+                            title: const Text(
+                              'Enable streaks',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 16,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            subtitle: const Text(
+                              'Show the streak button and streak tracking screen.',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+
+                          const SizedBox(height: 12),
+
+                          SizedBox(
+                            width: double.infinity,
+                            height: 48,
+                            child: OutlinedButton(
+                              onPressed: _resetStreaksWithWarning,
+                              style: OutlinedButton.styleFrom(
+                                backgroundColor: const Color(0xFFFF002E),
+                                foregroundColor: Colors.white,
+                                side: const BorderSide(
+                                  color: Color(0xFFFF002E),
+                                  width: 1.5,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(16),
+                                ),
+                              ),
+                              child: const Text(
+                                'Reset Streaks',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w800,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+
+                          const SizedBox(height: 8),
+
+                          const Text(
+                            'Resetting clears all streak progress and personal bests.',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
                             ),
                           ),
                         ],

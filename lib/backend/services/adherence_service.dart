@@ -63,24 +63,19 @@ class AdherenceService {
   Future<void> confirmTaken(int doseEventId) async {
     final db = await _database;
     await db.transaction((txn) async {
-      final cur = await txn.query(
-        'dose_events',
-        where: 'id = ?',
-        whereArgs: [doseEventId],
-        limit: 1,
-      );
-      if (cur.isEmpty) return;
-      if ((cur.first['status'] as String) != 'planned') return;
-
-      await txn.update(
+      final changed = await txn.update(
         'dose_events',
         {
           'status': 'taken',
           'taken_at': DateTime.now().toUtc().toIso8601String(),
         },
-        where: 'id = ?',
-        whereArgs: [doseEventId],
+        where: 'id = ? AND status = ?',
+        whereArgs: [doseEventId, 'planned'],
       );
+
+      // If another caller already changed it, do not insert another log.
+      if (changed == 0) return;
+
       await _insertLog(txn, doseEventId, 'taken');
     });
   }
@@ -88,21 +83,16 @@ class AdherenceService {
   Future<void> markMissed(int doseEventId) async {
     final db = await _database;
     await db.transaction((txn) async {
-      final cur = await txn.query(
-        'dose_events',
-        where: 'id = ?',
-        whereArgs: [doseEventId],
-        limit: 1,
-      );
-      if (cur.isEmpty) return;
-      if ((cur.first['status'] as String) != 'planned') return;
-
-      await txn.update(
+      final changed = await txn.update(
         'dose_events',
         {'status': 'missed'},
-        where: 'id = ?',
-        whereArgs: [doseEventId],
+        where: 'id = ? AND status = ?',
+        whereArgs: [doseEventId, 'planned'],
       );
+
+      // If another caller already changed it, do not insert another log.
+      if (changed == 0) return;
+
       await _insertLog(txn, doseEventId, 'missed');
     });
   }
@@ -145,11 +135,7 @@ class AdherenceService {
       } else {
         await txn.update(
           'dose_events',
-          {
-            'status': 'missed',
-            'is_overridden': 0,
-            'taken_at': null,
-          },
+          {'status': 'missed', 'is_overridden': 0, 'taken_at': null},
           where: 'id = ?',
           whereArgs: [doseEventId],
         );
@@ -169,7 +155,7 @@ class AdherenceService {
 
   /// Auto-mark planned doses as missed after a grace period past planned local time.
   Future<void> autoMarkMissedPastPlanned({
-    Duration grace = const Duration(hours: 2),
+    Duration grace = const Duration(hours: 4),
   }) async {
     final db = await _database;
 
@@ -190,19 +176,122 @@ WHERE e.status = 'planned'
       final planned = DateTime.parse(r['planned_at']! as String).toLocal();
       final created = DateTime.parse(r['created_at']! as String).toLocal();
 
-      final createdIsToday =
-          created.year == now.year &&
-          created.month == now.month &&
-          created.day == now.day;
+      final plannedDay = DateTime(planned.year, planned.month, planned.day);
+      final createdDay = DateTime(created.year, created.month, created.day);
 
-      if (createdIsToday) {
-        continue; // never miss a pill on its first day
+      // ✅ Prevent yesterday/backfilled rows from being marked missed
+      // for pills that were only created today.
+      // This still allows a pill to become missed on day 1.
+      if (plannedDay.isBefore(createdDay)) {
+        continue;
       }
 
       if (now.isAfter(planned.add(grace))) {
         await markMissed(r['id']! as int);
       }
     }
+  }
+
+  Future<bool> confirmTakenByPlannedUtc({
+    required int medicationId,
+    required String plannedAtUtcIso,
+  }) async {
+    final db = await _database;
+
+    return db.transaction((txn) async {
+      final rows = await txn.query(
+        'dose_events',
+        columns: ['id', 'status'],
+        where: 'medication_id = ? AND planned_at = ?',
+        whereArgs: [medicationId, plannedAtUtcIso],
+        limit: 1,
+      );
+
+      if (rows.isEmpty) return false;
+
+      final id = rows.first['id']! as int;
+      final status = rows.first['status']! as String;
+
+      if (status == 'taken') return true;
+
+      if (status == 'planned') {
+        final changed = await txn.update(
+          'dose_events',
+          {
+            'status': 'taken',
+            'taken_at': DateTime.now().toUtc().toIso8601String(),
+          },
+          where: 'id = ? AND status = ?',
+          whereArgs: [id, 'planned'],
+        );
+
+        if (changed == 0) return true;
+
+        await _insertLog(txn, id, 'taken');
+        return true;
+      }
+
+      // missed -> taken through override/correction
+      await txn.delete(
+        'adherence_logs',
+        where: 'dose_event_id = ?',
+        whereArgs: [id],
+      );
+
+      await txn.update(
+        'dose_events',
+        {
+          'status': 'taken',
+          'is_overridden': 1,
+          'taken_at': DateTime.now().toUtc().toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+
+      await _insertLog(txn, id, 'override');
+      return true;
+    });
+  }
+
+  Future<bool> markMissedByPlannedUtc({
+    required int medicationId,
+    required String plannedAtUtcIso,
+  }) async {
+    final db = await _database;
+
+    return db.transaction((txn) async {
+      final rows = await txn.query(
+        'dose_events',
+        columns: ['id', 'status'],
+        where: 'medication_id = ? AND planned_at = ?',
+        whereArgs: [medicationId, plannedAtUtcIso],
+        limit: 1,
+      );
+
+      if (rows.isEmpty) return false;
+
+      final id = rows.first['id']! as int;
+      final status = rows.first['status']! as String;
+
+      if (status == 'missed') return true;
+
+      await txn.delete(
+        'adherence_logs',
+        where: 'dose_event_id = ?',
+        whereArgs: [id],
+      );
+
+      await txn.update(
+        'dose_events',
+        {'status': 'missed', 'is_overridden': 0, 'taken_at': null},
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+
+      await _insertLog(txn, id, 'missed');
+      return true;
+    });
   }
 
   Future<List<HistoryEntry>> fetchHistory({int limit = 200}) async {

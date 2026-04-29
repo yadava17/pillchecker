@@ -46,6 +46,8 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
   List<bool> _myNameLocked = [];
 
   final TextEditingController _searchCtrl = TextEditingController();
+  final ScrollController _catalogueScrollCtrl = ScrollController();
+  final ScrollController _myPillsScrollCtrl = ScrollController();
   Timer? _debounce;
   bool _searchLoading = false;
   bool _servedFromCache = false;
@@ -113,6 +115,8 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
   void dispose() {
     _debounce?.cancel();
     _searchCtrl.dispose();
+    _catalogueScrollCtrl.dispose();
+    _myPillsScrollCtrl.dispose();
     _rxNormService.dispose();
     super.dispose();
   }
@@ -654,190 +658,207 @@ class _DirectoryScreenState extends State<DirectoryScreen> {
                           : TabBarView(
                               children: [
                                 // Catalogue tab
-                                ListView(
-                                  padding: const EdgeInsets.fromLTRB(
-                                    16,
-                                    0,
-                                    16,
-                                    16,
-                                  ),
-                                  children: [
-                                    if (_queryRaw.length >= 2 && _searchLoading)
-                                      const Padding(
-                                        padding: EdgeInsets.only(bottom: 10),
-                                        child: Center(
-                                          child: CircularProgressIndicator(),
-                                        ),
-                                      ),
-                                    if (_queryRaw.length >= 2 &&
-                                        _servedFromCache &&
-                                        _rxItems.isNotEmpty)
-                                      Container(
-                                        margin: const EdgeInsets.only(
-                                          bottom: 10,
-                                        ),
-                                        padding: const EdgeInsets.all(10),
-                                        decoration: BoxDecoration(
-                                          color: Colors.amber.shade100,
-                                          borderRadius: BorderRadius.circular(
-                                            12,
+                                Scrollbar(
+                                  controller: _catalogueScrollCtrl,
+                                  thumbVisibility: true,
+                                  thickness: 5,
+                                  radius: const Radius.circular(99),
+                                  child: ListView(
+                                    controller: _catalogueScrollCtrl,
+                                    padding: const EdgeInsets.fromLTRB(
+                                      16,
+                                      0,
+                                      16,
+                                      16,
+                                    ),
+                                    children: [
+                                      if (_queryRaw.length >= 2 &&
+                                          _searchLoading)
+                                        const Padding(
+                                          padding: EdgeInsets.only(bottom: 10),
+                                          child: Center(
+                                            child: CircularProgressIndicator(),
                                           ),
                                         ),
-                                        child: Text(
-                                          'Showing saved RxNorm results (offline or API unavailable).',
-                                          style: TextStyle(
-                                            color: Colors.amber.shade900,
-                                            fontWeight: FontWeight.w600,
+                                      if (_queryRaw.length >= 2 &&
+                                          _servedFromCache &&
+                                          _rxItems.isNotEmpty)
+                                        Container(
+                                          margin: const EdgeInsets.only(
+                                            bottom: 10,
+                                          ),
+                                          padding: const EdgeInsets.all(10),
+                                          decoration: BoxDecoration(
+                                            color: Colors.amber.shade100,
+                                            borderRadius: BorderRadius.circular(
+                                              12,
+                                            ),
+                                          ),
+                                          child: Text(
+                                            'Showing saved RxNorm results (offline or API unavailable).',
+                                            style: TextStyle(
+                                              color: Colors.amber.shade900,
+                                              fontWeight: FontWeight.w600,
+                                            ),
                                           ),
                                         ),
-                                      ),
-                                    if (_queryRaw.length >= 2 &&
-                                        _hadNetworkError &&
-                                        _rxItems.isEmpty)
-                                      Container(
-                                        margin: const EdgeInsets.only(
-                                          bottom: 10,
-                                        ),
-                                        padding: const EdgeInsets.all(10),
-                                        decoration: BoxDecoration(
-                                          color: Colors.teal.shade50,
-                                          borderRadius: BorderRadius.circular(
-                                            12,
+                                      if (_queryRaw.length >= 2 &&
+                                          _hadNetworkError &&
+                                          _rxItems.isEmpty)
+                                        Container(
+                                          margin: const EdgeInsets.only(
+                                            bottom: 10,
+                                          ),
+                                          padding: const EdgeInsets.all(10),
+                                          decoration: BoxDecoration(
+                                            color: Colors.teal.shade50,
+                                            borderRadius: BorderRadius.circular(
+                                              12,
+                                            ),
+                                          ),
+                                          child: Text(
+                                            'Offline — showing built-in medication names.',
+                                            style: TextStyle(
+                                              color: Colors.teal.shade900,
+                                              fontWeight: FontWeight.w600,
+                                            ),
                                           ),
                                         ),
-                                        child: Text(
-                                          'Offline — showing built-in medication names.',
-                                          style: TextStyle(
-                                            color: Colors.teal.shade900,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                        ),
-                                      ),
-                                    for (final p in _catalogForView)
-                                      _pillRow(
-                                        name: p.name,
-                                        subtitle: p.isRxNorm
-                                            ? (p.searchSubtitle ??
-                                                  (p.isFromCache
-                                                      ? 'RxNorm (saved)'
-                                                      : 'RxNorm'))
-                                            : '${p.suggestedTimesPerDay}× per day',
-                                        showAddButton: true,
-                                        addEnabled: !_alreadyAdded(p.name),
-                                        onAdd: !_alreadyAdded(p.name)
-                                            ? () async {
-                                                final ok =
-                                                    await showDialog<bool>(
-                                                      context: context,
-                                                      builder: (ctx) => AlertDialog(
-                                                        title: const Text(
-                                                          'Add this pill?',
-                                                        ),
-                                                        content: Text(
-                                                          'Add "${p.name}" to your wheel?',
-                                                        ),
-                                                        actions: [
-                                                          TextButton(
-                                                            onPressed: () =>
-                                                                Navigator.pop(
-                                                                  ctx,
-                                                                  false,
-                                                                ),
-                                                            child: const Text(
-                                                              'Cancel',
-                                                            ),
-                                                          ),
-                                                          TextButton(
-                                                            onPressed: () =>
-                                                                Navigator.pop(
-                                                                  ctx,
-                                                                  true,
-                                                                ),
-                                                            child: const Text(
-                                                              'Add',
-                                                            ),
-                                                          ),
-                                                        ],
-                                                      ),
-                                                    ) ??
-                                                    false;
-
-                                                if (!ok) return;
-                                                if (!context.mounted) return;
-                                                Navigator.pop(context, p);
-                                              }
-                                            : null,
-                                        onTap: () {
-                                          _openDetails(
-                                            name: p.name,
-                                            isCatalog: true,
-                                            addEnabled: !_alreadyAdded(p.name),
-                                            info: p.info,
-                                            addItem: p,
-                                          );
-                                        },
-                                      ),
-                                  ],
-                                ),
-
-                                // My Pills tab
-                                ListView(
-                                  padding: const EdgeInsets.fromLTRB(
-                                    16,
-                                    0,
-                                    16,
-                                    16,
-                                  ),
-                                  children: [
-                                    if (_myNames.isEmpty)
-                                      Container(
-                                        padding: const EdgeInsets.all(14),
-                                        decoration: BoxDecoration(
-                                          color: _card,
-                                          borderRadius: BorderRadius.circular(
-                                            18,
-                                          ),
-                                        ),
-                                        child: const Text(
-                                          'No pills added yet.',
-                                          style: TextStyle(
-                                            color: Colors.white70,
-                                          ),
-                                        ),
-                                      ),
-                                    for (int i = 0; i < _myNames.length; i++)
-                                      if (_matches(_myNames[i]))
+                                      for (final p in _catalogForView)
                                         _pillRow(
-                                          name: _myNames[i],
-                                          subtitle:
-                                              '${_myDoseTimes24h[i].length}× per day',
-                                          showAddButton: false,
+                                          name: p.name,
+                                          subtitle: p.isRxNorm
+                                              ? (p.searchSubtitle ??
+                                                    (p.isFromCache
+                                                        ? 'RxNorm (saved)'
+                                                        : 'RxNorm'))
+                                              : '${p.suggestedTimesPerDay}× per day',
+                                          showAddButton: true,
+                                          addEnabled: !_alreadyAdded(p.name),
+                                          onAdd: !_alreadyAdded(p.name)
+                                              ? () async {
+                                                  final ok =
+                                                      await showDialog<bool>(
+                                                        context: context,
+                                                        builder: (ctx) => AlertDialog(
+                                                          title: const Text(
+                                                            'Add this pill?',
+                                                          ),
+                                                          content: Text(
+                                                            'Add "${p.name}" to your wheel?',
+                                                          ),
+                                                          actions: [
+                                                            TextButton(
+                                                              onPressed: () =>
+                                                                  Navigator.pop(
+                                                                    ctx,
+                                                                    false,
+                                                                  ),
+                                                              child: const Text(
+                                                                'Cancel',
+                                                              ),
+                                                            ),
+                                                            TextButton(
+                                                              onPressed: () =>
+                                                                  Navigator.pop(
+                                                                    ctx,
+                                                                    true,
+                                                                  ),
+                                                              child: const Text(
+                                                                'Add',
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ),
+                                                      ) ??
+                                                      false;
+
+                                                  if (!ok) return;
+                                                  if (!context.mounted) return;
+                                                  Navigator.pop(context, p);
+                                                }
+                                              : null,
                                           onTap: () {
-                                            final isCustom =
-                                                i < _myNameLocked.length &&
-                                                _myNameLocked[i] == false;
-
-                                            final savedCustomInfo =
-                                                (i < _myCustomInfo.length)
-                                                ? _myCustomInfo[i].trim()
-                                                : '';
-
-                                            final infoText = isCustom
-                                                ? (savedCustomInfo.isNotEmpty
-                                                      ? savedCustomInfo
-                                                      : 'No custom pill info added yet.')
-                                                : 'Medication details available in the main pill info panel.';
-
                                             _openDetails(
-                                              name: _myNames[i],
-                                              isCatalog: false,
-                                              addEnabled: false,
-                                              info: infoText,
-                                              myPillIndex: i,
+                                              name: p.name,
+                                              isCatalog: true,
+                                              addEnabled: !_alreadyAdded(
+                                                p.name,
+                                              ),
+                                              info: p.info,
+                                              addItem: p,
                                             );
                                           },
                                         ),
-                                  ],
+                                    ],
+                                  ),
+                                ),
+
+                                // My Pills tab
+                                Scrollbar(
+                                  controller: _myPillsScrollCtrl,
+                                  thumbVisibility: true,
+                                  thickness: 5,
+                                  radius: const Radius.circular(99),
+                                  child: ListView(
+                                    controller: _myPillsScrollCtrl,
+                                    padding: const EdgeInsets.fromLTRB(
+                                      16,
+                                      0,
+                                      16,
+                                      16,
+                                    ),
+                                    children: [
+                                      if (_myNames.isEmpty)
+                                        Container(
+                                          padding: const EdgeInsets.all(14),
+                                          decoration: BoxDecoration(
+                                            color: _card,
+                                            borderRadius: BorderRadius.circular(
+                                              18,
+                                            ),
+                                          ),
+                                          child: const Text(
+                                            'No pills added yet.',
+                                            style: TextStyle(
+                                              color: Colors.white70,
+                                            ),
+                                          ),
+                                        ),
+                                      for (int i = 0; i < _myNames.length; i++)
+                                        if (_matches(_myNames[i]))
+                                          _pillRow(
+                                            name: _myNames[i],
+                                            subtitle:
+                                                '${_myDoseTimes24h[i].length}× per day',
+                                            showAddButton: false,
+                                            onTap: () {
+                                              final isCustom =
+                                                  i < _myNameLocked.length &&
+                                                  _myNameLocked[i] == false;
+
+                                              final savedCustomInfo =
+                                                  (i < _myCustomInfo.length)
+                                                  ? _myCustomInfo[i].trim()
+                                                  : '';
+
+                                              final infoText = isCustom
+                                                  ? (savedCustomInfo.isNotEmpty
+                                                        ? savedCustomInfo
+                                                        : 'No custom pill info added yet.')
+                                                  : 'Medication details available in the main pill info panel.';
+
+                                              _openDetails(
+                                                name: _myNames[i],
+                                                isCatalog: false,
+                                                addEnabled: false,
+                                                info: infoText,
+                                                myPillIndex: i,
+                                              );
+                                            },
+                                          ),
+                                    ],
+                                  ),
                                 ),
                               ],
                             ),

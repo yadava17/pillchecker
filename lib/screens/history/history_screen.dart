@@ -22,11 +22,18 @@ class _HistoryScreenState extends State<HistoryScreen> {
   static const Color _statusRed = Color(0xFFFF002E);
 
   late Future<List<HistoryEntry>> _future;
+  final ScrollController _historyScrollCtrl = ScrollController();
 
   @override
   void initState() {
     super.initState();
     _future = widget.adherenceService.fetchHistory();
+  }
+
+  @override
+  void dispose() {
+    _historyScrollCtrl.dispose();
+    super.dispose();
   }
 
   Future<void> _refresh() async {
@@ -133,90 +140,104 @@ class _HistoryScreenState extends State<HistoryScreen> {
 
                   final items = snap.data ?? const <HistoryEntry>[];
                   if (items.isEmpty) {
-                    return RefreshIndicator(
-                      onRefresh: _refresh,
-                      child: ListView(
-                        physics: const AlwaysScrollableScrollPhysics(),
-                        children: const [
-                          SizedBox(height: 120),
-                          Center(
-                            child: Text(
-                              'No adherence history yet.\nTaken, missed, and overridden doses will appear here.',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(color: Colors.white),
+                    return Scrollbar(
+                      controller: _historyScrollCtrl,
+                      thumbVisibility: true,
+                      thickness: 5,
+                      radius: const Radius.circular(99),
+                      child: RefreshIndicator(
+                        onRefresh: _refresh,
+                        child: ListView(
+                          controller: _historyScrollCtrl,
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          children: const [
+                            SizedBox(height: 120),
+                            Center(
+                              child: Text(
+                                'No adherence history yet.\nTaken, missed, and overridden doses will appear here.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(color: Colors.white),
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     );
                   }
 
-                  return RefreshIndicator(
-                    onRefresh: _refresh,
-                    child: ListView.builder(
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      padding: const EdgeInsets.fromLTRB(12, 2, 12, 12),
-                      itemCount: items.length,
-                      itemBuilder: (context, i) {
-                        final e = items[i];
-                        final status = e.displayStatus;
-                        final logged = e.loggedAtLocal != null
-                            ? _fmt(e.loggedAtLocal!)
-                            : null;
+                  return Scrollbar(
+                    controller: _historyScrollCtrl,
+                    thumbVisibility: true,
+                    thickness: 5,
+                    radius: const Radius.circular(99),
+                    child: RefreshIndicator(
+                      onRefresh: _refresh,
+                      child: ListView.builder(
+                        controller: _historyScrollCtrl,
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        padding: const EdgeInsets.fromLTRB(12, 2, 12, 12),
+                        itemCount: items.length,
+                        itemBuilder: (context, i) {
+                          final e = items[i];
+                          final status = e.displayStatus;
+                          final logged = e.loggedAtLocal != null
+                              ? _fmt(e.loggedAtLocal!)
+                              : null;
 
-                        return Container(
-                          margin: const EdgeInsets.only(bottom: 8),
-                          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-                          decoration: BoxDecoration(
-                            color: _card,
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                e.medicationName,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 21,
-                                  fontFamily: 'Amaranth',
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                'Planned: ${_fmt(e.plannedAtLocal)}',
-                                style: const TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                              if (logged != null)
+                          return Container(
+                            margin: const EdgeInsets.only(bottom: 8),
+                            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                            decoration: BoxDecoration(
+                              color: _card,
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
                                 Text(
-                                  'Logged: $logged',
+                                  e.medicationName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 21,
+                                    fontFamily: 'Amaranth',
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  'Planned: ${_fmt(e.plannedAtLocal)}',
                                   style: const TextStyle(
                                     color: Colors.white70,
                                     fontSize: 13,
                                     fontWeight: FontWeight.w600,
                                   ),
                                 ),
-                              const SizedBox(height: 4),
-                              Text(
-                                status,
-                                style: TextStyle(
-                                  color: _statusColor(status),
-                                  fontSize: 20,
-                                  fontFamily: 'Amaranth',
-                                  fontWeight: FontWeight.w700,
+                                if (logged != null)
+                                  Text(
+                                    'Logged: $logged',
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  status,
+                                  style: TextStyle(
+                                    color: _statusColor(status),
+                                    fontSize: 20,
+                                    fontFamily: 'Amaranth',
+                                    fontWeight: FontWeight.w700,
+                                  ),
                                 ),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
+                              ],
+                            ),
+                          );
+                        },
+                      ),
                     ),
                   );
                 },

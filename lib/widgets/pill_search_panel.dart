@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:pillchecker/backend/rxnorm/medication_summary.dart';
 import 'package:pillchecker/backend/services/rxnorm_medication_service.dart';
 import 'package:pillchecker/models/pill_search_item.dart';
+import 'package:pillchecker/constants/demo_pill_keys.dart';
 
 class PillSearchPanel extends StatefulWidget {
   const PillSearchPanel({
@@ -61,6 +62,15 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
     setState(() {});
     _debounce?.cancel();
     final query = _q;
+    if (query == kDemoPillSecretSearch) {
+      setState(() {
+        _loading = false;
+        _rxResults = [];
+        _servedFromCache = false;
+        _hadNetworkError = false;
+      });
+      return;
+    }
     if (query.length < 2) {
       setState(() {
         _loading = false;
@@ -132,8 +142,19 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
   @override
   Widget build(BuildContext context) {
     final q = _q;
-    final useRx = q.length >= 2;
-    final items = useRx ? _mergedRxAndOffline : _placeholderFiltered;
+    final demoUnlocked = q == kDemoPillSecretSearch;
+    final useRx = q.length >= 2 && !demoUnlocked;
+
+    final items = demoUnlocked
+        ? const <PillSearchItem>[
+            PillSearchItem(
+              name: kDemoPillName,
+              suggestedTimesPerDay: 2,
+              info: kDemoPillInfo,
+              searchSubtitle: 'Presentation Demo',
+            ),
+          ]
+        : (useRx ? _mergedRxAndOffline : _placeholderFiltered);
     final hasOfflineMatches = _offlineLongQueryMatches.isNotEmpty;
     final showOfflineOnlyBanner =
         useRx && _hadNetworkError && _rxResults.isEmpty && hasOfflineMatches;
@@ -286,10 +307,17 @@ class _PillSearchPanelState extends State<PillSearchPanel> {
                     for (final p in items) ...[
                       Builder(
                         builder: (_) {
+                          final isDemo = isDemoPillName(p.name);
+
                           final isDup = widget.disabledNamesLower.contains(
                             p.name.trim().toLowerCase(),
                           );
-                          final subtitle = useRx
+
+                          final subtitle = isDemo
+                              ? (isDup
+                                    ? 'Already added'
+                                    : 'Presentation demo • tap to add')
+                              : useRx
                               ? (isDup
                                     ? 'Already added'
                                     : (p.isRxNorm

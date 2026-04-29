@@ -32,6 +32,7 @@ import 'package:pillchecker/screens/calendar/calendar_screen.dart';
 import 'package:pillchecker/widgets/multi_dose_override_dialog.dart';
 import 'package:pillchecker/backend/models/dose_event_record.dart';
 import 'package:pillchecker/widgets/tutorial_spotlight_overlay.dart';
+import 'package:pillchecker/constants/demo_pill_keys.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -68,6 +69,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const _pillNameLockedKey = 'pill_name_locked_v1'; // JSON List<bool>
 
   static const _doseHistoryKey = 'dose_history_v1';
+  static const _streakStateKey = 'pill_streak_state_v1';
 
   // -------- supply in-memory state (aligned with pillNames) --------
   List<bool> pillSupplyEnabled = [];
@@ -104,9 +106,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _refreshCheckMapFuture() {
     if (!mounted) return;
+
     setState(() {
       _checkMapFuture = Future.value(Map<String, dynamic>.from(_checkMapCache));
     });
+
+    _requestStreakSyncFromLocalState();
   }
 
   int _wheelSelectedIndex = 1;
@@ -120,6 +125,86 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   bool _searchOpen = false;
 
+  bool _streaksOpen = false;
+  bool _streaksGreenVisible = false;
+  Timer? _streaksTransitionTimer;
+  _StreakState _streakState = _StreakState.initial();
+  Timer? _streakDotsTimer;
+  Timer? _streakMarkersTimer;
+  bool _streakDotsVisible = false;
+  bool _streakMarkersVisible = false;
+  bool _streakMessageVisible = false;
+  Timer? _streakMessageTimer;
+  String _streakStatusMessage = "Let's get started!";
+  int _lastWeekCompleteMessageFor = 0;
+  bool _streakButtonNeedsAttention = false;
+
+  String get _currentStreakValue => _streakState.currentStreak.toString();
+  String get _weeksCompletedValue => _streakState.weeksCompleted.toString();
+  String get _longestStreakValue => _streakState.longestStreak.toString();
+  String get _mostWeeksCompletedValue =>
+      _streakState.mostWeeksCompleted.toString();
+  int get _weekProgressValue => _streakState.weekProgress.clamp(0, 7).toInt();
+  int? get _weekStartDayIndexValue => _streakState.weekStartDayIndex;
+  int? get _nextRequiredDayIndexValue => _streakState.nextRequiredDayIndex;
+
+  bool get _showLastCompletedWeekSnapshot {
+    final progress = _streakState.weekProgress.clamp(0, 7).toInt();
+    final completedKeys = _streakState.completedDayKeys.toSet().toList();
+
+    return progress == 0 &&
+        _streakState.weeksCompleted > 0 &&
+        completedKeys.length >= 7;
+  }
+
+  int get _displayWeekProgressValue {
+    return _showLastCompletedWeekSnapshot ? 7 : _weekProgressValue;
+  }
+
+  int? get _displayWeekStartDayIndexValue {
+    // True 0/7 state: show Start on today's tab.
+    if (_weekProgressValue == 0 && !_showLastCompletedWeekSnapshot) {
+      return _streakDayIndexForNow();
+    }
+
+    return _streakState.weekStartDayIndex;
+  }
+
+  int? get _displayNextRequiredDayIndexValue {
+    // True 0/7 state: no Next marker yet, only Start.
+    if (_weekProgressValue == 0) return null;
+
+    return _streakState.nextRequiredDayIndex;
+  }
+
+  Set<int> get _streakCompletedDayIndexes {
+    final displayProgress = _displayWeekProgressValue.clamp(0, 7).toInt();
+    if (displayProgress <= 0) return <int>{};
+
+    final sortedKeys = _streakState.completedDayKeys.toSet().toList()..sort();
+
+    if (sortedKeys.isEmpty) return <int>{};
+
+    final recentKeys = sortedKeys.length <= displayProgress
+        ? sortedKeys
+        : sortedKeys.sublist(sortedKeys.length - displayProgress);
+
+    return recentKeys.map((key) {
+      final d = _dateFromKey(key);
+      return _dayIndexFor(d); // 0 = Sun, 1 = Mon, ... 6 = Sat
+    }).toSet();
+  }
+
+  bool get _streakAtRisk {
+    return _streakState.streaksEnabled &&
+        _streakState.pendingLostDayKey != null;
+  }
+
+  Timer? _streaksPillboxTimer;
+
+  Set<int> _streakPillboxOpenDays = <int>{};
+  int _streakPillboxResetToken = 0;
+
   // Used to fill the config panel "info" box when a search item was picked
   String? _selectedPillInfo;
 
@@ -131,6 +216,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _timesPerDay = 1;
   TimeOfDay? _singleDoseTime;
   List<TimeOfDay?> _doseTimes = [];
+
+  final ScrollController _configPanelScrollCtrl = ScrollController();
+  final ScrollController _lockedInfoScrollCtrl = ScrollController();
+  final ScrollController _customInfoScrollCtrl = ScrollController();
 
   bool _tutorialActive = false;
   int _tutorialIndex = 0;
@@ -179,12 +268,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<String> pillCustomInfo = [];
   final TextEditingController _customInfoController = TextEditingController();
 
-  // lib/screens/home/home_screen.dart
-
   int _lastDoseBarTotalDoses = 2;
   int _lastDoseBarActiveDoseIndex = 0;
   int _lastDoseBarCheckedMask = 0;
   bool _hasDoseBarCache = false;
+
+  static const Color _streakBg = Color(0xFF30C05A);
+  static const Color _streakBand = Color(0xFF0F7A2D);
+  static const Color _streakBlue = Color(0xFF1FC7F4);
+  static const Color _streakHelpBtn = Color(0xFF0C8F2E);
+  static const Color _streakExitRed = Color(0xFFFF0037);
+  static const Color _streakFlame = Color(0xFFFFB347);
 
   // Pillbox-only scale (1.0 = current size). Try 0.90 or 0.85.
   static const double _pillboxScale = 0.75;
@@ -207,6 +301,297 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _lockPillName = false; // true = hide/disable edit-name UI
 
   int _supplyBadgeCacheValue = 0; // last displayed number (prevents "0 flash")
+
+  final List<Future<void>> _pendingAdherenceWrites = <Future<void>>[];
+
+  void _trackAdherenceWrite(Future<void> future) {
+    _pendingAdherenceWrites.add(future);
+    future.whenComplete(() {
+      _pendingAdherenceWrites.remove(future);
+    });
+  }
+
+  Future<void> _flushPendingAdherenceWrites() async {
+    final pending = List<Future<void>>.from(_pendingAdherenceWrites);
+    if (pending.isEmpty) return;
+    await Future.wait(pending);
+  }
+
+  bool _hasLocalAdherenceStateForCurrentCycle() {
+    for (int pillIndex = 0; pillIndex < pillNames.length; pillIndex++) {
+      final doses = _doseTimesForPill(pillIndex);
+      if (doses.isEmpty) continue;
+
+      final state = _getDisplayedDoseStateForPill(
+        pillIndex: pillIndex,
+        doses: doses,
+        takenMap: _checkMapCache,
+        missedMap: _lastMissedMapCache,
+        now: DateTime.now(),
+      );
+
+      if (state.takenMask != 0 || state.missedMask != 0) {
+        return true;
+      }
+
+      if (_isCurrentDoseMissed(pillIndex: pillIndex, map: _checkMapCache)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  Future<
+    List<
+      ({
+        int pillIndex,
+        int doseIndex,
+        int medicationId,
+        String plannedIso,
+        String cycleIso,
+        String status,
+      })
+    >
+  >
+  _localDoseDbSyncJobs() async {
+    final jobs =
+        <
+          ({
+            int pillIndex,
+            int doseIndex,
+            int medicationId,
+            String plannedIso,
+            String cycleIso,
+            String status,
+          })
+        >[];
+
+    final seen = <String>{};
+
+    Future<void> addJobIfDbMismatch({
+      required int pillIndex,
+      required int doseIndex,
+      required int medicationId,
+      required String plannedIso,
+      required String cycleIso,
+      required String status,
+    }) async {
+      final key = '$medicationId|$plannedIso|$status';
+      if (!seen.add(key)) return;
+
+      final ev = await _adherenceService.findDoseEventForPlannedUtc(
+        medicationId: medicationId,
+        plannedAtUtcIso: plannedIso,
+      );
+
+      if (ev == null || ev.status != status) {
+        jobs.add((
+          pillIndex: pillIndex,
+          doseIndex: doseIndex,
+          medicationId: medicationId,
+          plannedIso: plannedIso,
+          cycleIso: cycleIso,
+          status: status,
+        ));
+      }
+    }
+
+    for (int pillIndex = 0; pillIndex < pillNames.length; pillIndex++) {
+      if (pillIndex >= medicationIds.length) continue;
+
+      final doses = _doseTimesForPill(pillIndex);
+      if (doses.isEmpty) continue;
+
+      final state = _getDisplayedDoseStateForPill(
+        pillIndex: pillIndex,
+        doses: doses,
+        takenMap: _checkMapCache,
+        missedMap: _lastMissedMapCache,
+        now: DateTime.now(),
+      );
+
+      final cycleDay = DateTime(
+        state.cycleStart.year,
+        state.cycleStart.month,
+        state.cycleStart.day,
+      );
+
+      for (int doseIndex = 0; doseIndex < doses.length; doseIndex++) {
+        final bit = 1 << doseIndex;
+        final plannedIso = plannedAtUtcIsoForOrderedDose(
+          cycleDay,
+          doses,
+          doseIndex,
+        );
+
+        if ((state.takenMask & bit) != 0) {
+          await addJobIfDbMismatch(
+            pillIndex: pillIndex,
+            doseIndex: doseIndex,
+            medicationId: medicationIds[pillIndex],
+            plannedIso: plannedIso,
+            cycleIso: state.cycleIso,
+            status: 'taken',
+          );
+        } else if ((state.missedMask & bit) != 0) {
+          await addJobIfDbMismatch(
+            pillIndex: pillIndex,
+            doseIndex: doseIndex,
+            medicationId: medicationIds[pillIndex],
+            plannedIso: plannedIso,
+            cycleIso: state.cycleIso,
+            status: 'missed',
+          );
+        }
+      }
+
+      // Also catch the visual missed state that comes from time passing,
+      // even before the missed bit has been written locally.
+      if (_isCurrentDoseMissed(pillIndex: pillIndex, map: _checkMapCache)) {
+        final plannedIso = plannedAtUtcIsoForOrderedDose(
+          cycleDay,
+          doses,
+          state.doseIndex,
+        );
+
+        await addJobIfDbMismatch(
+          pillIndex: pillIndex,
+          doseIndex: state.doseIndex,
+          medicationId: medicationIds[pillIndex],
+          plannedIso: plannedIso,
+          cycleIso: state.cycleIso,
+          status: 'missed',
+        );
+      }
+    }
+
+    return jobs;
+  }
+
+  Future<bool> _shouldGateAdherenceScreen() async {
+    if (_pendingAdherenceWrites.isNotEmpty) return true;
+    if (!_hasLocalAdherenceStateForCurrentCycle()) return false;
+
+    final jobs = await _localDoseDbSyncJobs();
+    return jobs.isNotEmpty;
+  }
+
+  Future<void> _syncLocalAdherenceStateToDbNow() async {
+    try {
+      await _flushPendingAdherenceWrites().timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // If one write is stuck, force a reconciliation pass below.
+    }
+
+    final jobs = await _localDoseDbSyncJobs();
+
+    for (final job in jobs) {
+      if (job.status == 'taken') {
+        await _persistTakenToDb(
+          medicationId: job.medicationId,
+          plannedIso: job.plannedIso,
+        );
+      } else {
+        _setLocalDoseStatus(
+          pillIndex: job.pillIndex,
+          cycleIso: job.cycleIso,
+          doseIndex: job.doseIndex,
+          status: 'missed',
+        );
+
+        await _persistMissedToDb(
+          medicationId: job.medicationId,
+          plannedIso: job.plannedIso,
+        );
+      }
+    }
+
+    if (jobs.isNotEmpty) {
+      await _saveLocalDailyState();
+      _publishLocalDailyState();
+    }
+
+    // One real DB read, not a fake delay.
+    await _adherenceService.fetchHistory(limit: 1);
+  }
+
+  Future<void> _showAdherenceSyncLoading({
+    required String message,
+    required Future<void> Function() task,
+  }) async {
+    if (!mounted) {
+      await task();
+      return;
+    }
+
+    var dialogOpen = true;
+
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => PopScope(
+          canPop: false,
+          child: Dialog(
+            backgroundColor: const Color(0xFF98404F),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(24),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(22, 22, 22, 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const CircularProgressIndicator(color: Colors.white),
+                  const SizedBox(height: 18),
+                  Text(
+                    message,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 17,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Syncing your latest pill state...',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ).then((_) => dialogOpen = false),
+    );
+
+    await Future<void>.delayed(Duration.zero);
+
+    try {
+      await task();
+    } finally {
+      if (mounted && dialogOpen) {
+        Navigator.of(context, rootNavigator: true).pop();
+      }
+    }
+  }
+
+  Future<void> _gateAdherenceScreenIfNeeded(String message) async {
+    final shouldGate = await _shouldGateAdherenceScreen();
+    if (!shouldGate) return;
+
+    await _showAdherenceSyncLoading(
+      message: message,
+      task: _syncLocalAdherenceStateToDbNow,
+    );
+  }
 
   // ---------------- lifecycle ----------------
   @override
@@ -253,9 +638,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _dayBoundaryTimer?.cancel();
     _globalBoundaryTimer?.cancel();
 
+    _streaksTransitionTimer?.cancel();
+    _streaksPillboxTimer?.cancel();
+    _streakDotsTimer?.cancel();
+    _streakMarkersTimer?.cancel();
+    _streakMessageTimer?.cancel();
     _nameController.dispose();
     _wheelController.dispose();
     _rxNormService.dispose();
+    _configPanelScrollCtrl.dispose();
+    _lockedInfoScrollCtrl.dispose();
+    _customInfoScrollCtrl.dispose();
 
     super.dispose();
   }
@@ -354,6 +747,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           pillName: pillNames[pillIndex],
         ),
       );
+      _showForegroundSupplyNotice(
+        '${pillNames[pillIndex]} supply is running low. Make sure to refill!',
+      );
     }
 
     if (hitZeroNow) {
@@ -367,6 +763,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           pillSlot: pillIndex,
           pillName: pillNames[pillIndex],
         ),
+      );
+      _showForegroundSupplyNotice(
+        "You're out of ${pillNames[pillIndex]} supply! Time to refill!",
       );
     }
   }
@@ -689,7 +1088,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _TutorialStep(
         title: 'Streaks',
         description:
-            'This section is for streaks and progress features. Coming soon!',
+            'Tap here to view your streaks. Complete all of your scheduled doses for the day to keep your streak going. If a dose is missed, this tab flashes red because your streak is at risk.',
         targetRect: rectFromBottom(
           right: s(-10),
           bottom: s(460),
@@ -711,12 +1110,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return [const TimeOfDay(hour: 8, minute: 0)];
     }
 
-    final times = list.map(_strToTime).toList();
-
-    times.sort(
-      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
-    );
-    return times;
+    // IMPORTANT:
+    // Preserve the user's configured order.
+    // Do not sort by clock time.
+    return list.map(_strToTime).toList(growable: false);
   }
 
   ({
@@ -772,7 +1169,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _startEditFlow(int pillIndex) {
     if (pillIndex < 0 || pillIndex >= pillNames.length) return;
 
-    final doses = _doseTimesForPill(pillIndex); // sorted list
+    final doses = _doseTimesForPill(pillIndex); // configured order
 
     _hidePillLabelNow();
     setState(() {
@@ -834,41 +1231,79 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _hydrateMedicationsFromDatabase() async {
+    final prefs = await SharedPreferences.getInstance();
     final meds = await _medService.getAll();
+
     medicationIds = meds.map((m) => m.id).toList();
     medicationCreatedAts = meds.map((m) => m.createdAt).toList();
-    _alignMedicationCreatedAtsToCount(pillNames.length);
+
     pillNames = meds.map((m) => m.name).toList();
     pillTimes = [];
     pillDoseTimes = [];
-    pillSupplyEnabled = [];
-    pillSupplyLeft = [];
-    pillSupplyInitial = [];
     pillNameLocked = [];
 
     for (final m in meds) {
-      pillSupplyEnabled.add(m.supplyEnabled);
-      pillSupplyLeft.add(m.supplyLeft);
-      pillSupplyInitial.add(m.supplyInitial);
       pillNameLocked.add(m.nameLocked);
 
       final sch = await _scheduleService.getScheduleForMedication(m.id);
       var times = <String>['08:00'];
+
       if (sch != null) {
         times = (jsonDecode(sch['times_json']! as String) as List)
             .map((e) => e.toString())
             .toList();
       }
+
       pillDoseTimes.add(times);
       pillTimes.add(times.isNotEmpty ? times.first : '08:00');
     }
 
-    final prefs = await SharedPreferences.getInstance();
-    final lowSent = _decodeBoolList(prefs.getString(_pillSupplyLowSentKey));
-    pillSupplyLowSent = List.generate(
-      pillNames.length,
-      (i) => i < lowSent.length ? lowSent[i] : false,
-    );
+    // ✅ Local-first supply state.
+    // DB can store old values, but HomeScreen display should prefer prefs.
+    final hasLocalSupply =
+        prefs.containsKey(_pillSupplyEnabledKey) ||
+        prefs.containsKey(_pillSupplyLeftKey) ||
+        prefs.containsKey(_pillSupplyInitKey);
+
+    if (hasLocalSupply) {
+      final enabled = _decodeBoolList(prefs.getString(_pillSupplyEnabledKey));
+      final left = _decodeIntList(prefs.getString(_pillSupplyLeftKey));
+      final initial = _decodeIntList(prefs.getString(_pillSupplyInitKey));
+      final lowSent = _decodeBoolList(prefs.getString(_pillSupplyLowSentKey));
+
+      pillSupplyEnabled = List.generate(
+        pillNames.length,
+        (i) => i < enabled.length ? enabled[i] : false,
+      );
+
+      pillSupplyLeft = List.generate(
+        pillNames.length,
+        (i) => i < left.length ? left[i] : 0,
+      );
+
+      pillSupplyInitial = List.generate(
+        pillNames.length,
+        (i) => i < initial.length ? initial[i] : 0,
+      );
+
+      pillSupplyLowSent = List.generate(
+        pillNames.length,
+        (i) => i < lowSent.length ? lowSent[i] : false,
+      );
+    } else {
+      // Fallback only for old installs/migration cases where prefs do not exist yet.
+      pillSupplyEnabled = meds.map((m) => m.supplyEnabled).toList();
+      pillSupplyLeft = meds.map((m) => m.supplyLeft).toList();
+      pillSupplyInitial = meds.map((m) => m.supplyInitial).toList();
+      pillSupplyLowSent = List<bool>.filled(
+        pillNames.length,
+        false,
+        growable: true,
+      );
+    }
+
+    _alignMedicationCreatedAtsToCount(pillNames.length);
+    _alignSupplyListsToCount(pillNames.length);
   }
 
   Future<void> _refreshAdherenceFromDb() async {
@@ -998,6 +1433,32 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await prefs.setString(_localStatePillSigKey, _localStateSignature());
   }
 
+  void _removeSlotFromLocalDailyState(int deletedSlot) {
+    Map<String, dynamic> shiftMap(Map<String, dynamic> source) {
+      final out = <String, dynamic>{};
+
+      for (final entry in source.entries) {
+        final oldIndex = int.tryParse(entry.key);
+        if (oldIndex == null) continue;
+
+        // Drop the deleted pill's state.
+        if (oldIndex == deletedSlot) continue;
+
+        // Anything after the deleted pill shifts down by 1.
+        final newIndex = oldIndex > deletedSlot ? oldIndex - 1 : oldIndex;
+        out['$newIndex'] = entry.value;
+      }
+
+      return out;
+    }
+
+    _checkMapCache = shiftMap(_checkMapCache);
+    _lastCheckMapCache = Map<String, dynamic>.from(_checkMapCache);
+    _lastMissedMapCache = shiftMap(_lastMissedMapCache);
+
+    _checkMapFuture = Future.value(Map<String, dynamic>.from(_checkMapCache));
+  }
+
   Future<void> _clearLocalDailyState({bool publish = true}) async {
     _checkMapCache = <String, dynamic>{};
     _lastCheckMapCache = <String, dynamic>{};
@@ -1029,10 +1490,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _publishLocalDailyState() {
     _lastCheckMapCache = Map<String, dynamic>.from(_checkMapCache);
-    if (!mounted) return;
+
+    if (!mounted) {
+      _requestStreakSyncFromLocalState();
+      return;
+    }
+
     setState(() {
       _checkMapFuture = Future.value(Map<String, dynamic>.from(_checkMapCache));
     });
+
+    _requestStreakSyncFromLocalState();
   }
 
   void _setLocalDoseStatus({
@@ -1069,44 +1537,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     required int medicationId,
     required String plannedIso,
   }) async {
+    var ok = await _adherenceService.confirmTakenByPlannedUtc(
+      medicationId: medicationId,
+      plannedAtUtcIso: plannedIso,
+    );
+
+    if (ok) return;
+
     await _scheduleService.ensureDoseEventsForMedication(
       medicationId,
       daysBack: 1,
     );
-    final ev = await _adherenceService.findDoseEventForPlannedUtc(
+
+    await _adherenceService.confirmTakenByPlannedUtc(
       medicationId: medicationId,
       plannedAtUtcIso: plannedIso,
     );
-    if (ev == null) return;
-    if (ev.status == 'planned') {
-      await _adherenceService.confirmTaken(ev.id);
-    } else if (ev.status != 'taken') {
-      await _adherenceService.setDoseStatusForOverride(
-        doseEventId: ev.id,
-        finalStatus: 'taken',
-      );
-    }
   }
 
   Future<void> _persistMissedToDb({
     required int medicationId,
     required String plannedIso,
   }) async {
+    var ok = await _adherenceService.markMissedByPlannedUtc(
+      medicationId: medicationId,
+      plannedAtUtcIso: plannedIso,
+    );
+
+    if (ok) return;
+
     await _scheduleService.ensureDoseEventsForMedication(
       medicationId,
       daysBack: 1,
     );
-    final ev = await _adherenceService.findDoseEventForPlannedUtc(
+
+    await _adherenceService.markMissedByPlannedUtc(
       medicationId: medicationId,
       plannedAtUtcIso: plannedIso,
     );
-    if (ev == null) return;
-    if (ev.status != 'missed') {
-      await _adherenceService.setDoseStatusForOverride(
-        doseEventId: ev.id,
-        finalStatus: 'missed',
-      );
-    }
   }
 
   int _maskForCycle(Map<String, dynamic> map, int pillIndex, String cycleIso) {
@@ -1230,12 +1698,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return [const TimeOfDay(hour: 8, minute: 0)];
     }
 
-    final times = list.map(_strToTime).toList();
-
-    times.sort(
-      (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
-    );
-    return times;
+    // Preserve configured dose order here too.
+    return list.map(_strToTime).toList(growable: false);
   }
 
   Future<void> _muteAlreadyCheckedDosesToday({
@@ -1486,10 +1950,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _isCurrentDoseMissed({
     required int pillIndex,
     required Map<String, dynamic> map,
-    Duration grace = const Duration(hours: 2),
+    Duration grace = const Duration(hours: 4),
   }) {
-    if (_isFirstDayForMedication(pillIndex)) return false;
-    if (pillIndex < 0 || pillIndex >= medicationCreatedAts.length) return false;
+    if (pillIndex < 0 || pillIndex >= pillNames.length) return false;
 
     final doses = _doseTimesForPill(pillIndex);
     if (doses.isEmpty) return false;
@@ -1526,21 +1989,112 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return now.isAfter(plannedAt.add(grace));
   }
 
+  Future<void> _materializeOverdueMissedDosesLocally({
+    int? onlyPillIndex,
+  }) async {
+    final now = DateTime.now();
+    bool changed = false;
+
+    final indexes = onlyPillIndex == null
+        ? List<int>.generate(pillNames.length, (i) => i)
+        : <int>[onlyPillIndex];
+
+    for (final pillIndex in indexes) {
+      if (pillIndex < 0 || pillIndex >= pillNames.length) continue;
+
+      final doses = _doseTimesForPill(pillIndex);
+      if (doses.isEmpty) continue;
+
+      final state = _getDisplayedDoseStateForPill(
+        pillIndex: pillIndex,
+        doses: doses,
+        takenMap: _checkMapCache,
+        missedMap: _lastMissedMapCache,
+        now: now,
+      );
+
+      final cycleDay = DateTime(
+        state.cycleStart.year,
+        state.cycleStart.month,
+        state.cycleStart.day,
+      );
+
+      var nextTakenMask = state.takenMask;
+      var nextMissedMask = state.missedMask;
+
+      for (int doseIndex = 0; doseIndex < doses.length; doseIndex++) {
+        final bit = 1 << doseIndex;
+
+        final alreadyTaken = (nextTakenMask & bit) != 0;
+        final alreadyMissed = (nextMissedMask & bit) != 0;
+
+        if (alreadyTaken || alreadyMissed) continue;
+
+        final plannedAt = plannedAtLocalForOrderedDose(
+          cycleDay,
+          doses,
+          doseIndex,
+        );
+
+        // Match your current missed rule.
+        final missedAt = plannedAt.add(const Duration(hours: 4));
+
+        if (now.isAfter(missedAt)) {
+          nextMissedMask |= bit;
+          nextTakenMask &= ~bit;
+          changed = true;
+
+          // DB catches up in the background, but UI is already correct locally.
+          if (pillIndex < medicationIds.length) {
+            final plannedIso = plannedAtUtcIsoForOrderedDose(
+              cycleDay,
+              doses,
+              doseIndex,
+            );
+
+            _trackAdherenceWrite(
+              _persistMissedToDb(
+                medicationId: medicationIds[pillIndex],
+                plannedIso: plannedIso,
+              ),
+            );
+          }
+        }
+      }
+
+      if (nextTakenMask != state.takenMask ||
+          nextMissedMask != state.missedMask) {
+        _checkMapCache['$pillIndex'] = _packCycleAndMask(
+          state.cycleIso,
+          nextTakenMask,
+        );
+
+        _lastMissedMapCache['$pillIndex'] = _packCycleAndMask(
+          state.cycleIso,
+          nextMissedMask,
+        );
+      }
+    }
+
+    if (!changed) return;
+
+    await _saveLocalDailyState();
+    await _syncCurrentCycleAnchorOnly();
+
+    if (!mounted) return;
+    _publishLocalDailyState();
+    _scheduleCenteredDoseBoundaryRefresh();
+
+    unawaited(
+      _rebuild2DayNotifWindowAndReMuteChecked(
+        tag: 'materialize-overdue-missed-local',
+      ),
+    );
+  }
+
   Future<void> _openMultiDoseOverride() async {
     final pillIndex = _centerPillIndex;
     if (pillIndex == null || pillIndex >= medicationIds.length) return;
-
-    if (_isFirstDayForMedication(pillIndex)) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Multiple dose override is not available on the first day.',
-          ),
-        ),
-      );
-      return;
-    }
 
     final doses = _doseTimesForPill(pillIndex);
     if (doses.length <= 1) return;
@@ -1599,14 +2153,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             );
 
             if (shouldBeTaken) {
-              unawaited(
+              _trackAdherenceWrite(
                 _persistTakenToDb(
                   medicationId: medicationIds[pillIndex],
                   plannedIso: plannedIso,
                 ),
               );
             } else if (oldWasTaken || !oldWasMissed) {
-              unawaited(
+              _trackAdherenceWrite(
                 _persistMissedToDb(
                   medicationId: medicationIds[pillIndex],
                   plannedIso: plannedIso,
@@ -1823,6 +2377,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _checkMapFuture = _loadCheckMap();
       });
 
+      // This is the moment pending missed streaks should officially be lost
+      // if they were not fixed/overridden before the new cycle.
+      _requestStreakSyncFromLocalState();
+
       unawaited(_rebuild2DayNotifWindowAndReMuteChecked(tag: 'day-boundary'));
 
       if (!mounted) return;
@@ -1861,7 +2419,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       state.doseIndex,
     );
 
-    final missAt = plannedAt.add(const Duration(hours: 2));
+    final missAt = plannedAt.add(const Duration(hours: 4));
 
     DateTime next = state.cycleStart.add(const Duration(days: 1));
     if (missAt.isAfter(now) && missAt.isBefore(next)) {
@@ -1871,9 +2429,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final diff = next.difference(now);
     if (diff.inMilliseconds <= 50) {
       if (!mounted) return;
-      unawaited(_adherenceService.autoMarkMissedPastPlanned());
-      _checkMapFuture = _loadCheckMap();
-      setState(() {});
+      setState(() {
+        _checkMapFuture = _loadCheckMap();
+      });
+      _requestStreakSyncFromLocalState();
       return;
     }
 
@@ -1902,7 +2461,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final slot = _wheelSelectedIndex - 1;
     if (slot < 0) return '';
     if (slot >= pillNames.length) return '';
-    return pillNames[slot];
+
+    final rawName = pillNames[slot];
+    if (isDemoPillName(rawName)) return kDemoPillName;
+
+    return rawName;
   }
 
   double _leftFromDesignRight(
@@ -1940,6 +2503,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _alignSupplyListsToCount(int count) {
+    // Make every supply list growable.
+    // This prevents "Cannot add to a fixed-length list" after List.filled/List.generate.
+    pillSupplyEnabled = List<bool>.from(pillSupplyEnabled, growable: true);
+    pillSupplyLeft = List<int>.from(pillSupplyLeft, growable: true);
+    pillSupplyInitial = List<int>.from(pillSupplyInitial, growable: true);
+    pillSupplyLowSent = List<bool>.from(pillSupplyLowSent, growable: true);
+
     while (pillSupplyEnabled.length < count) pillSupplyEnabled.add(false);
     if (pillSupplyEnabled.length > count) {
       pillSupplyEnabled.removeRange(count, pillSupplyEnabled.length);
@@ -2011,6 +2581,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     await _persistSupplyLists();
+  }
+
+  void _showForegroundSupplyNotice(String message) {
+    if (!mounted) return;
+    if (!Platform.isIOS) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(message),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 4),
+      ),
+    );
   }
 
   Future<void> _adjustSupplyForStatusTransition({
@@ -2157,6 +2742,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return _supplyLeftDraft > 0;
   }
 
+  bool _isDemoPillIndex(int pillIndex) {
+    if (pillIndex < 0 || pillIndex >= pillNames.length) return false;
+    return isDemoPillName(pillNames[pillIndex]);
+  }
+
   // ---------------- UI label helpers ----------------
   void _hidePillLabelNow() {
     if (_showPillLabel) setState(() => _showPillLabel = false);
@@ -2222,6 +2812,741 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
   }
 
+  Widget _streaksPanel({
+    required double Function(double) s,
+    required double Function(double) fs,
+    required VoidCallback onClose,
+    required VoidCallback onShowStreaksHelp,
+    required Set<int> streakPillboxOpenDays,
+    required int streakPillboxResetToken,
+    required String currentStreakValue,
+    required String weeksCompletedValue,
+    required String longestStreakValue,
+    required String mostWeeksCompletedValue,
+    required String streakStatusMessage,
+    required int weekProgress,
+    required Set<int> completedDayIndexes,
+    required bool streakDotsVisible,
+    required bool streakMarkersVisible,
+    required bool streakMessageVisible,
+    required int? weekStartDayIndex,
+    required int? nextRequiredDayIndex,
+  }) {
+    double currentStreakFontSize(String value, double normalSize) {
+      final len = value.trim().length;
+
+      if (len <= 3) return normalSize;
+      if (len == 4) return normalSize * 0.70;
+      if (len == 5) return normalSize * 0.57;
+      return normalSize * 0.62;
+    }
+
+    final safeWeekProgress = weekProgress.clamp(0, 7).toInt();
+    final weekProgressText = '$safeWeekProgress/7';
+    final weekProgressFraction = safeWeekProgress / 7.0;
+    final weekProgressComplete = safeWeekProgress >= 7;
+    final weekProgressFillColor = weekProgressComplete
+        ? const Color(0xFF59FF56)
+        : const Color.fromARGB(255, 36, 251, 255);
+    final safeCompletedDayIndexes = completedDayIndexes
+        .where((day) => day >= 0 && day <= 6)
+        .toSet();
+
+    int? safeDayIndex(int? day) {
+      if (day == null) return null;
+      if (day < 0 || day > 6) return null;
+      return day;
+    }
+
+    final safeWeekStartDay = safeDayIndex(weekStartDayIndex);
+    final safeNextRequiredDay = safeDayIndex(nextRequiredDayIndex);
+
+    final displayStartDay = safeWeekStartDay;
+
+    final displayEndDay = safeWeekStartDay == null
+        ? null
+        : (safeWeekStartDay + 6) % 7;
+
+    final hasActiveWeek = safeWeekProgress > 0 && !weekProgressComplete;
+
+    final showStartMarker =
+        streakMarkersVisible &&
+        !weekProgressComplete &&
+        displayStartDay != null;
+
+    final showNextMarker =
+        streakMarkersVisible && hasActiveWeek && safeNextRequiredDay != null;
+
+    final showEndMarker =
+        streakMarkersVisible && hasActiveWeek && displayEndDay != null;
+
+    Widget markerForDay({
+      required int day,
+      required String label,
+      required Color color,
+    }) {
+      return Positioned(
+        left: s((55.5 * day) + 2.5 + (day * 1.075)),
+        top: s(8),
+        child: IgnorePointer(
+          child: _StreakTabMarker(
+            label: label,
+            color: color,
+            width: s(50),
+            height: s(58),
+          ),
+        ),
+      );
+    }
+
+    return Material(
+      color: Colors.transparent,
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(s(8), s(8), s(8), s(10)),
+        child: Container(
+          decoration: BoxDecoration(
+            color: _streakBg,
+            borderRadius: BorderRadius.circular(s(18)),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            children: [
+              SizedBox(height: s(12)),
+
+              // Top row: Current Streak + flame + number overlay.
+              Padding(
+                padding: EdgeInsets.fromLTRB(s(17), 0, s(14), 0),
+                child: SizedBox(
+                  height: s(100),
+                  child: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: Padding(
+                              padding: EdgeInsets.only(top: s(40)),
+                              child: Text(
+                                'Current Streak:',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontFamily: 'Amaranth',
+                                  fontSize: fs(35),
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                  shadows: const [
+                                    Shadow(
+                                      blurRadius: 2,
+                                      offset: Offset(2.5, 1),
+                                      color: Color.fromARGB(120, 0, 0, 0),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+
+                          SizedBox(
+                            width: s(104),
+                            height: s(104),
+                            child: Transform.translate(
+                              offset: Offset(
+                                s(10), // whole flame group: left/right
+                                s(-2), // whole flame group: up/down
+                              ),
+                              child: Transform.scale(
+                                scale: 0.92, // whole flame group size
+                                child: Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    Transform.translate(
+                                      offset: Offset(s(-15), s(0)),
+                                      child: Transform.rotate(
+                                        angle: -0.23,
+                                        child: Icon(
+                                          Icons.whatshot_rounded,
+                                          size: s(105),
+                                          color: const Color.fromARGB(
+                                            255,
+                                            255,
+                                            116,
+                                            66,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+
+                                    Transform.translate(
+                                      offset: Offset(s(10), s(-15)),
+                                      child: Transform.scale(
+                                        scaleX: -1,
+                                        child: Icon(
+                                          Icons.whatshot_rounded,
+                                          size: s(150),
+                                          color: const Color.fromARGB(
+                                            255,
+                                            255,
+                                            116,
+                                            66,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+
+                                    Transform.translate(
+                                      offset: Offset(s(-10), s(25)),
+                                      child: Container(
+                                        width: s(50),
+                                        height: s(50),
+                                        decoration: const BoxDecoration(
+                                          color: _streakFlame,
+                                          shape: BoxShape.circle,
+                                        ),
+                                      ),
+                                    ),
+
+                                    Transform.translate(
+                                      offset: Offset(s(-19), s(10)),
+                                      child: Icon(
+                                        Icons.whatshot_rounded,
+                                        size: s(109),
+                                        color: _streakFlame,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      // Number overlay is OUTSIDE the fire Stack and OUTSIDE the Row.
+                      // It has a fixed box, so 1/2/3 digit numbers don't move the flame group.
+                      Positioned(
+                        right: s(20),
+                        top: s(45),
+                        child: SizedBox(
+                          width: s(76),
+                          height: s(50),
+                          child: Center(
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              alignment: Alignment.center,
+                              child: Text(
+                                currentStreakValue,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontFamily: 'Amaranth',
+                                  fontSize: fs(
+                                    currentStreakFontSize(
+                                      currentStreakValue,
+                                      38,
+                                    ),
+                                  ),
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                  shadows: const [
+                                    Shadow(
+                                      blurRadius: 2,
+                                      offset: Offset(2.5, 1),
+                                      color: Color.fromARGB(100, 0, 0, 0),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              SizedBox(height: s(18)),
+
+              AnimatedOpacity(
+                duration: const Duration(milliseconds: 750),
+                curve: Curves.easeInOut,
+                opacity: streakMessageVisible ? 1.0 : 0.0,
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 260),
+                  switchInCurve: Curves.easeOut,
+                  switchOutCurve: Curves.easeIn,
+                  transitionBuilder: (child, animation) {
+                    return FadeTransition(opacity: animation, child: child);
+                  },
+                  child: Text(
+                    streakStatusMessage,
+                    key: ValueKey(streakStatusMessage),
+                    textAlign: TextAlign.center,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontFamily: 'Amaranth',
+                      fontSize: fs(20),
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                      shadows: const [
+                        Shadow(
+                          blurRadius: 2,
+                          offset: Offset(2, 1),
+                          color: Color.fromARGB(100, 0, 0, 0),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+              SizedBox(height: s(70)),
+
+              // Dark green pillbox band
+              Container(
+                width: double.infinity,
+                height: s(100),
+                color: _streakBand,
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    Center(
+                      child: OverflowBox(
+                        maxWidth: s(620),
+                        maxHeight: s(230),
+                        child: Transform.translate(
+                          offset: Offset(s(5), -s(23)),
+                          child: Transform.scale(
+                            scale: 1.35,
+                            child: SizedBox(
+                              width: s(430),
+                              height: s(160),
+                              child: WeeklyPillboxOrganizer(
+                                key: ValueKey(
+                                  'streaks_storyboard_pillbox_$streakPillboxResetToken',
+                                ),
+                                fit: BoxFit.contain,
+                                openDays: streakPillboxOpenDays,
+                                autoCloseOthers: false,
+                                stateMachineName: 'PillboxSM',
+                                openAnimDuration: const Duration(
+                                  milliseconds: 750,
+                                ),
+                                openSpeedMultiplier: 7,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    // Blue divider line overlays for streak pillbox sections.
+                    for (final left in [
+                      55.0,
+                      111.5,
+                      168.0,
+                      224.5,
+                      281.0,
+                      337.0,
+                    ])
+                      Positioned(
+                        left: s(left),
+                        top: s(8),
+                        child: IgnorePointer(
+                          child: Container(
+                            width: s(2),
+                            height: s(60),
+                            decoration: BoxDecoration(
+                              color: const Color.fromARGB(255, 108, 157, 225),
+                              borderRadius: BorderRadius.circular(s(99)),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withOpacity(0.18),
+                                  blurRadius: s(3),
+                                  offset: Offset(0, s(1)),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+
+                    // Pulsing Start / Next / End markers.
+                    // Put these after divider lines and before mini completion circles.
+                    if (showStartMarker)
+                      markerForDay(
+                        day: displayStartDay!,
+                        label: 'Start',
+                        color: const Color(0xFF59FF56),
+                      ),
+
+                    if (showNextMarker)
+                      markerForDay(
+                        day: safeNextRequiredDay!,
+                        label: 'Next',
+                        color: const Color(0xFFFFD447),
+                      ),
+
+                    if (showEndMarker)
+                      markerForDay(
+                        day: displayEndDay!,
+                        label: 'End',
+                        color: const Color(0xFFFF0037),
+                      ),
+
+                    // Mini daily completion circles over the streak pillbox.
+                    // They appear only after the pillbox tabs finish opening.
+                    // 0 = Sun, 1 = Mon, ... 6 = Sat.
+                    if (streakDotsVisible)
+                      for (int day = 0; day < 7; day++)
+                        Positioned(
+                          key: ValueKey('streak_mini_circle_position_$day'),
+                          left: s((21.25 + (day + (day * 55.085)) - 16.0)),
+                          top: s(-50.5),
+                          child: IgnorePointer(
+                            child: _StreakMiniCompletionCircle(
+                              key: ValueKey('streak_mini_circle_$day'),
+                              done: safeCompletedDayIndexes.contains(day),
+                              size: s(47.5),
+                              delay: Duration(milliseconds: day * 125),
+                            ),
+                          ),
+                        ),
+                  ],
+                ),
+              ),
+
+              SizedBox(height: s(12)),
+
+              // Week progress bar
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: s(24)),
+                child: Column(
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          'Week Progress',
+                          style: TextStyle(
+                            fontFamily: 'Amaranth',
+                            fontSize: fs(17),
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                            shadows: const [
+                              Shadow(
+                                blurRadius: 2,
+                                offset: Offset(1.5, 1),
+                                color: Color.fromARGB(100, 0, 0, 0),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const Spacer(),
+                        Text(
+                          weekProgressText,
+                          style: TextStyle(
+                            fontFamily: 'Amaranth',
+                            fontSize: fs(17),
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                            shadows: const [
+                              Shadow(
+                                blurRadius: 2,
+                                offset: Offset(1.5, 1),
+                                color: Color.fromARGB(100, 0, 0, 0),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    SizedBox(height: s(6)),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(s(99)),
+                      child: Container(
+                        height: s(12),
+                        width: double.infinity,
+                        color: Colors.white.withOpacity(0.28),
+                        alignment: Alignment.centerLeft,
+                        child: FractionallySizedBox(
+                          widthFactor: weekProgressFraction.clamp(0.0, 1.0),
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 260),
+                            curve: Curves.easeInOut,
+                            color: weekProgressFillColor,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              SizedBox(height: s(14)),
+
+              // Weeks completed box
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: s(24)),
+                child: Container(
+                  height: s(54),
+                  decoration: BoxDecoration(
+                    color: _streakBlue,
+                    borderRadius: BorderRadius.circular(s(14)),
+                  ),
+                  padding: EdgeInsets.symmetric(horizontal: s(12)),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Weeks Completed:',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontFamily: 'Amaranth',
+                            fontSize: fs(21),
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                            shadows: const [
+                              Shadow(
+                                blurRadius: 2,
+                                offset: Offset(1.5, 1),
+                                color: Color.fromARGB(100, 0, 0, 0),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      Text(
+                        weeksCompletedValue,
+                        style: TextStyle(
+                          fontFamily: 'Amaranth',
+                          fontSize: fs(36),
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                          shadows: const [
+                            Shadow(
+                              blurRadius: 2,
+                              offset: Offset(1.5, 1),
+                              color: Color.fromARGB(100, 0, 0, 0),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              SizedBox(height: s(12)),
+
+              // How streaks work button
+              Material(
+                color: _streakHelpBtn,
+                borderRadius: BorderRadius.circular(s(16)),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(s(16)),
+                  onTap: onShowStreaksHelp,
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: s(18),
+                      vertical: s(10),
+                    ),
+                    child: Text(
+                      'How do streaks work?',
+                      style: TextStyle(
+                        fontFamily: 'Amaranth',
+                        fontSize: fs(17),
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              const Spacer(),
+
+              // Bottom stats section
+              Container(
+                width: double.infinity,
+                padding: EdgeInsets.symmetric(vertical: s(10)),
+                decoration: BoxDecoration(color: _streakBand.withOpacity(0.40)),
+                child: Padding(
+                  padding: EdgeInsets.symmetric(horizontal: s(24)),
+                  child: SizedBox(
+                    height: s(118),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              SizedBox(
+                                height: s(36),
+                                child: Center(
+                                  child: Text(
+                                    'Longest Streak',
+                                    textAlign: TextAlign.center,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontFamily: 'Amaranth',
+                                      fontSize: fs(22),
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                      height: 0.95,
+                                      shadows: const [
+                                        Shadow(
+                                          blurRadius: 2,
+                                          offset: Offset(1.5, 1),
+                                          color: Color.fromARGB(100, 0, 0, 0),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              SizedBox(height: s(0)),
+                              SizedBox(
+                                height: s(66),
+                                child: Center(
+                                  child: Text(
+                                    longestStreakValue,
+                                    style: TextStyle(
+                                      fontFamily: 'Amaranth',
+                                      fontSize: fs(32),
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                      height: 1.0,
+                                      shadows: const [
+                                        Shadow(
+                                          blurRadius: 2,
+                                          offset: Offset(1.5, 1),
+                                          color: Color.fromARGB(100, 0, 0, 0),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+
+                        Container(
+                          width: s(2),
+                          height: s(118),
+                          color: const Color.fromARGB(170, 0, 88, 33),
+                        ),
+
+                        Expanded(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              SizedBox(
+                                height: s(36),
+                                child: Center(
+                                  child: Text(
+                                    'Most Weeks\nCompleted',
+                                    textAlign: TextAlign.center,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontFamily: 'Amaranth',
+                                      fontSize: fs(18),
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                      height: 0.95,
+                                      shadows: const [
+                                        Shadow(
+                                          blurRadius: 2,
+                                          offset: Offset(1.5, 1),
+                                          color: Color.fromARGB(100, 0, 0, 0),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              SizedBox(height: s(0)),
+                              SizedBox(
+                                height: s(66),
+                                child: Center(
+                                  child: Text(
+                                    mostWeeksCompletedValue,
+                                    style: TextStyle(
+                                      fontFamily: 'Amaranth',
+                                      fontSize: fs(32),
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                      height: 1.0,
+                                      shadows: const [
+                                        Shadow(
+                                          blurRadius: 2,
+                                          offset: Offset(1.5, 1),
+                                          color: Color.fromARGB(100, 0, 0, 0),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+              SizedBox(height: s(22)),
+
+              // Exit button
+              Padding(
+                padding: EdgeInsets.fromLTRB(s(10), 0, s(10), s(18)),
+                child: SizedBox(
+                  width: double.infinity,
+                  height: s(54),
+                  child: Material(
+                    color: _streakExitRed,
+                    borderRadius: BorderRadius.circular(s(16)),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(s(16)),
+                      onTap: onClose,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            'Exit',
+                            style: TextStyle(
+                              fontFamily: 'Amaranth',
+                              fontSize: fs(21),
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
+                            ),
+                          ),
+                          SizedBox(width: s(8)),
+                          Icon(
+                            Icons.arrow_forward_rounded,
+                            size: s(24),
+                            color: Colors.white,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   // ---------------- onboarding ----------------
   Future<void> _showWelcomeTutorialPrompt(SharedPreferences prefs) async {
     final alreadySeen = prefs.getBool(_seenPromptKey) ?? false;
@@ -2272,6 +3597,913 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _supplyBadgeCacheValue = v;
   }
 
+  // ---------------- streak state ----------------
+  int _dateKey(DateTime d) => d.year * 10000 + d.month * 100 + d.day;
+
+  DateTime _dateFromKey(int key) {
+    final year = key ~/ 10000;
+    final month = (key ~/ 100) % 100;
+    final day = key % 100;
+    return DateTime(year, month, day);
+  }
+
+  int _daysBetweenDateKeys(int fromKey, int toKey) {
+    final from = _dateFromKey(fromKey);
+    final to = _dateFromKey(toKey);
+
+    final fromDay = DateTime(from.year, from.month, from.day);
+    final toDay = DateTime(to.year, to.month, to.day);
+
+    return toDay.difference(fromDay).inDays;
+  }
+
+  int? _mostRecentCompletedStreakDayKey(_StreakState state) {
+    final keys = state.completedDayKeys.toSet();
+
+    final last = state.lastCompletedDayKey;
+    if (last != null) keys.add(last);
+
+    if (keys.isEmpty) return null;
+
+    final sorted = keys.toList()..sort();
+    return sorted.last;
+  }
+
+  int _streakDayKeyForNow() {
+    final now = DateTime.now();
+
+    // Use PillChecker's cycle day, not calendar midnight.
+    // This keeps streak loss aligned with the app's daily reset timing.
+    final cycleStart = _globalCycleStartForNow(now);
+
+    final d = cycleStart ?? now;
+    return _dateKey(d);
+  }
+
+  /// Sun = 0, Mon = 1, ... Sat = 6
+  int _dayIndexFor(DateTime d) => d.weekday % 7;
+
+  int _streakDayIndexForNow() {
+    final now = DateTime.now();
+
+    // Match the same PillChecker cycle day used by streakDayKey.
+    final cycleStart = _globalCycleStartForNow(now);
+    final d = cycleStart ?? now;
+
+    return _dayIndexFor(d);
+  }
+
+  Future<void> _loadStreakState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_streakStateKey);
+
+    final loaded = _StreakState.fromJsonString(raw);
+
+    if (!mounted) {
+      _streakState = loaded;
+      return;
+    }
+
+    setState(() {
+      _streakState = loaded;
+    });
+  }
+
+  Future<void> _saveStreakState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_streakStateKey, _streakState.toJsonString());
+  }
+
+  Future<void> _setStreakState(_StreakState next) async {
+    final normalizedNext = next.normalized();
+
+    final currentStreakIncreased =
+        normalizedNext.currentStreak > _streakState.currentStreak;
+
+    if (!mounted) {
+      _streakState = normalizedNext;
+      await _saveStreakState();
+      return;
+    }
+
+    setState(() {
+      _streakState = normalizedNext;
+
+      // Bounce/highlight the streak button whenever current streak goes up by 1.
+      // This clears once the user opens the streak screen.
+      if (currentStreakIncreased && !_streaksOpen) {
+        _streakButtonNeedsAttention = true;
+      }
+    });
+
+    await _saveStreakState();
+    _refreshStreakStatusMessage();
+  }
+
+  bool _hasMissedStreakRiskForToday() {
+    if (pillNames.isEmpty) return false;
+
+    final now = DateTime.now();
+
+    for (int pillIndex = 0; pillIndex < pillNames.length; pillIndex++) {
+      final doses = _doseTimesForPill(pillIndex);
+      if (doses.isEmpty) continue;
+
+      final state = _getDisplayedDoseStateForPill(
+        pillIndex: pillIndex,
+        doses: doses,
+        takenMap: _checkMapCache,
+        missedMap: _lastMissedMapCache,
+        now: now,
+      );
+
+      // Explicit missed bit saved locally.
+      if (state.missedMask != 0) {
+        return true;
+      }
+
+      // Visual/time-based missed state, even before it gets written.
+      if (_isCurrentDoseMissed(pillIndex: pillIndex, map: _checkMapCache)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  ({
+    int weekProgress,
+    int weeksCompleted,
+    int mostWeeksCompleted,
+    int? weekStartDayIndex,
+    int? nextRequiredDayIndex,
+  })
+  _weeklyStateAfterCompletingDay(_StreakState state, int todayDayIndex) {
+    final safeProgress = state.weekProgress.clamp(0, 7).toInt();
+
+    // If no week is active, or the last week already completed,
+    // start a new rolling 7-day week from today.
+    if (safeProgress == 0 ||
+        safeProgress >= 7 ||
+        state.weekStartDayIndex == null ||
+        state.nextRequiredDayIndex == null) {
+      return (
+        weekProgress: 1,
+        weeksCompleted: state.weeksCompleted,
+        mostWeeksCompleted: state.mostWeeksCompleted,
+        weekStartDayIndex: todayDayIndex,
+        nextRequiredDayIndex: (todayDayIndex + 1) % 7,
+      );
+    }
+
+    // If the user completed a day that is not the expected next day,
+    // treat it as a fresh weekly run. This is a defensive fallback for
+    // weird time travel / reset cases.
+    if (state.nextRequiredDayIndex != todayDayIndex) {
+      return (
+        weekProgress: 1,
+        weeksCompleted: state.weeksCompleted,
+        mostWeeksCompleted: state.mostWeeksCompleted,
+        weekStartDayIndex: todayDayIndex,
+        nextRequiredDayIndex: (todayDayIndex + 1) % 7,
+      );
+    }
+
+    final nextProgress = (safeProgress + 1).clamp(0, 7).toInt();
+
+    if (nextProgress >= 7) {
+      final nextWeeksCompleted = (state.weeksCompleted + 1)
+          .clamp(0, 999999)
+          .toInt();
+
+      final nextMostWeeksCompleted =
+          nextWeeksCompleted > state.mostWeeksCompleted
+          ? nextWeeksCompleted
+          : state.mostWeeksCompleted;
+
+      return (
+        weekProgress: 7,
+        weeksCompleted: nextWeeksCompleted,
+        mostWeeksCompleted: nextMostWeeksCompleted,
+        weekStartDayIndex: state.weekStartDayIndex,
+        nextRequiredDayIndex: (todayDayIndex + 1) % 7,
+      );
+    }
+
+    return (
+      weekProgress: nextProgress,
+      weeksCompleted: state.weeksCompleted,
+      mostWeeksCompleted: state.mostWeeksCompleted,
+      weekStartDayIndex: state.weekStartDayIndex,
+      nextRequiredDayIndex: (todayDayIndex + 1) % 7,
+    );
+  }
+
+  ({
+    int weekProgress,
+    int weeksCompleted,
+    int mostWeeksCompleted,
+    int? weekStartDayIndex,
+    int? nextRequiredDayIndex,
+  })
+  _weeklyStateAfterUndoingToday(_StreakState state, int todayDayIndex) {
+    final safeProgress = state.weekProgress.clamp(0, 7).toInt();
+
+    if (safeProgress <= 0) {
+      return (
+        weekProgress: 0,
+        weeksCompleted: state.weeksCompleted,
+        mostWeeksCompleted: state.mostWeeksCompleted,
+        weekStartDayIndex: null,
+        nextRequiredDayIndex: null,
+      );
+    }
+
+    // If today was the 7th completed day, undo the completed week too.
+    if (safeProgress >= 7) {
+      final nextWeeksCompleted = (state.weeksCompleted - 1)
+          .clamp(0, 999999)
+          .toInt();
+
+      // Lifetime best should never decrement automatically.
+      // Only a manual Reset Streaks action should clear this later.
+      final nextMostWeeksCompleted = state.mostWeeksCompleted;
+
+      return (
+        weekProgress: 6,
+        weeksCompleted: nextWeeksCompleted,
+        mostWeeksCompleted: nextMostWeeksCompleted,
+        weekStartDayIndex: state.weekStartDayIndex,
+        nextRequiredDayIndex: todayDayIndex,
+      );
+    }
+
+    final nextProgress = (safeProgress - 1).clamp(0, 7).toInt();
+
+    if (nextProgress == 0) {
+      return (
+        weekProgress: 0,
+        weeksCompleted: state.weeksCompleted,
+        mostWeeksCompleted: state.mostWeeksCompleted,
+        weekStartDayIndex: null,
+        nextRequiredDayIndex: null,
+      );
+    }
+
+    return (
+      weekProgress: nextProgress,
+      weeksCompleted: state.weeksCompleted,
+      mostWeeksCompleted: state.mostWeeksCompleted,
+      weekStartDayIndex: state.weekStartDayIndex,
+      nextRequiredDayIndex: todayDayIndex,
+    );
+  }
+
+  Future<void> _syncStreakFromLocalDailyState() async {
+    if (!_streakState.streaksEnabled) return;
+
+    final todayKey = _streakDayKeyForNow();
+
+    var state = _streakState;
+
+    // ------------------------------------------------------------
+    // 1) If yesterday/older day was pending lost and we made it to
+    //    a new day, the streak is now officially lost.
+    // ------------------------------------------------------------
+    final pendingLostDayKey = state.pendingLostDayKey;
+    final hasExpiredPendingLoss =
+        pendingLostDayKey != null && pendingLostDayKey != todayKey;
+
+    if (hasExpiredPendingLoss) {
+      state = state
+          .copyWith(
+            currentStreak: 0,
+            weeksCompleted: 0,
+            weekProgress: 0,
+            weekStartDayIndex: null,
+            nextRequiredDayIndex: null,
+            pendingLostDayKey: null,
+            pendingLostStreakValue: null,
+          )
+          .normalized();
+
+      await _setStreakState(state);
+
+      // Important: stop here so this same sync pass cannot accidentally
+      // re-count stale/in-between daily state right after resetting.
+      return;
+    }
+
+    // ------------------------------------------------------------
+    // If the user skipped one or more PillChecker days without ever
+    // producing a missed state, there may be no pendingLostDayKey.
+    // Example: time travel / app closed / missed state never got written.
+    // If the most recent completed streak day is older than yesterday,
+    // the streak is officially broken.
+    // ------------------------------------------------------------
+    final mostRecentCompletedDayKey = _mostRecentCompletedStreakDayKey(state);
+
+    final skippedARequiredDay =
+        state.currentStreak > 0 &&
+        mostRecentCompletedDayKey != null &&
+        _daysBetweenDateKeys(mostRecentCompletedDayKey, todayKey) > 1;
+
+    final impossibleStreakState =
+        state.currentStreak > 0 && mostRecentCompletedDayKey == null;
+
+    if (skippedARequiredDay || impossibleStreakState) {
+      state = state
+          .copyWith(
+            currentStreak: 0,
+            weeksCompleted: 0,
+            weekProgress: 0,
+            weekStartDayIndex: null,
+            nextRequiredDayIndex: null,
+            pendingLostDayKey: null,
+            pendingLostStreakValue: null,
+          )
+          .normalized();
+
+      await _setStreakState(state);
+
+      // Stop here. The user can earn a new streak point only after
+      // completing the current day from this reset state.
+      return;
+    }
+
+    final allDoneToday = _areAllPillsComplete(_checkMapCache);
+    final missedRiskToday = _hasMissedStreakRiskForToday();
+
+    final completedSet = state.completedDayKeys.toSet();
+    final alreadyCountedToday =
+        completedSet.contains(todayKey) ||
+        state.lastCompletedDayKey == todayKey;
+
+    // ------------------------------------------------------------
+    // 2) If a dose is missed today, save the streak as pending.
+    //    If today was already counted complete, undo today's +1 first.
+    //    Example: user checked all pills, then marks one missed.
+    // ------------------------------------------------------------
+    if (missedRiskToday && !allDoneToday) {
+      final alreadyPendingToday = state.pendingLostDayKey == todayKey;
+
+      // Special case:
+      // Today was already counted, but now a dose is missed.
+      // Undo today's streak/week increment immediately, then put
+      // the remaining streak value at risk until tomorrow.
+      if (alreadyCountedToday) {
+        completedSet.remove(todayKey);
+        final completedDays = completedSet.toList()..sort();
+
+        final previousCompletedDayKey = completedDays.isEmpty
+            ? null
+            : completedDays.last;
+
+        final previousCurrentStreak = state.currentStreak;
+
+        final nextCurrentStreak = (previousCurrentStreak - 1)
+            .clamp(0, 999999)
+            .toInt();
+
+        // Lifetime best should never decrement automatically.
+        // Only a manual Reset Streaks action should clear this later.
+        final nextLongestStreak = state.longestStreak;
+
+        final todayDayIndex = _streakDayIndexForNow();
+        final weekly = _weeklyStateAfterUndoingToday(state, todayDayIndex);
+
+        await _setStreakState(
+          state
+              .copyWith(
+                currentStreak: nextCurrentStreak,
+                longestStreak: nextLongestStreak,
+                weeksCompleted: weekly.weeksCompleted,
+                mostWeeksCompleted: weekly.mostWeeksCompleted,
+                weekProgress: weekly.weekProgress,
+                weekStartDayIndex: weekly.weekStartDayIndex,
+                nextRequiredDayIndex: weekly.nextRequiredDayIndex,
+                lastCompletedDayKey: previousCompletedDayKey,
+                completedDayKeys: completedDays,
+
+                // Preserve the remaining streak so an override can restore path.
+                pendingLostDayKey: nextCurrentStreak > 0 ? todayKey : null,
+                pendingLostStreakValue: nextCurrentStreak > 0
+                    ? nextCurrentStreak
+                    : null,
+              )
+              .normalized(),
+        );
+
+        return;
+      }
+
+      // Normal missed-risk case:
+      // day was not counted yet, so keep visible streak for now
+      // and mark it pending until the next PillChecker day.
+      if (!alreadyPendingToday && state.currentStreak > 0) {
+        await _setStreakState(
+          state
+              .copyWith(
+                pendingLostDayKey: todayKey,
+                pendingLostStreakValue: state.currentStreak,
+              )
+              .normalized(),
+        );
+      }
+
+      return;
+    }
+
+    // ------------------------------------------------------------
+    // 3) If the missed state got fixed today, clear pending loss.
+    //    Example: user overrides missed dose back to taken.
+    // ------------------------------------------------------------
+    if (!missedRiskToday && state.pendingLostDayKey == todayKey) {
+      state = state
+          .copyWith(pendingLostDayKey: null, pendingLostStreakValue: null)
+          .normalized();
+
+      await _setStreakState(state);
+    }
+
+    // ------------------------------------------------------------
+    // 4) Today just became complete.
+    // ------------------------------------------------------------
+    if (allDoneToday) {
+      if (alreadyCountedToday) return;
+
+      completedSet.add(todayKey);
+      final completedDays = completedSet.toList()..sort();
+
+      final todayDayIndex = _streakDayIndexForNow();
+
+      final nextCurrentStreak = (state.currentStreak + 1)
+          .clamp(0, 999999)
+          .toInt();
+
+      final nextLongestStreak = nextCurrentStreak > state.longestStreak
+          ? nextCurrentStreak
+          : state.longestStreak;
+
+      final weekly = _weeklyStateAfterCompletingDay(state, todayDayIndex);
+
+      await _setStreakState(
+        state
+            .copyWith(
+              currentStreak: nextCurrentStreak,
+              longestStreak: nextLongestStreak,
+              weeksCompleted: weekly.weeksCompleted,
+              mostWeeksCompleted: weekly.mostWeeksCompleted,
+              weekProgress: weekly.weekProgress,
+              weekStartDayIndex: weekly.weekStartDayIndex,
+              nextRequiredDayIndex: weekly.nextRequiredDayIndex,
+              lastCompletedDayKey: todayKey,
+              pendingLostDayKey: null,
+              pendingLostStreakValue: null,
+              completedDayKeys: completedDays,
+            )
+            .normalized(),
+      );
+
+      return;
+    }
+
+    // ------------------------------------------------------------
+    // 5) Today was counted before, but became incomplete again.
+    //    Example: user added a new pill after completing the day.
+    // ------------------------------------------------------------
+    if (!allDoneToday && alreadyCountedToday) {
+      completedSet.remove(todayKey);
+      final completedDays = completedSet.toList()..sort();
+
+      final previousCompletedDayKey = completedDays.isEmpty
+          ? null
+          : completedDays.last;
+
+      final previousCurrentStreak = state.currentStreak;
+
+      final nextCurrentStreak = (previousCurrentStreak - 1)
+          .clamp(0, 999999)
+          .toInt();
+
+      // Lifetime best should never decrement automatically.
+      // Only a manual Reset Streaks action should clear this later.
+      final nextLongestStreak = state.longestStreak;
+
+      final todayDayIndex = _streakDayIndexForNow();
+      final weekly = _weeklyStateAfterUndoingToday(state, todayDayIndex);
+
+      await _setStreakState(
+        state
+            .copyWith(
+              currentStreak: nextCurrentStreak,
+              longestStreak: nextLongestStreak,
+              weeksCompleted: weekly.weeksCompleted,
+              mostWeeksCompleted: weekly.mostWeeksCompleted,
+              weekProgress: weekly.weekProgress,
+              weekStartDayIndex: weekly.weekStartDayIndex,
+              nextRequiredDayIndex: weekly.nextRequiredDayIndex,
+              lastCompletedDayKey: previousCompletedDayKey,
+              completedDayKeys: completedDays,
+            )
+            .normalized(),
+      );
+    }
+  }
+
+  Future<void> _prepareStreakScreenState() async {
+    // Make sure latest saved streak state is in memory.
+    await _loadStreakState();
+
+    // Make sure any pending missed streak loss officially resets
+    // before the streak screen appears.
+    await _syncStreakFromLocalDailyState();
+  }
+
+  void _requestStreakSyncFromLocalState() {
+    unawaited(_syncStreakFromLocalDailyState());
+  }
+
+  static const double _streakRiveOpenFrames = 35.0;
+  static const double _streakRiveFps = 24.0;
+  static const double _streakRiveOpenSpeed = 7.0;
+  static const int _streakRiveGuardMs = 60;
+
+  Duration _streakPillboxOpenSequenceDurationFor(int tabCount) {
+    if (tabCount <= 0) return Duration.zero;
+
+    final baseAnimMs = ((_streakRiveOpenFrames / _streakRiveFps) * 1000)
+        .round();
+
+    final boostedAnimMs = (baseAnimMs / _streakRiveOpenSpeed).round();
+
+    final stepMs = boostedAnimMs + _streakRiveGuardMs;
+
+    // Last tab starts at (tabCount - 1) * stepMs,
+    // then needs one more step to finish.
+    return Duration(milliseconds: (stepMs * tabCount) + 120);
+  }
+
+  Duration _streakDotRippleDuration() {
+    // Match the mini circle settings in _streaksPanel.
+    // Last circle delay: 6 * 85ms = 510ms
+    // DailyCompletionCircle duration: 360ms
+    // Extra buffer: 120ms
+    return const Duration(milliseconds: 990);
+  }
+
+  String _pickRandomMessage(List<String> messages) {
+    if (messages.isEmpty) return 'Keep Going!';
+
+    final index = DateTime.now().microsecondsSinceEpoch.abs() % messages.length;
+
+    return messages[index];
+  }
+
+  String _pickStreakStatusMessage(_StreakState state) {
+    final current = state.currentStreak;
+    final weeks = state.weeksCompleted;
+    final progress = state.weekProgress.clamp(0, 7).toInt();
+    final atRisk = state.pendingLostDayKey != null;
+
+    if (atRisk) {
+      return _pickRandomMessage(const [
+        "You can still save it!",
+        "Don't give up yet!",
+        "One override can keep it alive!",
+        "Still in the fight!",
+        "You’ve got time to recover!",
+        "Not over yet!",
+      ]);
+    }
+
+    if (current == 0 && weeks == 0 && progress == 0) {
+      return _pickRandomMessage(const [
+        "Let's get started!",
+        "Fresh start!",
+        "Start strong!",
+        "One day at a time!",
+        "Today is day one!",
+        "Let’s build it up!",
+        "Ready when you are!",
+        "Small steps count!",
+      ]);
+    }
+
+    if (current == 0 && (weeks > 0 || state.longestStreak > 0)) {
+      return _pickRandomMessage(const [
+        "An end can start new beginnings! Let's go!",
+        "Fresh start. You got this!",
+        "New run, same goal!",
+        "Back at it!",
+        "Restart strong!",
+        "The comeback starts now!",
+        "No worries — start again!",
+        "New streak incoming!",
+      ]);
+    }
+
+    if (progress >= 5 && progress < 7) {
+      return _pickRandomMessage(const [
+        "You're almost there! You got this!",
+        "So close!",
+        "Almost a full week!",
+        "Finish strong!",
+        "The week is nearly yours!",
+        "Keep pushing!",
+        "One more clean stretch!",
+        "You’re right there!",
+      ]);
+    }
+
+    if (weeks > 0 && progress == 0) {
+      return _pickRandomMessage(const [
+        "Let's tackle this next week!",
+        "New week, same momentum!",
+        "Run it back!",
+        "Another week starts now!",
+        "Keep the rhythm going!",
+        "Time for the next one!",
+        "Let’s stack another week!",
+      ]);
+    }
+
+    if (current >= 10) {
+      return _pickRandomMessage(const [
+        "You're on fire!",
+        "This streak is getting serious!",
+        "That’s a real streak!",
+        "Keep that momentum!",
+        "Big streak energy!",
+        "You're locked in!",
+        "Don’t stop now!",
+      ]);
+    }
+
+    return _pickRandomMessage(const [
+      "Keep Going!",
+      "Nice work!",
+      "Keep it up!",
+      "You're doing great!",
+      "Stay consistent!",
+      "One dose at a time!",
+      "Momentum matters!",
+      "Another day stronger!",
+      "You got this!",
+      "Stay on track!",
+      "Good progress!",
+      "Keep building!",
+    ]);
+  }
+
+  void _refreshStreakStatusMessage({bool allowWeekCompleteMessage = true}) {
+    _streakMessageTimer?.cancel();
+
+    final state = _streakState;
+
+    final shouldShowWeekComplete =
+        allowWeekCompleteMessage &&
+        state.weekProgress >= 7 &&
+        state.weeksCompleted > _lastWeekCompleteMessageFor;
+
+    if (shouldShowWeekComplete) {
+      _lastWeekCompleteMessageFor = state.weeksCompleted;
+
+      if (mounted) {
+        setState(() {
+          _streakStatusMessage = 'Week complete!';
+        });
+      } else {
+        _streakStatusMessage = 'Week complete!';
+      }
+
+      _streakMessageTimer = Timer(const Duration(seconds: 9), () {
+        if (!mounted) return;
+
+        setState(() {
+          _streakStatusMessage = _pickRandomMessage(const [
+            "Let's tackle this next week!",
+            "New week, same momentum!",
+            "Run it back!",
+            "Another week starts now!",
+            "Keep the rhythm going!",
+            "Time for the next one!",
+            "Let’s stack another week!",
+          ]);
+        });
+      });
+
+      return;
+    }
+
+    final nextMessage = _pickStreakStatusMessage(state);
+
+    if (mounted) {
+      setState(() {
+        _streakStatusMessage = nextMessage;
+      });
+    } else {
+      _streakStatusMessage = nextMessage;
+    }
+  }
+
+  void _showStreaksHelpDialog() {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        const cardColor = Color(0xFF98404F);
+        const green = Color(0xFF59FF56);
+        const blue = Color.fromARGB(255, 36, 251, 255);
+        const yellow = Color(0xFFFFD447);
+        const red = Color(0xFFFF0037);
+
+        Widget section({
+          required IconData icon,
+          required Color iconColor,
+          required String title,
+          required String body,
+        }) {
+          return Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(bottom: 12),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(icon, color: iconColor, size: 24),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          fontFamily: 'Amaranth',
+                          fontSize: 17,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        body,
+                        style: const TextStyle(
+                          fontSize: 13.5,
+                          height: 1.25,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white70,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 18,
+            vertical: 28,
+          ),
+          child: Container(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(dialogContext).size.height * 0.78,
+            ),
+            decoration: BoxDecoration(
+              color: cardColor,
+              borderRadius: BorderRadius.circular(26),
+            ),
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.whatshot_rounded,
+                      color: Color(0xFFFFB347),
+                      size: 34,
+                    ),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'How do streaks work?',
+                        style: TextStyle(
+                          fontFamily: 'Amaranth',
+                          fontSize: 24,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      icon: const Icon(Icons.close, color: Colors.white),
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 8),
+
+                Flexible(
+                  child: Scrollbar(
+                    thumbVisibility: true,
+                    thickness: 5,
+                    radius: const Radius.circular(99),
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.only(right: 10),
+                      child: Column(
+                        children: [
+                          section(
+                            icon: Icons.check_circle_rounded,
+                            iconColor: green,
+                            title: 'Daily streaks',
+                            body:
+                                'Complete every scheduled dose for the day to add 1 to your current streak. If you add or edit a pill and today becomes incomplete again, today’s streak point is undone until everything is checked.',
+                          ),
+                          section(
+                            icon: Icons.calendar_month_rounded,
+                            iconColor: blue,
+                            title: 'Weekly progress',
+                            body:
+                                'Your week does not have to start on Sunday. PillChecker starts your 7-day week on the first day you complete, then counts up from 1/7 to 7/7.',
+                          ),
+                          section(
+                            icon: Icons.flag_rounded,
+                            iconColor: green,
+                            title: 'Start, Next, and End',
+                            body:
+                                'Start marks where your current 7-day run began. Next shows the next day you need to complete. End marks the day before your starting day.',
+                          ),
+                          section(
+                            icon: Icons.warning_rounded,
+                            iconColor: yellow,
+                            title: 'Missed doses',
+                            body:
+                                'If a dose is missed, your streak is at risk. PillChecker keeps your streak value saved for the rest of that day so an override can restore it by default.',
+                          ),
+                          section(
+                            icon: Icons.restart_alt_rounded,
+                            iconColor: red,
+                            title: 'Losing a streak',
+                            body:
+                                'If the missed dose is not fixed before the next PillChecker day, your current streak resets to 0. Your longest streak and most weeks completed stay saved as your personal bests.',
+                          ),
+                          section(
+                            icon: Icons.emoji_events_rounded,
+                            iconColor: const Color(0xFFFFB347),
+                            title: 'Week complete',
+                            body:
+                                'When you hit 7/7, the week counter goes up by 1. After that, a new 7-day run can begin from the next completed day.',
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 12),
+
+                SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: Material(
+                    color: green,
+                    borderRadius: BorderRadius.circular(16),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(16),
+                      onTap: () => Navigator.pop(dialogContext),
+                      child: const Center(
+                        child: Text(
+                          'Got it',
+                          style: TextStyle(
+                            fontFamily: 'Amaranth',
+                            fontSize: 19,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   // ---------------- decode helpers ----------------
   List<List<String>> _decodeListOfStringLists(String? raw) {
     if (raw == null || raw.isEmpty) return [];
@@ -2287,9 +4519,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return (decoded as List).map((e) => e == true).toList();
   }
 
+  List<int> _decodeIntList(String? raw) {
+    if (raw == null || raw.isEmpty) return [];
+    final decoded = jsonDecode(raw);
+    return (decoded as List).map((e) => (e as num).toInt()).toList();
+  }
+
   // ---------------- load ----------------
   Future<void> _loadAndMaybeAutoOpen() async {
     final prefs = await SharedPreferences.getInstance();
+    await _loadStreakState();
 
     await PrefsMigration.runOnceIfNeeded(
       medService: _medService,
@@ -2331,10 +4570,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     await _saveLocalStateSignature();
     await _syncCurrentCycleAnchorOnly();
+
+    await _materializeOverdueMissedDosesLocally();
+
     if (!mounted) return;
     setState(() {
       _checkMapFuture = Future.value(Map<String, dynamic>.from(_checkMapCache));
     });
+
+    _requestStreakSyncFromLocalState();
 
     unawaited(_rebuild2DayNotifWindowAndReMuteChecked(tag: 'initial-load'));
     await _syncCurrentCycleAnchorOnly();
@@ -2363,6 +4607,146 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!_wheelController.hasClients) return;
       _wheelController.jumpToItem(index);
     });
+  }
+
+  Future<void> _addDemoPillDirect() async {
+    FocusManager.instance.primaryFocus?.unfocus();
+
+    final alreadyIndex = pillNames.indexWhere(isDemoPillName);
+    if (alreadyIndex >= 0) {
+      if (!mounted) return;
+
+      setState(() {
+        _searchOpen = false;
+        _configOpen = false;
+        _infoOpen = false;
+        _pendingSlot = false;
+      });
+
+      _centerWheelOn(alreadyIndex + 1);
+
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Demo pill already added'),
+          content: const Text('The hidden demo pill is already on your wheel.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+
+      return;
+    }
+
+    final now = DateTime.now();
+    final dose1 = TimeOfDay(hour: now.hour, minute: now.minute);
+    final dose2Raw = now.add(const Duration(minutes: 1));
+    final dose2 = TimeOfDay(hour: dose2Raw.hour, minute: dose2Raw.minute);
+
+    final doseStrings = <String>[_timeToStr(dose1), _timeToStr(dose2)];
+
+    final prefs = await SharedPreferences.getInstance();
+
+    final sortOrder = pillNames.length;
+
+    final med = await _medService.create(
+      name: kDemoPillName,
+      supplyEnabled: false,
+      supplyLeft: 0,
+      supplyInitial: 0,
+      nameLocked: true,
+      sortOrder: sortOrder,
+    );
+
+    await _scheduleService.upsertSchedule(
+      medicationId: med.id,
+      times24hSorted: doseStrings,
+    );
+
+    await _scheduleService.ensureDoseEventsForMedication(med.id);
+
+    final updatedNames = [...pillNames, kDemoPillName];
+    final updatedTimes = [...pillTimes, doseStrings.first];
+    final updatedDoseTimes = [...pillDoseTimes, doseStrings];
+    final updatedNameLocked = [...pillNameLocked, true];
+    final updatedCustomInfo = [...pillCustomInfo, ''];
+
+    _alignSupplyListsToCount(pillNames.length);
+    pillSupplyEnabled.add(false);
+    pillSupplyLeft.add(0);
+    pillSupplyInitial.add(0);
+    pillSupplyLowSent.add(false);
+    _alignSupplyListsToCount(updatedNames.length);
+
+    await prefs.setStringList(_pillNamesKey, updatedNames);
+    await prefs.setStringList(_pillTimesKey, updatedTimes);
+    await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
+    await prefs.setString(_pillNameLockedKey, jsonEncode(updatedNameLocked));
+    await prefs.setStringList(_pillCustomInfoKey, updatedCustomInfo);
+
+    await _saveSupplyListsToPrefs();
+
+    if (!mounted) return;
+
+    setState(() {
+      medicationIds = [...medicationIds, med.id];
+      medicationCreatedAts = [...medicationCreatedAts, med.createdAt];
+
+      pillNames = updatedNames;
+      pillTimes = updatedTimes;
+      pillDoseTimes = updatedDoseTimes;
+      pillNameLocked = updatedNameLocked;
+      pillCustomInfo = updatedCustomInfo;
+
+      pillSupplyEnabled = [...pillSupplyEnabled];
+      pillSupplyLeft = [...pillSupplyLeft];
+      pillSupplyInitial = [...pillSupplyInitial];
+      pillSupplyLowSent = [...pillSupplyLowSent];
+
+      _searchOpen = false;
+      _configOpen = false;
+      _infoOpen = false;
+      _pendingSlot = false;
+      _editingIndex = null;
+      _selectedPillInfo = null;
+      _lockPillName = false;
+      _step = _ConfigStep.name;
+      _wheelSelectedIndex = updatedNames.length;
+      _showPillLabel = true;
+      _labelOverride = null;
+    });
+
+    await _saveLocalDailyState();
+    await _saveLocalStateSignature();
+    await _syncCurrentCycleAnchorOnly();
+
+    await MedicationPrefsMirror.write(
+      pillNames: pillNames,
+      pillTimesFirst: pillTimes,
+      pillDoseTimes: pillDoseTimes,
+      pillSupplyEnabled: pillSupplyEnabled,
+      pillSupplyLeft: pillSupplyLeft,
+      pillSupplyInitial: pillSupplyInitial,
+      pillSupplyLowSent: pillSupplyLowSent,
+      pillNameLocked: pillNameLocked,
+    );
+
+    await _resyncNotifsAfterPillChange();
+
+    await NotificationService.scheduleDemoPillDose1(
+      pillSlot: updatedNames.length - 1,
+      pillName: kDemoPillName,
+    );
+
+    _publishLocalDailyState();
+    _centerWheelOn(updatedNames.length);
+
+    _scheduleGlobalBoundaryRefresh();
+    unawaited(_scheduleGlobalDayBoundaryRefresh());
   }
 
   void _startAddFromDirectory(PillSearchItem item) {
@@ -2454,6 +4838,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _pickSearchItem(PillSearchItem item) async {
+    if (isDemoPillName(item.name)) {
+      await _addDemoPillDirect();
+      return;
+    }
     final already = pillNames.any(
       (p) => p.trim().toLowerCase() == item.name.trim().toLowerCase(),
     );
@@ -2812,10 +5200,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // ✅ persist
     await _saveSupplyListsToPrefs();
 
-    final checkMap = await _deriveCheckMapFromDatabase();
-    await _saveCheckMap(checkMap);
-    _setCheckMapAndRebuild(checkMap);
-    _refreshCheckMapFuture();
+    // ✅ Preserve local HomeScreen adherence state when adding a new pill.
+    // Adding a pill at the end should not erase today’s visual checks/missed states.
+    await _saveLocalDailyState();
 
     _alignMedicationCreatedAtsToCount(pillNames.length);
     // ✅ Rebuild notif window
@@ -2843,7 +5230,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _selectedPillInfo = null;
     });
 
-    await _clearLocalDailyState();
+    // Now that pillNames/pillDoseTimes include the new pill,
+    // streak sync can correctly see today is incomplete again.
+    await _materializeOverdueMissedDosesLocally(
+      onlyPillIndex: updatedNames.length - 1,
+    );
+    _publishLocalDailyState();
+
     await _saveLocalStateSignature();
     await _syncCurrentCycleAnchorOnly();
 
@@ -3171,21 +5564,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await prefs.setStringList(_pillTimesKey, updatedTimes);
     await prefs.setString(_pillDoseTimesKey, jsonEncode(updatedDoseTimes));
 
-    // ✅ make sure supply arrays exist and match current pill count BEFORE removing
-    _alignSupplyListsToCount(pillNames.length);
-
-    // Remove the same slot as the deleted pill (guarded)
-    if (slot < pillSupplyEnabled.length) pillSupplyEnabled.removeAt(slot);
-    if (slot < pillSupplyLeft.length) pillSupplyLeft.removeAt(slot);
-    if (slot < pillSupplyInitial.length) pillSupplyInitial.removeAt(slot);
-    if (slot < pillSupplyLowSent.length) pillSupplyLowSent.removeAt(slot);
-
-    // ✅ align to NEW count after delete
-    _alignSupplyListsToCount(updatedNames.length);
-
-    // ✅ persist the actual lists (NOT updatedSupplyEnabled vars)
-    await _saveSupplyListsToPrefs();
-
     final updatedNameLocked = [...pillNameLocked]..removeAt(slot);
     final updatedCustomInfo = [...pillCustomInfo]..removeAt(slot);
     await prefs.setStringList(_pillCustomInfoKey, updatedCustomInfo);
@@ -3232,12 +5610,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _showPillLabel = updatedNames.isNotEmpty;
     });
 
-    final checkMap = await _deriveCheckMapFromDatabase();
-    await _saveCheckMap(checkMap);
-    _setCheckMapAndRebuild(checkMap);
-    _refreshCheckMapFuture();
+    _removeSlotFromLocalDailyState(slot);
+    await _saveLocalDailyState();
+    _publishLocalDailyState();
 
-    await _clearLocalDailyState();
     await _saveLocalStateSignature();
 
     await MedicationPrefsMirror.write(
@@ -3371,7 +5747,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _scheduleCenteredDoseBoundaryRefresh();
 
-    unawaited(
+    _trackAdherenceWrite(
       _persistTakenToDb(
         medicationId: medicationIds[pillIndex],
         plannedIso: plannedIso,
@@ -3382,16 +5758,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _markCurrentDoseMissed() async {
     final pillIndex = _centerPillIndex;
     if (pillIndex == null || pillIndex >= medicationIds.length) return;
-
-    if (_isFirstDayForMedication(pillIndex)) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('A pill cannot be marked missed on its first day.'),
-        ),
-      );
-      return;
-    }
 
     final doses = _doseTimesForPill(pillIndex);
     if (doses.isEmpty) return;
@@ -3433,7 +5799,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _scheduleCenteredDoseBoundaryRefresh();
 
-    unawaited(
+    _trackAdherenceWrite(
       _persistMissedToDb(
         medicationId: medicationIds[pillIndex],
         plannedIso: plannedIso,
@@ -3442,16 +5808,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _openHistoryScreen() async {
+    await _gateAdherenceScreenIfNeeded('Preparing adherence history');
+
     await Navigator.push<void>(
       context,
       MaterialPageRoute(
         builder: (_) => HistoryScreen(adherenceService: _adherenceService),
       ),
     );
-    if (!mounted) return;
 
-    // Keep history/calendar DB fresh in background,
-    // but do not let DB overwrite HomeScreen UI state.
+    if (!mounted) return;
     unawaited(_refreshAdherenceFromDb());
     _publishLocalDailyState();
   }
@@ -3534,6 +5900,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final doseIndex = state.doseIndex;
 
+    final shouldStartDemoDose2 =
+        _isDemoPillIndex(pillIndex) &&
+        doseIndex == 0 &&
+        (state.takenMask & 1) == 0;
+
     final cycleDay = DateTime(
       state.cycleStart.year,
       state.cycleStart.month,
@@ -3544,6 +5915,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       doses,
       doseIndex,
     );
+
+    _trackAdherenceWrite(
+      _persistTakenToDb(
+        medicationId: medicationIds[pillIndex],
+        plannedIso: plannedIso,
+      ),
+    );
+
+    if (shouldStartDemoDose2) {
+      unawaited(
+        NotificationService.scheduleDemoPillDose2AfterCheck(
+          pillSlot: pillIndex,
+          pillName: pillNames[pillIndex],
+        ),
+      );
+    }
 
     // LOCAL FIRST
     _setLocalDoseStatus(
@@ -3556,36 +5943,238 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _syncCurrentCycleAnchorOnly();
     _publishLocalDailyState();
 
-    await NotificationService.muteToday(
-      pillSlot: pillIndex,
-      doseIndex: doseIndex,
-      dosesPerDay: doses.length,
-      muteRemainingDoses: false,
-    );
-
     unawaited(_consumeOneSupplyIfEnabled(pillIndex));
 
     _scheduleCenteredDoseBoundaryRefresh();
 
+    final visualStateAfterCheck = _getDisplayedDoseStateForPill(
+      pillIndex: pillIndex,
+      doses: doses,
+      takenMap: _checkMapCache,
+      missedMap: _lastMissedMapCache,
+      now: DateTime.now(),
+    );
+
+    final movedToNextDose = visualStateAfterCheck.doseIndex != doseIndex;
+
     _labelTimer?.cancel();
+    _labelTimer = null;
+
     setState(() => _labelOverride = 'Pill Checked!');
-    _labelTimer = Timer(const Duration(seconds: 9), () {
-      if (!mounted) return;
-      setState(() => _labelOverride = null);
-    });
+
+    _labelTimer = Timer(
+      movedToNextDose ? const Duration(seconds: 2) : const Duration(seconds: 9),
+      () {
+        if (!mounted) return;
+        setState(() => _labelOverride = null);
+      },
+    );
 
     _recordDoseHistory(pillNames[pillIndex]);
 
-    // BACKGROUND DB WRITE
+    // Notification cleanup can happen after UI + DB write are already moving.
     unawaited(
-      _persistTakenToDb(
-        medicationId: medicationIds[pillIndex],
-        plannedIso: plannedIso,
+      NotificationService.muteToday(
+        pillSlot: pillIndex,
+        doseIndex: doseIndex,
+        dosesPerDay: doses.length,
+        muteRemainingDoses: false,
       ),
     );
   }
 
+  Future<void> _openStreaksPanel() async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    _hidePillLabelNow();
+
+    await _prepareStreakScreenState();
+    if (!mounted) return;
+
+    if (!_streakState.streaksEnabled) return;
+
+    final shouldShowRiskWarning = _streakAtRisk;
+
+    _refreshStreakStatusMessage(allowWeekCompleteMessage: false);
+
+    _streaksTransitionTimer?.cancel();
+    _streaksPillboxTimer?.cancel();
+
+    setState(() {
+      _streaksOpen = true;
+      _streaksGreenVisible = false;
+
+      // Spawn streak pillbox closed first.
+      _streakPillboxOpenDays = <int>{};
+      _streakPillboxResetToken++;
+      _streakDotsVisible = false;
+      _streakMarkersVisible = false;
+      _streakMessageVisible = false;
+      _streakButtonNeedsAttention = false;
+
+      _configOpen = false;
+      _infoOpen = false;
+      _searchOpen = false;
+      _pendingSlot = false;
+      _editingIndex = null;
+    });
+
+    if (shouldShowRiskWarning) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_streaksOpen) return;
+        _showStreakRiskWarningDialog();
+      });
+    }
+
+    // First: home fades out to pink.
+    _streaksTransitionTimer = Timer(const Duration(milliseconds: 360), () {
+      if (!mounted) return;
+
+      setState(() {
+        _streaksGreenVisible = true;
+      });
+
+      // Second: wait for green streak screen/pillbox to finish fading in.
+      // Then start the pillbox open sequence while it is visible.
+      _streaksPillboxTimer?.cancel();
+      _streaksPillboxTimer = Timer(const Duration(milliseconds: 460), () {
+        if (!mounted || !_streaksOpen || !_streaksGreenVisible) return;
+
+        final daysToOpen = <int>{0, 1, 2, 3, 4, 5, 6};
+
+        setState(() {
+          _streakPillboxOpenDays = daysToOpen;
+          _streakDotsVisible = false;
+        });
+
+        _streakDotsTimer?.cancel();
+        _streakDotsTimer = Timer(
+          _streakPillboxOpenSequenceDurationFor(daysToOpen.length),
+          () {
+            if (!mounted || !_streaksOpen || !_streaksGreenVisible) return;
+
+            setState(() {
+              _streakDotsVisible = true;
+              _streakMarkersVisible = false;
+            });
+
+            _streakMarkersTimer?.cancel();
+            _streakMarkersTimer = Timer(_streakDotRippleDuration(), () {
+              if (!mounted || !_streaksOpen || !_streaksGreenVisible) return;
+
+              setState(() {
+                _streakMarkersVisible = true;
+                _streakMessageVisible = true;
+              });
+            });
+          },
+        );
+      });
+    });
+  }
+
+  void _closeStreaksPanel() {
+    if (!mounted) return;
+
+    _streaksTransitionTimer?.cancel();
+    _streaksPillboxTimer?.cancel();
+    _streakDotsTimer?.cancel();
+    _streakMarkersTimer?.cancel();
+
+    // First: fade green streak screen out.
+    setState(() {
+      _streaksGreenVisible = false;
+      _streakDotsVisible = false;
+      _streakMarkersVisible = false;
+      _streakMessageVisible = false;
+    });
+
+    // After it is hidden, reset the streak pillbox back to closed
+    // and fully leave streak mode.
+    _streaksTransitionTimer = Timer(const Duration(milliseconds: 420), () {
+      if (!mounted) return;
+
+      setState(() {
+        _streakPillboxOpenDays = <int>{};
+        _streakPillboxResetToken++;
+
+        _streaksOpen = false;
+      });
+
+      _showPillLabelAfterSlide();
+    });
+  }
+
+  void _toggleStreaksPanel() {
+    if (_streaksOpen) {
+      _closeStreaksPanel();
+    } else {
+      _openStreaksPanel();
+    }
+  }
+
+  void _showStreakRiskWarningDialog() {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF98404F),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(22),
+          ),
+          title: const Text(
+            'Streak at risk',
+            style: TextStyle(
+              fontFamily: 'Amaranth',
+              fontSize: 25,
+              fontWeight: FontWeight.w800,
+              color: Colors.white,
+            ),
+          ),
+          content: const Text(
+            'You have missed doses today, so your streak is at risk. '
+            'If you actually took your pill, use override to fix the missed dose before the next PillChecker day.',
+            style: TextStyle(
+              color: Colors.white70,
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+              height: 1.25,
+            ),
+          ),
+          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+          actions: [
+            SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: Material(
+                color: const Color(0xFF59FF56),
+                borderRadius: BorderRadius.circular(16),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(16),
+                  onTap: () => Navigator.pop(dialogContext),
+                  child: const Center(
+                    child: Text(
+                      'Got it',
+                      style: TextStyle(
+                        fontFamily: 'Amaranth',
+                        fontSize: 19,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Future<void> _openCalendarScreen() async {
+    await _gateAdherenceScreenIfNeeded('Preparing calendar');
+
     await Navigator.push<void>(
       context,
       MaterialPageRoute(
@@ -3624,404 +6213,441 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           borderRadius: BorderRadius.circular(26),
         ),
         padding: const EdgeInsets.all(16),
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // ---------------- HEADER ROW ----------------
-              Row(
-                children: [
-                  Container(
-                    width: 52,
-                    height: 52,
-                    decoration: BoxDecoration(
-                      color: white,
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: Center(
-                      child: Image.asset(
-                        'assets/images/pill_placeholder.png',
-                        width: 36,
-                        height: 36,
-                        fit: BoxFit.contain,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: (_step == _ConfigStep.name)
-                        ? TextField(
-                            focusNode: _nameFocus,
-                            controller: _nameController,
-                            style: const TextStyle(color: white, fontSize: 18),
-                            decoration: const InputDecoration(
-                              hintText: 'Pill name...',
-                              hintStyle: TextStyle(color: Colors.white70),
-                              border: InputBorder.none,
-                            ),
-                          )
-                        : (_lockPillName
-                              ? Text(
-                                  _nameController.text.trim(),
-                                  style: const TextStyle(
-                                    color: white,
-                                    fontSize: 22,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                  overflow: TextOverflow.ellipsis,
-                                )
-                              : InkWell(
-                                  onTap: _editNameAgain,
-                                  child: Row(
-                                    children: [
-                                      Expanded(
-                                        child: Text(
-                                          _nameController.text.trim(),
-                                          style: const TextStyle(
-                                            color: white,
-                                            fontSize: 22,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                          overflow: TextOverflow.ellipsis,
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      const Icon(
-                                        Icons.edit,
-                                        color: Colors.white70,
-                                        size: 20,
-                                      ),
-                                    ],
-                                  ),
-                                )),
-                  ),
-                  IconButton(
-                    onPressed: _cancelAddFlow,
-                    icon: const Icon(Icons.close, color: white),
-                  ),
-                ],
-              ),
-
-              const SizedBox(height: 10),
-
-              AnimatedSize(
-                duration: const Duration(milliseconds: 180),
-                curve: Curves.easeInOut,
-                child: Container(
-                  width: double.infinity,
-                  height: _step == _ConfigStep.name ? 120 : 120,
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.12),
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                  child: _lockPillName
-                      ? SingleChildScrollView(
-                          child: Text(
-                            (_selectedPillInfo != null &&
-                                    _selectedPillInfo!.trim().isNotEmpty)
-                                ? _selectedPillInfo!
-                                : 'Medication info unavailable right now.',
-                            style: TextStyle(
-                              color: Colors.white70,
-                              fontSize: _infoFontSizeFor(
-                                _selectedPillInfo ?? '',
-                              ),
-                              height: 1.25,
-                            ),
-                          ),
-                        )
-                      : TextField(
-                          controller: _customInfoController,
-                          expands: true,
-                          minLines: null,
-                          maxLines: null,
-                          textAlignVertical: TextAlignVertical.top,
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: _infoFontSizeFor(
-                              _customInfoController.text,
-                              base: 15,
-                            ),
-                            height: 1.25,
-                          ),
-                          decoration: const InputDecoration(
-                            hintText: 'Edit pill info here',
-                            hintStyle: TextStyle(color: Colors.white70),
-                            border: InputBorder.none,
-                            isCollapsed: true,
-                          ),
-                        ),
-                ),
-              ),
-
-              const SizedBox(height: 12),
-
-              if (_step != _ConfigStep.name && _supplyModeGlobal != 'off') ...[
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.12),
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                  child: Column(
-                    children: [
-                      if (_supplyModeGlobal == 'decide') ...[
-                        Row(
-                          children: [
-                            const Text(
-                              'Track supply',
-                              style: TextStyle(
-                                color: white,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(width: 6),
-                            GestureDetector(
-                              onTap: _showSupplyInfoDialog,
-                              child: const Icon(
-                                Icons.info_outline,
-                                color: Colors.white70,
-                                size: 20,
-                              ),
-                            ),
-                            const Spacer(),
-                            Switch(
-                              value: _supplyTrackOn,
-                              onChanged: (v) async {
-                                if (!mounted) return;
-
-                                if (!v) {
-                                  setState(() {
-                                    _supplyTrackOn = false;
-                                    _supplyLeftDraft = 0;
-                                    _supplyInitialDraft = 0;
-                                  });
-                                  return;
-                                }
-
-                                setState(() => _supplyTrackOn = true);
-                                await _editSupplyDialog(setInitialToo: true);
-
-                                if (!mounted) return;
-                                if (_supplyLeftDraft <= 0) {
-                                  setState(() => _supplyTrackOn = false);
-                                }
-                              },
-                            ),
-                          ],
-                        ),
-                      ] else ...[
-                        Row(
-                          children: [
-                            const Text(
-                              'Supply',
-                              style: TextStyle(
-                                color: white,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(width: 6),
-                            GestureDetector(
-                              onTap: _showSupplyInfoDialog,
-                              child: const Icon(
-                                Icons.info_outline,
-                                color: Colors.white70,
-                                size: 20,
-                              ),
-                            ),
-                            const Spacer(),
-                            const Text(
-                              'Always On',
-                              style: TextStyle(
-                                color: Colors.white70,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                      ],
-
-                      if ((_supplyModeGlobal == 'on') ||
-                          (_supplyModeGlobal == 'decide' &&
-                              _supplyTrackOn)) ...[
-                        const SizedBox(height: 8),
-                        InkWell(
-                          onTap: () => _editSupplyDialog(setInitialToo: false),
-                          child: Row(
-                            children: [
-                              const Text(
-                                'Supply left',
-                                style: TextStyle(
-                                  color: Colors.white70,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                              const Spacer(),
-                              Text(
-                                _supplyLeftDraft.toString(),
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w900,
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              const Icon(
-                                Icons.edit,
-                                color: Colors.white70,
-                                size: 18,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-              ],
-
-              if (_step == _ConfigStep.config) ...[
+        child: Scrollbar(
+          controller: _configPanelScrollCtrl,
+          thumbVisibility: true,
+          thickness: 5,
+          radius: const Radius.circular(99),
+          child: SingleChildScrollView(
+            controller: _configPanelScrollCtrl,
+            padding: const EdgeInsets.only(right: 8),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // ---------------- HEADER ROW ----------------
                 Row(
                   children: [
-                    const Icon(Icons.schedule, color: white),
-                    const SizedBox(width: 10),
-                    const Text('Times per day', style: TextStyle(color: white)),
-                    const Spacer(),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      width: 52,
+                      height: 52,
                       decoration: BoxDecoration(
                         color: white,
-                        borderRadius: BorderRadius.circular(12),
+                        borderRadius: BorderRadius.circular(14),
                       ),
-                      child: DropdownButton<int>(
-                        value: _timesPerDay,
-                        underline: const SizedBox.shrink(),
-                        items: List.generate(6, (i) => i + 1)
-                            .map(
-                              (n) =>
-                                  DropdownMenuItem(value: n, child: Text('$n')),
+                      child: Center(
+                        child: Image.asset(
+                          'assets/images/pill_placeholder.png',
+                          width: 36,
+                          height: 36,
+                          fit: BoxFit.contain,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: (_step == _ConfigStep.name)
+                          ? TextField(
+                              focusNode: _nameFocus,
+                              controller: _nameController,
+                              style: const TextStyle(
+                                color: white,
+                                fontSize: 18,
+                              ),
+                              decoration: const InputDecoration(
+                                hintText: 'Pill name...',
+                                hintStyle: TextStyle(color: Colors.white70),
+                                border: InputBorder.none,
+                              ),
                             )
-                            .toList(),
-                        onChanged: (v) {
-                          if (v == null) return;
-                          setState(() {
-                            _timesPerDay = v;
-                            _singleDoseTime = null;
-                            _doseTimes = [];
-                          });
-                        },
-                      ),
+                          : (_lockPillName
+                                ? Text(
+                                    _nameController.text.trim(),
+                                    style: const TextStyle(
+                                      color: white,
+                                      fontSize: 22,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  )
+                                : InkWell(
+                                    onTap: _editNameAgain,
+                                    child: Row(
+                                      children: [
+                                        Expanded(
+                                          child: Text(
+                                            _nameController.text.trim(),
+                                            style: const TextStyle(
+                                              color: white,
+                                              fontSize: 22,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 8),
+                                        const Icon(
+                                          Icons.edit,
+                                          color: Colors.white70,
+                                          size: 20,
+                                        ),
+                                      ],
+                                    ),
+                                  )),
+                    ),
+                    IconButton(
+                      onPressed: _cancelAddFlow,
+                      icon: const Icon(Icons.close, color: white),
                     ),
                   ],
                 ),
 
                 const SizedBox(height: 10),
 
-                if (_timesPerDay == 1)
-                  Container(
-                    height: 48,
+                AnimatedSize(
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeInOut,
+                  child: Container(
+                    width: double.infinity,
+                    height: _step == _ConfigStep.name ? 120 : 120,
+                    padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
-                      color: white,
-                      borderRadius: BorderRadius.circular(14),
+                      color: Colors.white.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(18),
                     ),
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(14),
-                      onTap: _pickTimeSingle,
-                      child: Center(
-                        child: Text(
-                          _singleDoseTime == null
-                              ? 'Pick time'
-                              : _fmt(_singleDoseTime!),
-                          style: const TextStyle(
-                            color: cardColor,
-                            fontWeight: FontWeight.w700,
-                            fontSize: 18,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
-
-              if (_step == _ConfigStep.doses)
-                Column(
-                  children: [
-                    for (int i = 0; i < _timesPerDay; i++) ...[
-                      Builder(
-                        builder: (context) {
-                          final t = _doseTimes[i];
-                          return Container(
-                            decoration: BoxDecoration(
-                              color: white,
-                              borderRadius: BorderRadius.circular(16),
-                            ),
-                            child: ListTile(
-                              title: Text(
-                                'Dose ${i + 1}',
-                                style: const TextStyle(
-                                  color: cardColor,
-                                  fontWeight: FontWeight.w800,
+                    child: _lockPillName
+                        ? Scrollbar(
+                            controller: _lockedInfoScrollCtrl,
+                            thumbVisibility: true,
+                            thickness: 4,
+                            radius: const Radius.circular(99),
+                            child: SingleChildScrollView(
+                              controller: _lockedInfoScrollCtrl,
+                              padding: const EdgeInsets.only(right: 8),
+                              child: Text(
+                                (_selectedPillInfo != null &&
+                                        _selectedPillInfo!.trim().isNotEmpty)
+                                    ? _selectedPillInfo!
+                                    : 'Medication info unavailable right now.',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: _infoFontSizeFor(
+                                    _selectedPillInfo ?? '',
+                                  ),
+                                  height: 1.25,
                                 ),
                               ),
-                              subtitle: Text(
-                                t == null ? 'Tap to set time' : _fmt(t),
-                                style: const TextStyle(color: cardColor),
-                              ),
-                              trailing: const Icon(
-                                Icons.schedule,
-                                color: cardColor,
-                              ),
-                              onTap: () => _pickDoseTime(i),
                             ),
-                          );
-                        },
-                      ),
-                      if (i < _timesPerDay - 1) const SizedBox(height: 10),
-                    ],
-                  ],
-                )
-              else
-                const SizedBox(height: 12),
-
-              SizedBox(
-                width: double.infinity,
-                height: 56,
-                child: Material(
-                  color: green,
-                  borderRadius: BorderRadius.circular(18),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(18),
-                    onTap: _handlePrimaryAction,
-                    child: Row(
-                      children: [
-                        const SizedBox(width: 16),
-                        Expanded(
-                          child: Center(
-                            child: Text(
-                              titleText,
-                              style: const TextStyle(
+                          )
+                        : Scrollbar(
+                            controller: _customInfoScrollCtrl,
+                            thumbVisibility: true,
+                            thickness: 4,
+                            radius: const Radius.circular(99),
+                            child: TextField(
+                              controller: _customInfoController,
+                              scrollController: _customInfoScrollCtrl,
+                              expands: true,
+                              minLines: null,
+                              maxLines: null,
+                              textAlignVertical: TextAlignVertical.top,
+                              style: TextStyle(
                                 color: Colors.white,
-                                fontSize: 22,
-                                fontWeight: FontWeight.w800,
+                                fontSize: _infoFontSizeFor(
+                                  _customInfoController.text,
+                                  base: 15,
+                                ),
+                                height: 1.25,
+                              ),
+                              decoration: const InputDecoration(
+                                hintText: 'Edit pill info here',
+                                hintStyle: TextStyle(color: Colors.white70),
+                                border: InputBorder.none,
+                                isCollapsed: true,
                               ),
                             ),
                           ),
-                        ),
-                        const SizedBox(
-                          width: 56,
-                          height: 56,
-                          child: Icon(Icons.add, color: Colors.white, size: 34),
-                        ),
+                  ),
+                ),
+
+                const SizedBox(height: 12),
+
+                if (_step != _ConfigStep.name &&
+                    _supplyModeGlobal != 'off') ...[
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Column(
+                      children: [
+                        if (_supplyModeGlobal == 'decide') ...[
+                          Row(
+                            children: [
+                              const Text(
+                                'Track supply',
+                                style: TextStyle(
+                                  color: white,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              GestureDetector(
+                                onTap: _showSupplyInfoDialog,
+                                child: const Icon(
+                                  Icons.info_outline,
+                                  color: Colors.white70,
+                                  size: 20,
+                                ),
+                              ),
+                              const Spacer(),
+                              Switch(
+                                value: _supplyTrackOn,
+                                onChanged: (v) async {
+                                  if (!mounted) return;
+
+                                  if (!v) {
+                                    setState(() {
+                                      _supplyTrackOn = false;
+                                      _supplyLeftDraft = 0;
+                                      _supplyInitialDraft = 0;
+                                    });
+                                    return;
+                                  }
+
+                                  setState(() => _supplyTrackOn = true);
+                                  await _editSupplyDialog(setInitialToo: true);
+
+                                  if (!mounted) return;
+                                  if (_supplyLeftDraft <= 0) {
+                                    setState(() => _supplyTrackOn = false);
+                                  }
+                                },
+                              ),
+                            ],
+                          ),
+                        ] else ...[
+                          Row(
+                            children: [
+                              const Text(
+                                'Supply',
+                                style: TextStyle(
+                                  color: white,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              GestureDetector(
+                                onTap: _showSupplyInfoDialog,
+                                child: const Icon(
+                                  Icons.info_outline,
+                                  color: Colors.white70,
+                                  size: 20,
+                                ),
+                              ),
+                              const Spacer(),
+                              const Text(
+                                'Always On',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                        ],
+
+                        if ((_supplyModeGlobal == 'on') ||
+                            (_supplyModeGlobal == 'decide' &&
+                                _supplyTrackOn)) ...[
+                          const SizedBox(height: 8),
+                          InkWell(
+                            onTap: () =>
+                                _editSupplyDialog(setInitialToo: false),
+                            child: Row(
+                              children: [
+                                const Text(
+                                  'Supply left',
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const Spacer(),
+                                Text(
+                                  _supplyLeftDraft.toString(),
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w900,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                const Icon(
+                                  Icons.edit,
+                                  color: Colors.white70,
+                                  size: 18,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ),
+                  const SizedBox(height: 12),
+                ],
+
+                if (_step == _ConfigStep.config) ...[
+                  Row(
+                    children: [
+                      const Icon(Icons.schedule, color: white),
+                      const SizedBox(width: 10),
+                      const Text(
+                        'Times per day',
+                        style: TextStyle(color: white),
+                      ),
+                      const Spacer(),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        decoration: BoxDecoration(
+                          color: white,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: DropdownButton<int>(
+                          value: _timesPerDay,
+                          underline: const SizedBox.shrink(),
+                          items: List.generate(6, (i) => i + 1)
+                              .map(
+                                (n) => DropdownMenuItem(
+                                  value: n,
+                                  child: Text('$n'),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: (v) {
+                            if (v == null) return;
+                            setState(() {
+                              _timesPerDay = v;
+                              _singleDoseTime = null;
+                              _doseTimes = [];
+                            });
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 10),
+
+                  if (_timesPerDay == 1)
+                    Container(
+                      height: 48,
+                      decoration: BoxDecoration(
+                        color: white,
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(14),
+                        onTap: _pickTimeSingle,
+                        child: Center(
+                          child: Text(
+                            _singleDoseTime == null
+                                ? 'Pick time'
+                                : _fmt(_singleDoseTime!),
+                            style: const TextStyle(
+                              color: cardColor,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 18,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+
+                if (_step == _ConfigStep.doses)
+                  Column(
+                    children: [
+                      for (int i = 0; i < _timesPerDay; i++) ...[
+                        Builder(
+                          builder: (context) {
+                            final t = _doseTimes[i];
+                            return Container(
+                              decoration: BoxDecoration(
+                                color: white,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: ListTile(
+                                title: Text(
+                                  'Dose ${i + 1}',
+                                  style: const TextStyle(
+                                    color: cardColor,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  t == null ? 'Tap to set time' : _fmt(t),
+                                  style: const TextStyle(color: cardColor),
+                                ),
+                                trailing: const Icon(
+                                  Icons.schedule,
+                                  color: cardColor,
+                                ),
+                                onTap: () => _pickDoseTime(i),
+                              ),
+                            );
+                          },
+                        ),
+                        if (i < _timesPerDay - 1) const SizedBox(height: 10),
+                      ],
+                    ],
+                  )
+                else
+                  const SizedBox(height: 12),
+
+                SizedBox(
+                  width: double.infinity,
+                  height: 56,
+                  child: Material(
+                    color: green,
+                    borderRadius: BorderRadius.circular(18),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(18),
+                      onTap: _handlePrimaryAction,
+                      child: Row(
+                        children: [
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: Center(
+                              child: Text(
+                                titleText,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(
+                            width: 56,
+                            height: 56,
+                            child: Icon(
+                              Icons.add,
+                              color: Colors.white,
+                              size: 34,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -4071,23 +6697,57 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     double cx(double w) => (size.width - w) / 2;
 
-    final midFade = _searchOpen ? 0.0 : 1.0;
+    final overlayOpen = _configOpen || _infoOpen || _searchOpen;
+    final streaksActive = _streaksOpen;
+    final streaksScreenVisible = _streaksGreenVisible;
+
+    final midFade = (_searchOpen || streaksActive) ? 0.0 : 1.0;
+
+    // Only search moves the logo/title. Streaks should not move them.
     final topShift = _searchOpen ? -s(220) : 0.0;
+
     final searchScrimOpacity = _searchOpen ? 1.0 : 0.0;
 
-    final bottomSlide = (_configOpen || _infoOpen || _searchOpen)
-        ? const Offset(0, 0.30)
-        : Offset.zero;
+    final bottomSlide = overlayOpen ? const Offset(0, 0.30) : Offset.zero;
 
-    final bottomSlidDown = (_configOpen || _infoOpen || _searchOpen);
+    final bottomSlidDown = overlayOpen || streaksActive;
 
     final showPillNameBackPlate =
         pillNames.isNotEmpty && _wheelSelectedIndex != 0;
+
     final bottomDecorOpacity = (!bottomSlidDown && showPillNameBackPlate)
         ? 1.0
         : 0.0;
 
-    final sideZoneButtonsHidden = _configOpen || _infoOpen || _searchOpen;
+    // IMPORTANT: do NOT include streaksActive here.
+    // Calendar/Streak tabs should fade out, not slide out.
+    final sideZoneButtonsHidden = overlayOpen;
+
+    final streaksPanelTop = s(140);
+
+    // Normal HomeScreen pillbox position/size
+    final normalPillboxWidth = s(800) * pbScale;
+    final normalPillboxHeight = s(1383) * pbScale;
+
+    final normalPillboxLeft = _pillboxLeftForDay(
+      size: size,
+      s: s,
+      designW: designW,
+      todayIndex: _pillboxVisualDay,
+      scale: pbScale,
+    );
+
+    final normalPillboxBottom = s(130);
+
+    final pillboxOpenDays = _allowPillboxOpen ? <int>{_todayIndex} : <int>{};
+
+    // Streaks pillbox: separate spawned-in closed pillbox
+    final streakPillboxScale = 0.48;
+    final streakPillboxWidth = s(800) * streakPillboxScale;
+    final streakPillboxHeight = s(1383) * streakPillboxScale;
+
+    final streakPillboxLeft = (size.width - streakPillboxWidth) / 2;
+    final streakPillboxBottom = s(112);
 
     final wheelLocked = _pendingSlot;
 
@@ -4186,34 +6846,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
 
             // --- WEEKLY PILLBOX (Rive) ---
+            // Normal HomeScreen pillbox fades out during Streaks.
             AnimatedPositioned(
               duration: _pillboxSlideDur,
               curve: Curves.easeInOutCubic,
-              left: _pillboxLeftForDay(
-                size: size,
-                s: s,
-                designW: designW,
-                todayIndex: _pillboxVisualDay,
-                scale: pbScale, // ✅ slide uses visual day
-              ),
-              bottom: s(130),
-              child: AnimatedOpacity(
-                duration: const Duration(milliseconds: 220),
-                curve: Curves.easeInOut,
-                opacity: midFade,
-                child: SizedBox(
-                  width: s(800) * pbScale,
-                  height: s(1383) * pbScale,
-                  child: WeeklyPillboxOrganizer(
-                    key: ValueKey(
-                      'pillbox_${_pillboxResetToken}_day_${_todayIndex}',
+              left: normalPillboxLeft,
+              bottom: normalPillboxBottom,
+              child: IgnorePointer(
+                ignoring: _streaksOpen,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 260),
+                  curve: Curves.easeInOut,
+                  opacity: _streaksOpen || _searchOpen ? 0.0 : 1.0,
+                  child: SizedBox(
+                    width: normalPillboxWidth,
+                    height: normalPillboxHeight,
+                    child: WeeklyPillboxOrganizer(
+                      key: ValueKey(
+                        'pillbox_normal_${_pillboxResetToken}_day_${_todayIndex}',
+                      ),
+                      fit: BoxFit.contain,
+                      openDays: pillboxOpenDays,
+                      stateMachineName: 'PillboxSM',
                     ),
-                    fit: BoxFit.contain,
-
-                    // keep closed during slide, only open AFTER slide finishes
-                    openDays: _allowPillboxOpen ? <int>{_todayIndex} : <int>{},
-
-                    stateMachineName: 'PillboxSM',
                   ),
                 ),
               ),
@@ -4224,146 +6879,164 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               left: 0,
               right: 0,
               top: s(160), // main vertical placement reference
-              child: FutureBuilder<Map<String, dynamic>>(
-                future: _checkMapFuture,
-                builder: (context, snap) {
-                  final map = snap.data ?? <String, dynamic>{};
+              child: IgnorePointer(
+                ignoring: streaksActive,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 220),
+                  curve: Curves.easeInOut,
+                  opacity: streaksActive ? 0.0 : 1.0,
+                  child: FutureBuilder<Map<String, dynamic>>(
+                    future: _checkMapFuture,
+                    builder: (context, snap) {
+                      final map = snap.data ?? <String, dynamic>{};
 
-                  final idx = _centerPillIndex;
-                  final hasRealPill =
-                      idx != null && idx >= 0 && idx < pillNames.length;
+                      final idx = _centerPillIndex;
+                      final hasRealPill =
+                          idx != null && idx >= 0 && idx < pillNames.length;
 
-                  final doses = hasRealPill
-                      ? _doseTimesForPill(idx!)
-                      : <TimeOfDay>[];
+                      final doses = hasRealPill
+                          ? _doseTimesForPill(idx!)
+                          : <TimeOfDay>[];
 
-                  final showLeft = hasRealPill && doses.length > 1;
+                      final showLeft = hasRealPill && doses.length > 1;
 
-                  int totalDoses = doses.length;
-                  int activeDoseIndex = 0;
-                  int mask = 0;
-                  int missedMask = 0;
+                      int totalDoses = doses.length;
+                      int activeDoseIndex = 0;
+                      int mask = 0;
+                      int missedMask = 0;
 
-                  if (showLeft) {
-                    final state = _getDisplayedDoseStateForPill(
-                      pillIndex: idx!,
-                      doses: doses,
-                      takenMap: map,
-                      missedMap: _lastMissedMapCache,
-                      now: DateTime.now(),
-                    );
+                      if (showLeft) {
+                        final state = _getDisplayedDoseStateForPill(
+                          pillIndex: idx!,
+                          doses: doses,
+                          takenMap: map,
+                          missedMap: _lastMissedMapCache,
+                          now: DateTime.now(),
+                        );
 
-                    mask = state.takenMask;
-                    missedMask = state.missedMask;
-                    activeDoseIndex = state.doseIndex;
+                        mask = state.takenMask;
+                        missedMask = state.missedMask;
+                        activeDoseIndex = state.doseIndex;
 
-                    _lastDoseBarTotalDoses = totalDoses;
-                    _lastDoseBarActiveDoseIndex = activeDoseIndex;
-                    _lastDoseBarCheckedMask = mask;
-                    _lastDoseBarMissedMask = missedMask;
-                    _hasDoseBarCache = true;
-                  }
+                        _lastDoseBarTotalDoses = totalDoses;
+                        _lastDoseBarActiveDoseIndex = activeDoseIndex;
+                        _lastDoseBarCheckedMask = mask;
+                        _lastDoseBarMissedMask = missedMask;
+                        _hasDoseBarCache = true;
+                      }
 
-                  final barTotalDoses = showLeft
-                      ? totalDoses
-                      : (_hasDoseBarCache ? _lastDoseBarTotalDoses : 2);
+                      final barTotalDoses = showLeft
+                          ? totalDoses
+                          : (_hasDoseBarCache ? _lastDoseBarTotalDoses : 2);
 
-                  final barActiveDoseIndex = showLeft
-                      ? activeDoseIndex
-                      : (_hasDoseBarCache ? _lastDoseBarActiveDoseIndex : 0);
+                      final barActiveDoseIndex = showLeft
+                          ? activeDoseIndex
+                          : (_hasDoseBarCache
+                                ? _lastDoseBarActiveDoseIndex
+                                : 0);
 
-                  final barCheckedMask = showLeft
-                      ? mask
-                      : (_hasDoseBarCache ? _lastDoseBarCheckedMask : 0);
+                      final barCheckedMask = showLeft
+                          ? mask
+                          : (_hasDoseBarCache ? _lastDoseBarCheckedMask : 0);
 
-                  final barMissedMask = showLeft
-                      ? missedMask
-                      : (_hasDoseBarCache ? _lastDoseBarMissedMask : 0);
+                      final barMissedMask = showLeft
+                          ? missedMask
+                          : (_hasDoseBarCache ? _lastDoseBarMissedMask : 0);
 
-                  final allDone = _areAllPillsComplete(map);
+                      final allDone = _areAllPillsComplete(map);
 
-                  // Match the right bar to the same delayed completion feel as the circle
-                  final doneForCircle =
-                      allDone &&
-                      (_allowDailyFillAnim || !_needsDailyCircleDelay);
+                      // Match the right bar to the same delayed completion feel as the circle
+                      final doneForCircle =
+                          allDone &&
+                          (_allowDailyFillAnim || !_needsDailyCircleDelay);
 
-                  // Right bar should appear immediately once all pills are complete
-                  final showRight = allDone;
+                      // Right bar should appear immediately once all pills are complete
+                      final showRight = allDone;
 
-                  return SizedBox(
-                    height: s(70),
-                    child: Stack(
-                      children: [
-                        // LEFT BAR: multi-dose progress
-                        AnimatedPositioned(
-                          duration: const Duration(milliseconds: 280),
-                          curve: Curves.easeInOutCubic,
-                          left: showLeft ? s(4) : -s(220),
-                          top: 0,
-                          width: s(165),
-                          height: s(70),
-                          child: IgnorePointer(
-                            child: DoseProgressSideBar(
-                              totalDoses: barTotalDoses,
-                              activeDoseIndex: barActiveDoseIndex,
-                              checkedMask: barCheckedMask,
-                              missedMask: barMissedMask,
+                      return SizedBox(
+                        height: s(70),
+                        child: Stack(
+                          children: [
+                            // LEFT BAR: multi-dose progress
+                            AnimatedPositioned(
+                              duration: const Duration(milliseconds: 280),
+                              curve: Curves.easeInOutCubic,
+                              left: showLeft ? s(4) : -s(220),
+                              top: 0,
+                              width: s(165),
                               height: s(70),
+                              child: IgnorePointer(
+                                child: DoseProgressSideBar(
+                                  totalDoses: barTotalDoses,
+                                  activeDoseIndex: barActiveDoseIndex,
+                                  checkedMask: barCheckedMask,
+                                  missedMask: barMissedMask,
+                                  height: s(70),
+                                ),
+                              ),
                             ),
-                          ),
-                        ),
 
-                        // RIGHT BAR: all pills completed
-                        AnimatedPositioned(
-                          duration: const Duration(milliseconds: 320),
-                          curve: Curves.easeInOutCubic,
-                          right: showRight ? s(5) : -s(220),
-                          top: 0,
-                          width: s(166.5),
-                          height: s(70),
-                          child: IgnorePointer(
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: const Color.fromARGB(222, 155, 255, 168),
-                                borderRadius: BorderRadius.circular(18),
-                                border: Border.all(
-                                  color: const Color.fromARGB(
-                                    255,
-                                    137,
-                                    255,
-                                    133,
-                                  ),
-                                  width: 5,
-                                ),
-                              ),
-                              padding: EdgeInsets.symmetric(horizontal: s(14)),
-                              child: Center(
-                                child: Text(
-                                  'Checked all pills\nfor today!',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                    fontFamily: 'Amaranth',
-                                    fontSize: fs(17),
+                            // RIGHT BAR: all pills completed
+                            AnimatedPositioned(
+                              duration: const Duration(milliseconds: 320),
+                              curve: Curves.easeInOutCubic,
+                              right: showRight ? s(5) : -s(220),
+                              top: 0,
+                              width: s(166.5),
+                              height: s(70),
+                              child: IgnorePointer(
+                                child: Container(
+                                  decoration: BoxDecoration(
                                     color: const Color.fromARGB(
+                                      222,
+                                      155,
                                       255,
-                                      152,
-                                      64,
-                                      79,
+                                      168,
                                     ),
-                                    fontWeight: FontWeight.w700,
-                                    height: 1.0,
+                                    borderRadius: BorderRadius.circular(18),
+                                    border: Border.all(
+                                      color: const Color.fromARGB(
+                                        255,
+                                        137,
+                                        255,
+                                        133,
+                                      ),
+                                      width: 5,
+                                    ),
+                                  ),
+                                  padding: EdgeInsets.symmetric(
+                                    horizontal: s(14),
+                                  ),
+                                  child: Center(
+                                    child: Text(
+                                      'Checked all pills\nfor today!',
+                                      textAlign: TextAlign.center,
+                                      style: TextStyle(
+                                        fontFamily: 'Amaranth',
+                                        fontSize: fs(17),
+                                        color: const Color.fromARGB(
+                                          255,
+                                          152,
+                                          64,
+                                          79,
+                                        ),
+                                        fontWeight: FontWeight.w700,
+                                        height: 1.0,
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
                             ),
-                          ),
+                          ],
                         ),
-                      ],
-                    ),
-                  );
-                },
+                      );
+                    },
+                  ),
+                ),
               ),
             ),
+
             // --- LOGO (left) ---
             AnimatedPositioned(
               duration: const Duration(milliseconds: 320),
@@ -4414,434 +7087,458 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             Positioned(
               left: cx(s(60.2)),
               bottom: s(687),
-              child: FutureBuilder<Map<String, dynamic>>(
-                future: _checkMapFuture,
-                builder: (context, snap) {
-                  final map = snap.data ?? {};
+              child: IgnorePointer(
+                ignoring: streaksActive,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 220),
+                  curve: Curves.easeInOut,
+                  opacity: streaksActive ? 0.0 : 1.0,
+                  child: FutureBuilder<Map<String, dynamic>>(
+                    future: _checkMapFuture,
+                    builder: (context, snap) {
+                      final map = snap.data ?? {};
 
-                  final actualDone = _areAllPillsComplete(map);
+                      final actualDone = _areAllPillsComplete(map);
 
-                  // wait until pillbox open animation window is finished
-                  final doneForCircle =
-                      actualDone &&
-                      (_allowDailyFillAnim || !_needsDailyCircleDelay);
+                      // wait until pillbox open animation window is finished
+                      final doneForCircle =
+                          actualDone &&
+                          (_allowDailyFillAnim || !_needsDailyCircleDelay);
 
-                  // 1s delay ONLY once (re-armed on cold start + resume-after-midnight)
-                  if (!doneForCircle) {
-                    _dailyCircleDelayTimer?.cancel();
-                    _dailyCircleDelayTimer = null;
-                    _dailyCircleDelayPassed = false;
-                  } else {
-                    if (_delayDailyCircleOnce) {
-                      _dailyCircleDelayTimer ??= Timer(
-                        const Duration(milliseconds: 1300),
-                        () {
-                          if (!mounted) return;
-                          setState(() {
-                            _dailyCircleDelayPassed = true;
-                            _delayDailyCircleOnce = false;
-                          });
-                        },
+                      // 1s delay ONLY once (re-armed on cold start + resume-after-midnight)
+                      if (!doneForCircle) {
+                        _dailyCircleDelayTimer?.cancel();
+                        _dailyCircleDelayTimer = null;
+                        _dailyCircleDelayPassed = false;
+                      } else {
+                        if (_delayDailyCircleOnce) {
+                          _dailyCircleDelayTimer ??= Timer(
+                            const Duration(milliseconds: 1300),
+                            () {
+                              if (!mounted) return;
+                              setState(() {
+                                _dailyCircleDelayPassed = true;
+                                _delayDailyCircleOnce = false;
+                              });
+                            },
+                          );
+                        } else {
+                          _dailyCircleDelayPassed = true;
+                        }
+                      }
+
+                      final delayedDone =
+                          doneForCircle && _dailyCircleDelayPassed;
+
+                      return DailyCompletionCircle(
+                        done: delayedDone,
+                        size: s(58),
+                        baseColor: const Color.fromARGB(0, 231, 36, 153),
+                        fillColor: const Color(0xFF59FF56),
                       );
-                    } else {
-                      _dailyCircleDelayPassed = true;
-                    }
-                  }
-
-                  final delayedDone = doneForCircle && _dailyCircleDelayPassed;
-
-                  return DailyCompletionCircle(
-                    done: delayedDone,
-                    size: s(58),
-                    baseColor: const Color.fromARGB(0, 231, 36, 153),
-                    fillColor: const Color(0xFF59FF56),
-                  );
-                },
+                    },
+                  ),
+                ),
               ),
             ),
 
             // --- BOTTOM ZONE ---
+            // --- BOTTOM ZONE ---
             IgnorePointer(
-              ignoring: _configOpen || _infoOpen || _searchOpen,
-              child: AnimatedSlide(
+              ignoring:
+                  _configOpen || _infoOpen || _searchOpen || streaksActive,
+              child: AnimatedOpacity(
                 duration: const Duration(milliseconds: 320),
                 curve: Curves.easeInOut,
-                offset: bottomSlide,
-                child: Stack(
-                  children: [
-                    // --- BACK PLATE (behind everything) ---
-                    Positioned(
-                      left: s(100),
-                      right: s(100),
+                opacity: streaksActive ? 0.0 : 1.0,
+                child: AnimatedSlide(
+                  duration: const Duration(milliseconds: 320),
+                  curve: Curves.easeInOut,
+                  offset: bottomSlide,
+                  child: Stack(
+                    children: [
+                      // --- BACK PLATE (behind everything) ---
+                      Positioned(
+                        left: s(100),
+                        right: s(100),
 
-                      // tweak these two to place it between pillbox and wheel
-                      top: s(395),
-                      bottom: s(350),
+                        // tweak these two to place it between pillbox and wheel
+                        top: s(395),
+                        bottom: s(350),
 
-                      child: AnimatedOpacity(
-                        duration: const Duration(milliseconds: 140),
-                        curve: Curves.easeInOut,
-                        opacity: bottomDecorOpacity,
-                        child: IgnorePointer(
-                          child: Container(
-                            decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.18),
-                              borderRadius: BorderRadius.circular(s(25)),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-
-                    // --- RED STRIP (background) ---
-                    Positioned(
-                      left: cx(stripW),
-                      bottom: s(-910),
-                      child: ClipOval(
-                        child: Container(
-                          width: stripW,
-                          height: stripH,
-                          color: const Color(0xFFE72447),
-                        ),
-                      ),
-                    ),
-
-                    Positioned(
-                      left: _leftFromDesignRight(400, 5, size, s, designW),
-                      bottom: s(-1055),
-                      child: ClipOval(
-                        child: Container(
-                          width: s(400),
-                          height: s(1383),
-                          color: const Color(0xFFFF6D87),
-                        ),
-                      ),
-                    ),
-
-                    Positioned(
-                      left: 0,
-                      right: 0,
-                      bottom: s(260), // tweak if you want it higher/lower
-                      child: IgnorePointer(
                         child: AnimatedOpacity(
-                          duration: const Duration(milliseconds: 180),
+                          duration: const Duration(milliseconds: 140),
                           curve: Curves.easeInOut,
-                          opacity: (showSupplyBadge && !bottomSlidDown)
-                              ? 1.0
-                              : 0.0,
-                          child: Center(
-                            child: SizedBox(
-                              width: s(64),
-                              height: s(64),
-                              child: Stack(
-                                alignment: Alignment.center,
-                                children: [
-                                  // ✅ tiny patch behind the icon to fill the "hole"
-                                  Positioned(
-                                    // tweak these 3 numbers if needed
-                                    top: s(22),
-                                    child: Container(
-                                      width: s(25),
-                                      height: s(25),
-                                      decoration: BoxDecoration(
-                                        color: const Color.fromARGB(
-                                          255,
-                                          156,
-                                          68,
-                                          83,
-                                        ),
-                                        borderRadius: BorderRadius.circular(
-                                          s(4),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-
-                                  Icon(
-                                    Icons.medication_rounded,
-                                    size: s(64),
-                                    color: const Color.fromARGB(
-                                      255,
-                                      156,
-                                      68,
-                                      83,
-                                    ),
-                                  ),
-
-                                  Text(
-                                    displaySupplyValue.toString(),
-                                    style: TextStyle(
-                                      fontFamily: 'Amaranth',
-                                      fontSize: fs(21),
-                                      color: supplyNumberColor,
-                                      fontWeight: FontWeight.w900,
-                                    ),
-                                  ),
-                                ],
+                          opacity: bottomDecorOpacity,
+                          child: IgnorePointer(
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.18),
+                                borderRadius: BorderRadius.circular(s(25)),
                               ),
                             ),
                           ),
                         ),
                       ),
-                    ),
 
-                    // --- WHEEL (below button/rings so it doesn't steal touches) ---
-                    Positioned(
-                      left: cx(wheelBoxW),
-                      width: wheelBoxW,
-                      bottom: s(-95),
-                      height: wheelBoxH,
-                      child: PillWheel(
-                        onDeleteCentered: _deleteCenteredPill,
-                        controller: _wheelController,
-                        displayPillCount: _displayPillCount,
-                        realPillCount: _realPillCount,
-                        scrollEnabled: !wheelLocked,
-                        addEnabled: !wheelLocked,
-                        onSelectedChanged: (i) {
-                          if (i != _wheelSelectedIndex) _clearCheckedMessage();
-
-                          setState(() {
-                            _wheelSelectedIndex = i;
-                            _cacheSupplyBadgeIfShowing(); // ✅ cache value if this new pill tracks supply
-                          });
-
-                          _scheduleCenteredDoseBoundaryRefresh();
-                        },
-                        onAddPressed: _openPillSearch,
-                      ),
-                    ),
-
-                    // --- GREEN OUTER RING ---
-                    Positioned(
-                      left: _leftFromDesignRight(175, 118, size, s, designW),
-                      bottom: s(80),
-                      child: ClipOval(
-                        child: Container(
-                          width: s(175),
-                          height: s(175),
-                          color: const Color(0xFF0CF000),
+                      // --- RED STRIP (background) ---
+                      Positioned(
+                        left: cx(stripW),
+                        bottom: s(-910),
+                        child: ClipOval(
+                          child: Container(
+                            width: stripW,
+                            height: stripH,
+                            color: const Color(0xFFE72447),
+                          ),
                         ),
                       ),
-                    ),
 
-                    // --- DARK RED RING ---
-                    Positioned(
-                      left: _leftFromDesignRight(155, 127.5, size, s, designW),
-                      bottom: s(90),
-                      child: ClipOval(
-                        child: Container(
-                          width: s(155),
-                          height: s(155),
-                          color: const Color(0xFF8C1C2F),
+                      Positioned(
+                        left: _leftFromDesignRight(400, 5, size, s, designW),
+                        bottom: s(-1055),
+                        child: ClipOval(
+                          child: Container(
+                            width: s(400),
+                            height: s(1383),
+                            color: const Color(0xFFFF6D87),
+                          ),
                         ),
                       ),
-                    ),
 
-                    // --- CHECK BUTTON (last so it gets touches) ---
-                    Positioned(
-                      left:
-                          _leftFromDesignRight(135, 137, size, s, designW) -
-                          s(1),
-                      bottom: s(100),
-                      child: FutureBuilder<Map<String, dynamic>>(
-                        future: _checkMapFuture,
-                        builder: (context, snap) {
-                          final pillIndex = _centerPillIndex;
-                          final map = snap.data ?? {};
-
-                          _lastCheckMapCache = map;
-
-                          bool checked = false;
-                          bool missed = false;
-                          String checkButtonKey = 'check_empty';
-
-                          if (pillIndex != null) {
-                            final doses = _doseTimesForPill(pillIndex);
-
-                            final state = _getDisplayedDoseStateForPill(
-                              pillIndex: pillIndex,
-                              doses: doses,
-                              takenMap: map,
-                              missedMap: _lastMissedMapCache,
-                              now: DateTime.now(),
-                            );
-
-                            checked =
-                                (state.takenMask & (1 << state.doseIndex)) != 0;
-
-                            missed = _isCurrentDoseMissed(
-                              pillIndex: pillIndex,
-                              map: map,
-                            );
-
-                            checkButtonKey =
-                                'check_${pillIndex}_${state.cycleIso}_${state.doseIndex}_${checked ? 1 : 0}_${missed ? 1 : 0}';
-                          }
-
-                          final bool disable =
-                              _configOpen ||
-                              _pendingSlot ||
-                              (_wheelSelectedIndex == 0) ||
-                              (pillIndex == null);
-
-                          return AbsorbPointer(
-                            absorbing: disable,
-                            child: PillCheckButton(
-                              key: ValueKey(checkButtonKey),
-                              checked: checked,
-                              missed: missed,
-                              onChecked: _checkCenteredPill,
-                              size: s(135),
-                              baseColor: const Color(0xFFFF002E),
-                              fillColor: const Color(0xFF59FF56),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-
-                    // --- Bottom-left oval ---
-                    Positioned(
-                      left: s(-75),
-                      bottom: s(-100),
-                      child: ClipOval(
-                        child: Container(
-                          width: s(200),
-                          height: s(200),
-                          color: const Color.fromARGB(255, 135, 255, 133),
-                        ),
-                      ),
-                    ),
-
-                    // --- INFO BUTTON (bottom-left green i) ---
-                    Positioned(
-                      left: s(5),
-                      bottom: s(5),
-                      child: IgnorePointer(
-                        ignoring:
-                            _configOpen || _pendingSlot || !_centerIsRealPill,
-                        child: Opacity(
-                          opacity:
-                              (_configOpen ||
-                                  _pendingSlot ||
-                                  !_centerIsRealPill)
-                              ? 0.45
-                              : 1.0,
-                          child: GestureDetector(
-                            onTap: _openInfoPanel,
-                            child: SizedBox(
-                              width: s(82),
-                              height: s(82),
-                              child: Stack(
-                                alignment: Alignment.center,
-                                children: [
-                                  // green base
-                                  Container(
-                                    decoration: const BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      color: const Color.fromARGB(
-                                        255,
-                                        135,
-                                        255,
-                                        133,
-                                      ),
-                                    ),
-                                  ),
-
-                                  // dark ring
-                                  Container(
-                                    width: s(74),
-                                    height: s(74),
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      border: Border.all(
-                                        width: s(5),
-                                        color: const Color.fromARGB(
-                                          255,
-                                          255,
-                                          255,
-                                          255,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-
-                                  // "i" (dot + stem) built from shapes
-                                  Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Container(
-                                        width: s(10),
-                                        height: s(10),
-                                        decoration: const BoxDecoration(
-                                          shape: BoxShape.circle,
-                                          color: Color.fromARGB(
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: s(260), // tweak if you want it higher/lower
+                        child: IgnorePointer(
+                          child: AnimatedOpacity(
+                            duration: const Duration(milliseconds: 180),
+                            curve: Curves.easeInOut,
+                            opacity: (showSupplyBadge && !bottomSlidDown)
+                                ? 1.0
+                                : 0.0,
+                            child: Center(
+                              child: SizedBox(
+                                width: s(64),
+                                height: s(64),
+                                child: Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    // ✅ tiny patch behind the icon to fill the "hole"
+                                    Positioned(
+                                      // tweak these 3 numbers if needed
+                                      top: s(22),
+                                      child: Container(
+                                        width: s(25),
+                                        height: s(25),
+                                        decoration: BoxDecoration(
+                                          color: const Color.fromARGB(
                                             255,
-                                            255,
-                                            255,
-                                            255,
+                                            156,
+                                            68,
+                                            83,
+                                          ),
+                                          borderRadius: BorderRadius.circular(
+                                            s(4),
                                           ),
                                         ),
                                       ),
-                                      SizedBox(height: s(6)),
-                                      Container(
-                                        width: s(10),
-                                        height: s(30),
-                                        decoration: BoxDecoration(
+                                    ),
+
+                                    Icon(
+                                      Icons.medication_rounded,
+                                      size: s(64),
+                                      color: const Color.fromARGB(
+                                        255,
+                                        156,
+                                        68,
+                                        83,
+                                      ),
+                                    ),
+
+                                    Text(
+                                      displaySupplyValue.toString(),
+                                      style: TextStyle(
+                                        fontFamily: 'Amaranth',
+                                        fontSize: fs(21),
+                                        color: supplyNumberColor,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+
+                      // --- WHEEL (below button/rings so it doesn't steal touches) ---
+                      Positioned(
+                        left: cx(wheelBoxW),
+                        width: wheelBoxW,
+                        bottom: s(-95),
+                        height: wheelBoxH,
+                        child: PillWheel(
+                          onDeleteCentered: _deleteCenteredPill,
+                          controller: _wheelController,
+                          displayPillCount: _displayPillCount,
+                          realPillCount: _realPillCount,
+                          scrollEnabled: !wheelLocked,
+                          addEnabled: !wheelLocked,
+                          onSelectedChanged: (i) {
+                            if (i != _wheelSelectedIndex)
+                              _clearCheckedMessage();
+
+                            setState(() {
+                              _wheelSelectedIndex = i;
+                              _cacheSupplyBadgeIfShowing(); // ✅ cache value if this new pill tracks supply
+                            });
+
+                            _scheduleCenteredDoseBoundaryRefresh();
+                          },
+                          onAddPressed: _openPillSearch,
+                        ),
+                      ),
+
+                      // --- GREEN OUTER RING ---
+                      Positioned(
+                        left: _leftFromDesignRight(175, 118, size, s, designW),
+                        bottom: s(80),
+                        child: ClipOval(
+                          child: Container(
+                            width: s(175),
+                            height: s(175),
+                            color: const Color(0xFF0CF000),
+                          ),
+                        ),
+                      ),
+
+                      // --- DARK RED RING ---
+                      Positioned(
+                        left: _leftFromDesignRight(
+                          155,
+                          127.5,
+                          size,
+                          s,
+                          designW,
+                        ),
+                        bottom: s(90),
+                        child: ClipOval(
+                          child: Container(
+                            width: s(155),
+                            height: s(155),
+                            color: const Color(0xFF8C1C2F),
+                          ),
+                        ),
+                      ),
+
+                      // --- CHECK BUTTON (last so it gets touches) ---
+                      Positioned(
+                        left:
+                            _leftFromDesignRight(135, 137, size, s, designW) -
+                            s(1),
+                        bottom: s(100),
+                        child: FutureBuilder<Map<String, dynamic>>(
+                          future: _checkMapFuture,
+                          builder: (context, snap) {
+                            final pillIndex = _centerPillIndex;
+                            final map = snap.data ?? {};
+
+                            _lastCheckMapCache = map;
+
+                            bool checked = false;
+                            bool missed = false;
+                            String checkButtonKey = 'check_empty';
+
+                            if (pillIndex != null) {
+                              final doses = _doseTimesForPill(pillIndex);
+
+                              final state = _getDisplayedDoseStateForPill(
+                                pillIndex: pillIndex,
+                                doses: doses,
+                                takenMap: map,
+                                missedMap: _lastMissedMapCache,
+                                now: DateTime.now(),
+                              );
+
+                              checked =
+                                  (state.takenMask & (1 << state.doseIndex)) !=
+                                  0;
+
+                              missed = _isCurrentDoseMissed(
+                                pillIndex: pillIndex,
+                                map: map,
+                              );
+
+                              checkButtonKey =
+                                  'check_${pillIndex}_${state.cycleIso}_${state.doseIndex}_${checked ? 1 : 0}_${missed ? 1 : 0}';
+                            }
+
+                            final bool disable =
+                                _configOpen ||
+                                _pendingSlot ||
+                                (_wheelSelectedIndex == 0) ||
+                                (pillIndex == null);
+
+                            return AbsorbPointer(
+                              absorbing: disable,
+                              child: PillCheckButton(
+                                key: ValueKey(checkButtonKey),
+                                checked: checked,
+                                missed: missed,
+                                onChecked: _checkCenteredPill,
+                                size: s(135),
+                                baseColor: const Color(0xFFFF002E),
+                                fillColor: const Color(0xFF59FF56),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+
+                      // --- Bottom-left oval ---
+                      Positioned(
+                        left: s(-75),
+                        bottom: s(-100),
+                        child: ClipOval(
+                          child: Container(
+                            width: s(200),
+                            height: s(200),
+                            color: const Color.fromARGB(255, 135, 255, 133),
+                          ),
+                        ),
+                      ),
+
+                      // --- INFO BUTTON (bottom-left green i) ---
+                      Positioned(
+                        left: s(5),
+                        bottom: s(5),
+                        child: IgnorePointer(
+                          ignoring:
+                              _configOpen || _pendingSlot || !_centerIsRealPill,
+                          child: Opacity(
+                            opacity:
+                                (_configOpen ||
+                                    _pendingSlot ||
+                                    !_centerIsRealPill)
+                                ? 0.45
+                                : 1.0,
+                            child: GestureDetector(
+                              onTap: _openInfoPanel,
+                              child: SizedBox(
+                                width: s(82),
+                                height: s(82),
+                                child: Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    // green base
+                                    Container(
+                                      decoration: const BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        color: const Color.fromARGB(
+                                          255,
+                                          135,
+                                          255,
+                                          133,
+                                        ),
+                                      ),
+                                    ),
+
+                                    // dark ring
+                                    Container(
+                                      width: s(74),
+                                      height: s(74),
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        border: Border.all(
+                                          width: s(5),
                                           color: const Color.fromARGB(
                                             255,
                                             255,
                                             255,
                                             255,
                                           ),
-                                          borderRadius: BorderRadius.circular(
-                                            s(8),
-                                          ),
                                         ),
                                       ),
-                                    ],
-                                  ),
-                                ],
+                                    ),
+
+                                    // "i" (dot + stem) built from shapes
+                                    Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Container(
+                                          width: s(10),
+                                          height: s(10),
+                                          decoration: const BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            color: Color.fromARGB(
+                                              255,
+                                              255,
+                                              255,
+                                              255,
+                                            ),
+                                          ),
+                                        ),
+                                        SizedBox(height: s(6)),
+                                        Container(
+                                          width: s(10),
+                                          height: s(30),
+                                          decoration: BoxDecoration(
+                                            color: const Color.fromARGB(
+                                              255,
+                                              255,
+                                              255,
+                                              255,
+                                            ),
+                                            borderRadius: BorderRadius.circular(
+                                              s(8),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
                           ),
                         ),
                       ),
-                    ),
 
-                    // --- Bottom-right oval ---
-                    Positioned(
-                      right: s(-75),
-                      bottom: s(-100),
-                      child: ClipOval(
-                        child: Container(
-                          width: s(200),
-                          height: s(200),
-                          color: const Color(0xFFFFDF59),
+                      // --- Bottom-right oval ---
+                      Positioned(
+                        right: s(-75),
+                        bottom: s(-100),
+                        child: ClipOval(
+                          child: Container(
+                            width: s(200),
+                            height: s(200),
+                            color: const Color(0xFFFFDF59),
+                          ),
                         ),
                       ),
-                    ),
-                    // --- WARNING ICON (bottom-right) ---
-                    Positioned(
-                      right: s(10),
-                      bottom: s(8),
-                      child: IgnorePointer(
-                        ignoring: _configOpen || _infoOpen,
-                        child: Opacity(
-                          opacity: (_configOpen || _infoOpen) ? 0.45 : 1.0,
-                          child: GestureDetector(
-                            onTap: _openWarningActions,
-                            child: ClipOval(
-                              child: Container(
-                                width: s(82),
-                                height: s(82),
-                                color: const Color(0xFFFFDF59),
-                                child: Center(
-                                  child: Icon(
-                                    Icons.warning_rounded,
-                                    size: s(75),
-                                    color: const Color(0xFFE72447),
+                      // --- WARNING ICON (bottom-right) ---
+                      Positioned(
+                        right: s(10),
+                        bottom: s(8),
+                        child: IgnorePointer(
+                          ignoring: _configOpen || _infoOpen,
+                          child: Opacity(
+                            opacity: (_configOpen || _infoOpen) ? 0.45 : 1.0,
+                            child: GestureDetector(
+                              onTap: _openWarningActions,
+                              child: ClipOval(
+                                child: Container(
+                                  width: s(82),
+                                  height: s(82),
+                                  color: const Color(0xFFFFDF59),
+                                  child: Center(
+                                    child: Icon(
+                                      Icons.warning_rounded,
+                                      size: s(75),
+                                      color: const Color(0xFFE72447),
+                                    ),
                                   ),
                                 ),
                               ),
@@ -4849,8 +7546,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -4902,7 +7599,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             AnimatedPositioned(
               duration: const Duration(milliseconds: 320),
               curve: Curves.easeInOut,
-              left: s(-75),
+              left: _streaksOpen ? -s(190) : s(-75),
               top: s(40) + topShift,
               child: IgnorePointer(
                 ignoring: _searchOpen,
@@ -4920,10 +7617,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             AnimatedPositioned(
               duration: const Duration(milliseconds: 320),
               curve: Curves.easeInOut,
-              left: s(-10),
+              left: _streaksOpen ? -s(120) : s(-10),
               top: s(45) + topShift,
               child: IgnorePointer(
-                ignoring: _searchOpen || _configOpen || _infoOpen,
+                ignoring:
+                    _searchOpen || _configOpen || _infoOpen || _streaksOpen,
                 child: Opacity(
                   opacity: (_configOpen || _infoOpen || _searchOpen)
                       ? 0.45
@@ -4964,7 +7662,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             AnimatedPositioned(
               duration: const Duration(milliseconds: 320),
               curve: Curves.easeInOut,
-              right: s(-75),
+              right: _streaksOpen ? -s(190) : s(-75),
               top: s(40) + topShift,
               child: IgnorePointer(
                 ignoring: _searchOpen,
@@ -4980,10 +7678,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             AnimatedPositioned(
               duration: const Duration(milliseconds: 320),
               curve: Curves.easeInOut,
-              right: s(-45),
+              right: _streaksOpen ? -s(165) : s(-45),
               top: s(40) + topShift,
               child: IgnorePointer(
-                ignoring: _searchOpen || _configOpen || _infoOpen,
+                ignoring:
+                    _searchOpen || _configOpen || _infoOpen || _streaksOpen,
                 child: SizedBox(
                   width: s(150),
                   height: s(85),
@@ -4999,6 +7698,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                               builder: (_) => const SettingsScreen(),
                             ),
                           );
+
+                          await _loadStreakState();
 
                           if (!mounted) return;
 
@@ -5160,11 +7861,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               left: sideZoneButtonsHidden ? -s(110) : s(-10),
               bottom: s(460),
               child: IgnorePointer(
-                ignoring: sideZoneButtonsHidden,
+                ignoring: sideZoneButtonsHidden || streaksActive,
                 child: AnimatedOpacity(
                   duration: const Duration(milliseconds: 180),
                   curve: Curves.easeInOut,
-                  opacity: sideZoneButtonsHidden ? 0.0 : 1.0,
+                  opacity: (sideZoneButtonsHidden || streaksActive) ? 0.0 : 1.0,
                   child: Material(
                     color: const Color(0xFF1E3A8A),
                     borderRadius: BorderRadius.only(
@@ -5199,87 +7900,128 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             AnimatedPositioned(
               duration: const Duration(milliseconds: 320),
               curve: Curves.easeInOutCubic,
-              right: sideZoneButtonsHidden ? -s(110) : s(-10),
+              right: (sideZoneButtonsHidden || !_streakState.streaksEnabled)
+                  ? -s(110)
+                  : s(-10),
               bottom: s(460),
               child: IgnorePointer(
-                ignoring: sideZoneButtonsHidden,
+                ignoring:
+                    sideZoneButtonsHidden ||
+                    streaksActive ||
+                    !_streakState.streaksEnabled,
                 child: AnimatedOpacity(
                   duration: const Duration(milliseconds: 180),
                   curve: Curves.easeInOut,
-                  opacity: sideZoneButtonsHidden ? 0.0 : 1.0,
-                  child: Material(
-                    color: const Color.fromARGB(251, 88, 255, 85),
-                    borderRadius: BorderRadius.only(
-                      topLeft: Radius.circular(s(18)),
-                      bottomLeft: Radius.circular(s(18)),
-                    ),
-                    elevation: 3,
-                    child: InkWell(
-                      borderRadius: BorderRadius.only(
-                        topLeft: Radius.circular(s(18)),
-                        bottomLeft: Radius.circular(s(18)),
-                      ),
-                      onTap: () async {
-                        await showDialog<void>(
-                          context: context,
-                          builder: (ctx) => AlertDialog(
-                            title: const Text('Streaks'),
-                            content: const Text('Coming soon!'),
-                            actions: [
-                              TextButton(
-                                onPressed: () => Navigator.pop(ctx),
-                                child: const Text('OK'),
-                              ),
-                            ],
+                  opacity:
+                      (sideZoneButtonsHidden ||
+                          streaksActive ||
+                          !_streakState.streaksEnabled)
+                      ? 0.0
+                      : 1.0,
+                  child: _StreakRiskBlinkColor(
+                    atRisk: _streakAtRisk,
+                    normalColor: const Color.fromARGB(251, 88, 255, 85),
+                    builder: (tabColor) {
+                      return _StreakButtonAttentionShell(
+                        needsAttention: _streakButtonNeedsAttention,
+                        atRisk: _streakAtRisk,
+                        child: Material(
+                          color: tabColor,
+                          borderRadius: BorderRadius.only(
+                            topLeft: Radius.circular(s(18)),
+                            bottomLeft: Radius.circular(s(18)),
                           ),
-                        );
-                      },
-                      child: SizedBox(
-                        width: s(72),
-                        height: s(58),
-                        child: Center(
-                          child: Transform.translate(
-                            offset: Offset(-s(4), 0),
+                          elevation: 3,
+                          child: InkWell(
+                            borderRadius: BorderRadius.only(
+                              topLeft: Radius.circular(s(18)),
+                              bottomLeft: Radius.circular(s(18)),
+                            ),
+                            onTap: () {
+                              unawaited(_openStreaksPanel());
+                            },
                             child: SizedBox(
-                              width: s(34),
-                              height: s(34),
-                              child: Stack(
-                                alignment: Alignment.center,
-                                children: [
-                                  Positioned(
-                                    top: s(14),
-                                    left: s(11),
-                                    child: Container(
-                                      width: s(15),
-                                      height: s(15),
-                                      decoration: const BoxDecoration(
-                                        color: const Color.fromARGB(
-                                          255,
-                                          255,
-                                          177,
-                                          74,
+                              width: s(72),
+                              height: s(58),
+                              child: Center(
+                                child: Transform.translate(
+                                  offset: Offset(-s(4), 0),
+                                  child: SizedBox(
+                                    width: s(34),
+                                    height: s(34),
+                                    child: Stack(
+                                      alignment: Alignment.center,
+                                      children: [
+                                        Positioned(
+                                          top: s(14),
+                                          left: s(11),
+                                          child: Container(
+                                            width: s(15),
+                                            height: s(15),
+                                            decoration: const BoxDecoration(
+                                              color: Color.fromARGB(
+                                                255,
+                                                255,
+                                                177,
+                                                74,
+                                              ),
+                                              shape: BoxShape.circle,
+                                            ),
+                                          ),
                                         ),
-                                        shape: BoxShape.circle,
-                                      ),
+                                        Icon(
+                                          Icons.whatshot_rounded,
+                                          size: s(34),
+                                          color: const Color.fromARGB(
+                                            255,
+                                            255,
+                                            116,
+                                            66,
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                   ),
-                                  Icon(
-                                    Icons.whatshot_rounded,
-                                    size: s(34),
-                                    color: const Color.fromARGB(
-                                      255,
-                                      255,
-                                      116,
-                                      66,
-                                    ),
-                                  ),
-                                ],
+                                ),
                               ),
                             ),
                           ),
                         ),
-                      ),
-                    ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ),
+
+            // --- STREAKS STORYBOARD SCREEN ---
+            Positioned.fill(
+              top: streaksPanelTop,
+              child: IgnorePointer(
+                ignoring: !streaksScreenVisible,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 380),
+                  curve: Curves.easeInOut,
+                  opacity: streaksScreenVisible ? 1.0 : 0.0,
+                  child: _streaksPanel(
+                    s: s,
+                    fs: fs,
+                    onClose: _closeStreaksPanel,
+                    streakPillboxOpenDays: _streakPillboxOpenDays,
+                    streakPillboxResetToken: _streakPillboxResetToken,
+                    currentStreakValue: _currentStreakValue,
+                    weeksCompletedValue: _weeksCompletedValue,
+                    longestStreakValue: _longestStreakValue,
+                    mostWeeksCompletedValue: _mostWeeksCompletedValue,
+                    weekProgress: _displayWeekProgressValue,
+                    completedDayIndexes: _streakCompletedDayIndexes,
+                    streakDotsVisible: _streakDotsVisible,
+                    streakMarkersVisible: _streakMarkersVisible,
+                    weekStartDayIndex: _displayWeekStartDayIndexValue,
+                    nextRequiredDayIndex: _displayNextRequiredDayIndexValue,
+                    streakStatusMessage: _streakStatusMessage,
+                    streakMessageVisible: _streakMessageVisible,
+                    onShowStreaksHelp: _showStreaksHelpDialog,
                   ),
                 ),
               ),
@@ -5353,4 +8095,628 @@ class _TutorialStep {
   final String title;
   final String description;
   final Rect targetRect;
+}
+
+class _StreakState {
+  const _StreakState({
+    required this.streaksEnabled,
+    required this.overrideRestoresStreak,
+    required this.currentStreak,
+    required this.longestStreak,
+    required this.weeksCompleted,
+    required this.mostWeeksCompleted,
+    required this.weekProgress,
+    required this.weekStartDayIndex,
+    required this.nextRequiredDayIndex,
+    required this.lastCompletedDayKey,
+    required this.pendingLostDayKey,
+    required this.pendingLostStreakValue,
+    required this.seenHighestStreak,
+    required this.completedDayKeys,
+  });
+
+  final bool streaksEnabled;
+
+  /// Later setting:
+  /// true = override restores the streak by default.
+  /// false = override checks the day visually but does not restore streak.
+  final bool overrideRestoresStreak;
+
+  final int currentStreak;
+  final int longestStreak;
+
+  /// Number of completed 7-day weeks.
+  final int weeksCompleted;
+
+  /// Highest weeksCompleted value ever reached.
+  final int mostWeeksCompleted;
+
+  /// 0..7 for the current rolling week.
+  final int weekProgress;
+
+  /// 0 = Sun, 1 = Mon, ... 6 = Sat.
+  /// Null until the user completes their first streak day.
+  final int? weekStartDayIndex;
+
+  /// The next day index required to continue weekly progress.
+  final int? nextRequiredDayIndex;
+
+  /// YYYYMMDD key for the last day that successfully counted.
+  final int? lastCompletedDayKey;
+
+  /// If a dose is missed, this stores the day at risk until the next reset.
+  final int? pendingLostDayKey;
+
+  /// Saves the streak value before loss so an override can restore it.
+  final int? pendingLostStreakValue;
+
+  /// Used later for the white/bouncy highlight when the user has not seen
+  /// their newest highest streak yet.
+  final int seenHighestStreak;
+
+  /// Days that have been completed, stored as YYYYMMDD.
+  /// Later this feeds the 7 mini completion circles.
+  final List<int> completedDayKeys;
+
+  factory _StreakState.initial() {
+    return const _StreakState(
+      streaksEnabled: true,
+      overrideRestoresStreak: true,
+      currentStreak: 0,
+      longestStreak: 0,
+      weeksCompleted: 0,
+      mostWeeksCompleted: 0,
+      weekProgress: 0,
+      weekStartDayIndex: null,
+      nextRequiredDayIndex: null,
+      lastCompletedDayKey: null,
+      pendingLostDayKey: null,
+      pendingLostStreakValue: null,
+      seenHighestStreak: 0,
+      completedDayKeys: <int>[],
+    );
+  }
+
+  static int _readInt(Map<String, dynamic> map, String key, int fallback) {
+    final v = map[key];
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    return fallback;
+  }
+
+  static int? _readNullableInt(Map<String, dynamic> map, String key) {
+    final v = map[key];
+    if (v == null) return null;
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    return null;
+  }
+
+  static bool _readBool(Map<String, dynamic> map, String key, bool fallback) {
+    final v = map[key];
+    if (v is bool) return v;
+    return fallback;
+  }
+
+  static List<int> _readIntList(Map<String, dynamic> map, String key) {
+    final v = map[key];
+    if (v is! List) return <int>[];
+
+    return v
+        .map((e) {
+          if (e is int) return e;
+          if (e is num) return e.toInt();
+          return null;
+        })
+        .whereType<int>()
+        .toList(growable: true);
+  }
+
+  factory _StreakState.fromJsonString(String? raw) {
+    if (raw == null || raw.trim().isEmpty) {
+      return _StreakState.initial();
+    }
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return _StreakState.initial();
+
+      final map = Map<String, dynamic>.from(decoded);
+
+      return _StreakState(
+        streaksEnabled: _readBool(map, 'streaksEnabled', true),
+        overrideRestoresStreak: _readBool(map, 'overrideRestoresStreak', true),
+        currentStreak: _readInt(map, 'currentStreak', 0).clamp(0, 999999),
+        longestStreak: _readInt(map, 'longestStreak', 0).clamp(0, 999999),
+        weeksCompleted: _readInt(map, 'weeksCompleted', 0).clamp(0, 999999),
+        mostWeeksCompleted: _readInt(
+          map,
+          'mostWeeksCompleted',
+          0,
+        ).clamp(0, 999999),
+        weekProgress: _readInt(map, 'weekProgress', 0).clamp(0, 7),
+        weekStartDayIndex: _readNullableInt(map, 'weekStartDayIndex'),
+        nextRequiredDayIndex: _readNullableInt(map, 'nextRequiredDayIndex'),
+        lastCompletedDayKey: _readNullableInt(map, 'lastCompletedDayKey'),
+        pendingLostDayKey: _readNullableInt(map, 'pendingLostDayKey'),
+        pendingLostStreakValue: _readNullableInt(map, 'pendingLostStreakValue'),
+        seenHighestStreak: _readInt(
+          map,
+          'seenHighestStreak',
+          0,
+        ).clamp(0, 999999),
+        completedDayKeys: _readIntList(map, 'completedDayKeys'),
+      ).normalized();
+    } catch (_) {
+      return _StreakState.initial();
+    }
+  }
+
+  Map<String, dynamic> toJsonMap() {
+    return {
+      'streaksEnabled': streaksEnabled,
+      'overrideRestoresStreak': overrideRestoresStreak,
+      'currentStreak': currentStreak,
+      'longestStreak': longestStreak,
+      'weeksCompleted': weeksCompleted,
+      'mostWeeksCompleted': mostWeeksCompleted,
+      'weekProgress': weekProgress,
+      'weekStartDayIndex': weekStartDayIndex,
+      'nextRequiredDayIndex': nextRequiredDayIndex,
+      'lastCompletedDayKey': lastCompletedDayKey,
+      'pendingLostDayKey': pendingLostDayKey,
+      'pendingLostStreakValue': pendingLostStreakValue,
+      'seenHighestStreak': seenHighestStreak,
+      'completedDayKeys': completedDayKeys,
+    };
+  }
+
+  String toJsonString() => jsonEncode(toJsonMap());
+
+  _StreakState normalized() {
+    final cleanedDays = completedDayKeys.toSet().toList()..sort();
+
+    // Keep the list from growing forever. 60 days is plenty for UI/history
+    // unless we later decide to make a full streak calendar.
+    final trimmedDays = cleanedDays.length <= 60
+        ? cleanedDays
+        : cleanedDays.sublist(cleanedDays.length - 60);
+
+    final safeWeekStart =
+        weekStartDayIndex != null &&
+            weekStartDayIndex! >= 0 &&
+            weekStartDayIndex! <= 6
+        ? weekStartDayIndex
+        : null;
+
+    final safeNextDay =
+        nextRequiredDayIndex != null &&
+            nextRequiredDayIndex! >= 0 &&
+            nextRequiredDayIndex! <= 6
+        ? nextRequiredDayIndex
+        : null;
+
+    return copyWith(
+      currentStreak: currentStreak.clamp(0, 999999),
+      longestStreak: longestStreak.clamp(0, 999999),
+      weeksCompleted: weeksCompleted.clamp(0, 999999),
+      mostWeeksCompleted: mostWeeksCompleted.clamp(0, 999999),
+      weekProgress: weekProgress.clamp(0, 7),
+      weekStartDayIndex: safeWeekStart,
+      nextRequiredDayIndex: safeNextDay,
+      seenHighestStreak: seenHighestStreak.clamp(0, 999999),
+      completedDayKeys: trimmedDays,
+    );
+  }
+
+  static const Object _unset = Object();
+
+  _StreakState copyWith({
+    bool? streaksEnabled,
+    bool? overrideRestoresStreak,
+    int? currentStreak,
+    int? longestStreak,
+    int? weeksCompleted,
+    int? mostWeeksCompleted,
+    int? weekProgress,
+    Object? weekStartDayIndex = _unset,
+    Object? nextRequiredDayIndex = _unset,
+    Object? lastCompletedDayKey = _unset,
+    Object? pendingLostDayKey = _unset,
+    Object? pendingLostStreakValue = _unset,
+    int? seenHighestStreak,
+    List<int>? completedDayKeys,
+  }) {
+    return _StreakState(
+      streaksEnabled: streaksEnabled ?? this.streaksEnabled,
+      overrideRestoresStreak:
+          overrideRestoresStreak ?? this.overrideRestoresStreak,
+      currentStreak: currentStreak ?? this.currentStreak,
+      longestStreak: longestStreak ?? this.longestStreak,
+      weeksCompleted: weeksCompleted ?? this.weeksCompleted,
+      mostWeeksCompleted: mostWeeksCompleted ?? this.mostWeeksCompleted,
+      weekProgress: weekProgress ?? this.weekProgress,
+      weekStartDayIndex: weekStartDayIndex == _unset
+          ? this.weekStartDayIndex
+          : weekStartDayIndex as int?,
+      nextRequiredDayIndex: nextRequiredDayIndex == _unset
+          ? this.nextRequiredDayIndex
+          : nextRequiredDayIndex as int?,
+      lastCompletedDayKey: lastCompletedDayKey == _unset
+          ? this.lastCompletedDayKey
+          : lastCompletedDayKey as int?,
+      pendingLostDayKey: pendingLostDayKey == _unset
+          ? this.pendingLostDayKey
+          : pendingLostDayKey as int?,
+      pendingLostStreakValue: pendingLostStreakValue == _unset
+          ? this.pendingLostStreakValue
+          : pendingLostStreakValue as int?,
+      seenHighestStreak: seenHighestStreak ?? this.seenHighestStreak,
+      completedDayKeys: completedDayKeys ?? this.completedDayKeys,
+    );
+  }
+}
+
+class _StreakMiniCompletionCircle extends StatefulWidget {
+  const _StreakMiniCompletionCircle({
+    super.key,
+    required this.done,
+    required this.size,
+    required this.delay,
+  });
+
+  final bool done;
+  final double size;
+  final Duration delay;
+
+  @override
+  State<_StreakMiniCompletionCircle> createState() =>
+      _StreakMiniCompletionCircleState();
+}
+
+class _StreakMiniCompletionCircleState
+    extends State<_StreakMiniCompletionCircle> {
+  Timer? _timer;
+  bool _visualDone = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncVisualState(initial: true);
+  }
+
+  @override
+  void didUpdateWidget(covariant _StreakMiniCompletionCircle oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (oldWidget.done != widget.done || oldWidget.delay != widget.delay) {
+      _syncVisualState();
+    }
+  }
+
+  void _syncVisualState({bool initial = false}) {
+    _timer?.cancel();
+
+    if (!widget.done) {
+      _visualDone = false;
+      if (mounted && !initial) {
+        setState(() {});
+      }
+      return;
+    }
+
+    _visualDone = false;
+    if (mounted && !initial) {
+      setState(() {});
+    }
+
+    _timer = Timer(widget.delay, () {
+      if (!mounted) return;
+      setState(() {
+        _visualDone = true;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DailyCompletionCircle(
+      done: _visualDone,
+      size: widget.size,
+      duration: const Duration(milliseconds: 360),
+    );
+  }
+}
+
+class _StreakTabMarker extends StatefulWidget {
+  const _StreakTabMarker({
+    required this.label,
+    required this.color,
+    required this.width,
+    required this.height,
+  });
+
+  final String label;
+  final Color color;
+  final double width;
+  final double height;
+
+  @override
+  State<_StreakTabMarker> createState() => _StreakTabMarkerState();
+}
+
+class _StreakTabMarkerState extends State<_StreakTabMarker>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1150),
+  )..repeat(reverse: true);
+
+  late final Animation<double> _opacity = Tween<double>(
+    begin: 0.78,
+    end: 0.98,
+  ).animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut));
+
+  late final Animation<double> _scale = Tween<double>(
+    begin: 0.985,
+    end: 1.025,
+  ).animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut));
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (context, _) {
+        return Opacity(
+          opacity: _opacity.value,
+          child: Transform.scale(
+            scale: _scale.value,
+            child: Container(
+              width: widget.width,
+              height: widget.height,
+              decoration: BoxDecoration(
+                color: widget.color,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: Colors.white.withOpacity(0.45),
+                  width: 1.2,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.20),
+                    blurRadius: 4,
+                    offset: const Offset(0, 1.5),
+                  ),
+                ],
+              ),
+              alignment: Alignment.center,
+              child: Text(
+                widget.label,
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontFamily: 'Amaranth',
+                  fontSize: 12,
+                  fontWeight: FontWeight.w800,
+                  color: Colors.white,
+                  shadows: [
+                    Shadow(
+                      blurRadius: 2,
+                      offset: Offset(1, 1),
+                      color: Color.fromARGB(120, 0, 0, 0),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _StreakButtonAttentionShell extends StatefulWidget {
+  const _StreakButtonAttentionShell({
+    required this.needsAttention,
+    required this.atRisk,
+    required this.child,
+  });
+
+  final bool needsAttention;
+  final bool atRisk;
+  final Widget child;
+
+  @override
+  State<_StreakButtonAttentionShell> createState() =>
+      _StreakButtonAttentionShellState();
+}
+
+class _StreakButtonAttentionShellState
+    extends State<_StreakButtonAttentionShell>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1200),
+  );
+
+  late final Animation<double> _greenPulse = TweenSequence<double>([
+    TweenSequenceItem(
+      tween: Tween<double>(
+        begin: 0.0,
+        end: 1.0,
+      ).chain(CurveTween(curve: Curves.easeInOut)),
+      weight: 50,
+    ),
+    TweenSequenceItem(
+      tween: Tween<double>(
+        begin: 1.0,
+        end: 0.0,
+      ).chain(CurveTween(curve: Curves.easeInOut)),
+      weight: 50,
+    ),
+  ]).animate(_ctrl);
+
+  @override
+  void initState() {
+    super.initState();
+    _syncAnimation();
+  }
+
+  @override
+  void didUpdateWidget(covariant _StreakButtonAttentionShell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _syncAnimation();
+  }
+
+  void _syncAnimation() {
+    final shouldPulseGreen = widget.needsAttention && !widget.atRisk;
+
+    if (!shouldPulseGreen) {
+      _ctrl.stop();
+      _ctrl.value = 0.0;
+      return;
+    }
+
+    if (!_ctrl.isAnimating) {
+      _ctrl.repeat();
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final shouldPulseGreen = widget.needsAttention && !widget.atRisk;
+
+    if (!shouldPulseGreen) {
+      return widget.child;
+    }
+
+    const updateGlowGreen = Color(0xFF8DFF7A);
+
+    return Stack(
+      clipBehavior: Clip.none,
+      alignment: Alignment.center,
+      children: [
+        Positioned.fill(
+          child: IgnorePointer(
+            child: AnimatedBuilder(
+              animation: _ctrl,
+              builder: (context, _) {
+                final pulse = _greenPulse.value;
+
+                return Transform.scale(
+                  scale: 1.02 + (pulse * 0.105),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(22),
+                      color: updateGlowGreen.withOpacity(0.10 + pulse * 0.18),
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color.fromARGB(
+                            255,
+                            157,
+                            251,
+                            140,
+                          ).withOpacity(0.16 + pulse * 0.78),
+                          blurRadius: 8 + (pulse * 2),
+                          spreadRadius: 0.5 + (pulse * 3),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+
+        widget.child,
+      ],
+    );
+  }
+}
+
+class _StreakRiskBlinkColor extends StatefulWidget {
+  const _StreakRiskBlinkColor({
+    required this.atRisk,
+    required this.normalColor,
+    required this.builder,
+  });
+
+  final bool atRisk;
+  final Color normalColor;
+  final Widget Function(Color color) builder;
+
+  @override
+  State<_StreakRiskBlinkColor> createState() => _StreakRiskBlinkColorState();
+}
+
+class _StreakRiskBlinkColorState extends State<_StreakRiskBlinkColor>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1300),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _syncAnimation();
+  }
+
+  @override
+  void didUpdateWidget(covariant _StreakRiskBlinkColor oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _syncAnimation();
+  }
+
+  void _syncAnimation() {
+    if (widget.atRisk) {
+      if (!_ctrl.isAnimating) {
+        _ctrl.repeat();
+      }
+    } else {
+      _ctrl.stop();
+      _ctrl.value = 0.0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const warningRed = Color(0xFFFF002E);
+
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (context, _) {
+        final blinkOn = widget.atRisk && _ctrl.value < 0.50;
+
+        return widget.builder(blinkOn ? warningRed : widget.normalColor);
+      },
+    );
+  }
 }

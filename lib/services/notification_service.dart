@@ -7,6 +7,7 @@ import 'package:timezone/data/latest_all.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pillchecker/constants/prefs_keys.dart';
+import 'package:pillchecker/constants/demo_pill_keys.dart';
 
 enum _Kind { early, main, late }
 
@@ -27,6 +28,17 @@ class NotificationService {
   static const String _channelIdNoSound = 'pill_reminders_v2_nosound'; // ✅ NEW
   static const String _channelName = 'Pill Reminders';
   static const String _channelDesc = 'Daily pill reminder notifications';
+
+  static const int _demoBaseId = 1_909_200_000;
+  static const Duration _demoGap = Duration(seconds: 5);
+
+  static int _demoIdFor({
+    required int pillSlot,
+    required int doseIndex,
+    required _Kind kind,
+  }) {
+    return _demoBaseId + (pillSlot * 100) + (doseIndex * 10) + kind.index;
+  }
 
   // ---- In-memory settings (defaults) ----
   static String _mode = 'standard'; // off | basic | standard
@@ -361,6 +373,7 @@ class NotificationService {
     bool hasAnythingLeftToday = false;
 
     for (int pillSlot = 0; pillSlot < pillNames.length; pillSlot++) {
+      if (isDemoPillName(pillNames[pillSlot])) continue;
       final times = doseTimes24h[pillSlot];
       final occurrencesToday = _occurrencesForActualDay(
         actualDayOffset: 0,
@@ -425,6 +438,7 @@ class NotificationService {
     ) {
       for (int pillSlot = 0; pillSlot < pillNames.length; pillSlot++) {
         final pillName = pillNames[pillSlot];
+        if (isDemoPillName(pillNames[pillSlot])) continue;
         final times = doseTimes24h[pillSlot];
         final totalDoses = times.length;
 
@@ -641,6 +655,101 @@ class NotificationService {
     await init();
     final id = _outOfSupplyBaseId + pillSlot;
     await cancel(id);
+  }
+
+  static Future<void> cancelDemoPillNotifications({
+    required int pillSlot,
+  }) async {
+    await init();
+
+    for (int doseIndex = 0; doseIndex < 2; doseIndex++) {
+      for (final kind in _Kind.values) {
+        await cancel(
+          _demoIdFor(pillSlot: pillSlot, doseIndex: doseIndex, kind: kind),
+        );
+      }
+    }
+  }
+
+  static Future<void> _scheduleDemoTriplet({
+    required int pillSlot,
+    required int doseIndex,
+    required String pillName,
+    required Duration firstDelay,
+  }) async {
+    await init();
+    await loadUserNotificationSettings();
+
+    if (_mode == 'off') return;
+
+    final now = tz.TZDateTime.now(tz.local);
+    final doseNumber = doseIndex + 1;
+    final displayName = kDemoPillName;
+
+    final items = <({Duration delay, _Kind kind, String body})>[
+      (
+        delay: firstDelay,
+        kind: _Kind.early,
+        body: 'Almost time to take dose $doseNumber of $displayName!',
+      ),
+      (
+        delay: firstDelay + _demoGap,
+        kind: _Kind.main,
+        body: 'Time to take dose $doseNumber of $displayName!',
+      ),
+      (
+        delay: firstDelay + _demoGap + _demoGap,
+        kind: _Kind.late,
+        body: 'You have not checked dose $doseNumber of $displayName yet! Check it off before it is too late!',
+      ),
+    ];
+
+    for (final item in items) {
+      await _scheduleOneShot(
+        id: _demoIdFor(
+          pillSlot: pillSlot,
+          doseIndex: doseIndex,
+          kind: item.kind,
+        ),
+        when: now.add(item.delay),
+        title: 'PillChecker',
+        body: item.body,
+      );
+    }
+  }
+
+  static Future<void> scheduleDemoPillDose1({
+    required int pillSlot,
+    required String pillName,
+  }) async {
+    await cancelDemoPillNotifications(pillSlot: pillSlot);
+
+    await _scheduleDemoTriplet(
+      pillSlot: pillSlot,
+      doseIndex: 0,
+      pillName: pillName,
+      firstDelay: _demoGap,
+    );
+
+    debugPrint('DEMO NOTIF: dose 1 scheduled for pillSlot=$pillSlot');
+  }
+
+  static Future<void> scheduleDemoPillDose2AfterCheck({
+    required int pillSlot,
+    required String pillName,
+  }) async {
+    await cancelDemoPillNotifications(pillSlot: pillSlot);
+
+    await _scheduleDemoTriplet(
+      pillSlot: pillSlot,
+      doseIndex: 1,
+      pillName: pillName,
+      firstDelay: _demoGap,
+    );
+
+    debugPrint(
+      'DEMO NOTIF: dose 2 scheduled after check for pillSlot=$pillSlot',
+    );
   }
 
   static Future<void> scheduleLowSupplyWarning({

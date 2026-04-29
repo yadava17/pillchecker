@@ -28,6 +28,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
 
   bool _loaded = false;
   List<HistoryEntry> _allEntries = [];
+  final ScrollController _calendarScrollCtrl = ScrollController();
 
   final Map<DateTime, List<HistoryEntry>> _entriesByDay = {};
   final Map<DateTime, List<String>> _markersByDay = {};
@@ -40,6 +41,12 @@ class _CalendarScreenState extends State<CalendarScreen> {
     _focusedDay = DateTime.now();
     _selectedDay = _key(DateTime.now());
     _load();
+  }
+
+  @override
+  void dispose() {
+    _calendarScrollCtrl.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -186,201 +193,210 @@ class _CalendarScreenState extends State<CalendarScreen> {
               top: 125,
               child: !_loaded
                   ? const Center(child: CircularProgressIndicator())
-                  : ListView(
-                      padding: const EdgeInsets.fromLTRB(18, 18, 18, 18),
-                      children: [
-                        Container(
-                          decoration: BoxDecoration(
-                            color: _card,
-                            borderRadius: BorderRadius.circular(22),
-                          ),
-                          padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-                          child: TableCalendar<String>(
-                            firstDay: DateTime.utc(2020, 1, 1),
-                            lastDay: DateTime.utc(2100, 12, 31),
-                            focusedDay: _focusedDay,
-                            selectedDayPredicate: (d) =>
-                                isSameDay(d, _selectedDay),
-                            eventLoader: _eventsFor,
-                            calendarFormat: CalendarFormat.month,
-                            availableCalendarFormats: const {
-                              CalendarFormat.month: 'Month',
-                            },
-                            startingDayOfWeek: StartingDayOfWeek.sunday,
-                            headerStyle: const HeaderStyle(
-                              formatButtonVisible: false,
-                              titleCentered: true,
-                              leftChevronIcon: Icon(
-                                Icons.chevron_left,
-                                color: Colors.white,
-                                size: 28,
-                              ),
-                              rightChevronIcon: Icon(
-                                Icons.chevron_right,
-                                color: Colors.white,
-                                size: 28,
-                              ),
-                              titleTextStyle: TextStyle(
-                                fontFamily: 'Amaranth',
-                                fontSize: 22,
-                                fontWeight: FontWeight.w700,
-                                color: Colors.white,
-                              ),
-                              headerPadding: EdgeInsets.symmetric(vertical: 8),
+                  : Scrollbar(
+                      controller: _calendarScrollCtrl,
+                      thumbVisibility: true,
+                      thickness: 5,
+                      radius: const Radius.circular(99),
+                      child: ListView(
+                        controller: _calendarScrollCtrl,
+                        padding: const EdgeInsets.fromLTRB(18, 18, 18, 18),
+                        children: [
+                          Container(
+                            decoration: BoxDecoration(
+                              color: _card,
+                              borderRadius: BorderRadius.circular(22),
                             ),
-                            daysOfWeekStyle: const DaysOfWeekStyle(
-                              weekdayStyle: TextStyle(
-                                color: Colors.white70,
-                                fontSize: 13,
-                                fontWeight: FontWeight.w700,
-                              ),
-                              weekendStyle: TextStyle(
-                                color: Colors.white70,
-                                fontSize: 13,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            calendarStyle: CalendarStyle(
-                              outsideDaysVisible: false,
-                              defaultTextStyle: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 15,
-                                fontWeight: FontWeight.w600,
-                              ),
-                              weekendTextStyle: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 15,
-                                fontWeight: FontWeight.w600,
-                              ),
-                              todayTextStyle: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w800,
-                              ),
-                              selectedTextStyle: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w800,
-                              ),
-                              todayDecoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.10),
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: Colors.white.withOpacity(0.75),
-                                  width: 1.5,
+                            padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                            child: TableCalendar<String>(
+                              firstDay: DateTime.utc(2020, 1, 1),
+                              lastDay: DateTime.utc(2100, 12, 31),
+                              focusedDay: _focusedDay,
+                              selectedDayPredicate: (d) =>
+                                  isSameDay(d, _selectedDay),
+                              eventLoader: _eventsFor,
+                              calendarFormat: CalendarFormat.month,
+                              availableCalendarFormats: const {
+                                CalendarFormat.month: 'Month',
+                              },
+                              startingDayOfWeek: StartingDayOfWeek.sunday,
+                              headerStyle: const HeaderStyle(
+                                formatButtonVisible: false,
+                                titleCentered: true,
+                                leftChevronIcon: Icon(
+                                  Icons.chevron_left,
+                                  color: Colors.white,
+                                  size: 28,
+                                ),
+                                rightChevronIcon: Icon(
+                                  Icons.chevron_right,
+                                  color: Colors.white,
+                                  size: 28,
+                                ),
+                                titleTextStyle: TextStyle(
+                                  fontFamily: 'Amaranth',
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                ),
+                                headerPadding: EdgeInsets.symmetric(
+                                  vertical: 8,
                                 ),
                               ),
-                              selectedDecoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.18),
-                                shape: BoxShape.circle,
+                              daysOfWeekStyle: const DaysOfWeekStyle(
+                                weekdayStyle: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                                weekendStyle: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                ),
                               ),
-                              markerSize: 0,
-                              markersMaxCount: 0,
-                              cellMargin: const EdgeInsets.all(4),
-                            ),
-                            calendarBuilders: CalendarBuilders(
-                              markerBuilder: (context, day, events) {
-                                if (events.isEmpty) return null;
-
-                                final hasTaken = events.contains('taken');
-                                final hasMissed = events.contains('missed');
-
-                                return Positioned(
-                                  bottom: 9,
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      if (hasTaken)
-                                        Container(
-                                          width: 6,
-                                          height: 6,
-                                          decoration: const BoxDecoration(
-                                            color: _green,
-                                            shape: BoxShape.circle,
-                                          ),
-                                        ),
-                                      if (hasTaken && hasMissed)
-                                        const SizedBox(width: 4),
-                                      if (hasMissed)
-                                        Container(
-                                          width: 6,
-                                          height: 6,
-                                          decoration: const BoxDecoration(
-                                            color: _red,
-                                            shape: BoxShape.circle,
-                                          ),
-                                        ),
-                                    ],
+                              calendarStyle: CalendarStyle(
+                                outsideDaysVisible: false,
+                                defaultTextStyle: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                                weekendTextStyle: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                                todayTextStyle: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                                selectedTextStyle: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                                todayDecoration: BoxDecoration(
+                                  color: Colors.white.withOpacity(0.10),
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: Colors.white.withOpacity(0.75),
+                                    width: 1.5,
                                   ),
-                                );
+                                ),
+                                selectedDecoration: BoxDecoration(
+                                  color: Colors.white.withOpacity(0.18),
+                                  shape: BoxShape.circle,
+                                ),
+                                markerSize: 0,
+                                markersMaxCount: 0,
+                                cellMargin: const EdgeInsets.all(4),
+                              ),
+                              calendarBuilders: CalendarBuilders(
+                                markerBuilder: (context, day, events) {
+                                  if (events.isEmpty) return null;
+
+                                  final hasTaken = events.contains('taken');
+                                  final hasMissed = events.contains('missed');
+
+                                  return Positioned(
+                                    bottom: 9,
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        if (hasTaken)
+                                          Container(
+                                            width: 6,
+                                            height: 6,
+                                            decoration: const BoxDecoration(
+                                              color: _green,
+                                              shape: BoxShape.circle,
+                                            ),
+                                          ),
+                                        if (hasTaken && hasMissed)
+                                          const SizedBox(width: 4),
+                                        if (hasMissed)
+                                          Container(
+                                            width: 6,
+                                            height: 6,
+                                            decoration: const BoxDecoration(
+                                              color: _red,
+                                              shape: BoxShape.circle,
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              ),
+                              onDaySelected: (selected, focused) {
+                                setState(() {
+                                  _selectedDay = _key(selected);
+                                  _focusedDay = focused;
+                                });
                               },
                             ),
-                            onDaySelected: (selected, focused) {
-                              setState(() {
-                                _selectedDay = _key(selected);
-                                _focusedDay = focused;
-                              });
-                            },
                           ),
-                        ),
-                        const SizedBox(height: 18),
-                        Text(
-                          isSameDay(_selectedDay, today)
-                              ? 'Today'
-                              : _formatDate(_selectedDay),
-                          style: const TextStyle(
-                            fontSize: 28,
-                            fontWeight: FontWeight.w700,
-                            color: _card,
-                            fontFamily: 'Amaranth',
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                        if (entries.isEmpty)
-                          Container(
-                            decoration: BoxDecoration(
+                          const SizedBox(height: 18),
+                          Text(
+                            isSameDay(_selectedDay, today)
+                                ? 'Today'
+                                : _formatDate(_selectedDay),
+                            style: const TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.w700,
                               color: _card,
-                              borderRadius: BorderRadius.circular(22),
+                              fontFamily: 'Amaranth',
                             ),
-                            padding: const EdgeInsets.all(18),
-                            child: Text(
-                              isSameDay(_selectedDay, today)
-                                  ? 'No adherence history today.'
-                                  : 'No adherence history on ${_formatDate(_selectedDay)}.',
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 16,
-                                fontWeight: FontWeight.w600,
+                          ),
+                          const SizedBox(height: 12),
+                          if (entries.isEmpty)
+                            Container(
+                              decoration: BoxDecoration(
+                                color: _card,
+                                borderRadius: BorderRadius.circular(22),
+                              ),
+                              padding: const EdgeInsets.all(18),
+                              child: Text(
+                                isSameDay(_selectedDay, today)
+                                    ? 'No adherence history today.'
+                                    : 'No adherence history on ${_formatDate(_selectedDay)}.',
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            )
+                          else
+                            Container(
+                              decoration: BoxDecoration(
+                                color: _card,
+                                borderRadius: BorderRadius.circular(22),
+                              ),
+                              child: Column(
+                                children: [
+                                  for (int i = 0; i < entries.length; i++) ...[
+                                    _HistoryRow(
+                                      pillName: entries[i].medicationName,
+                                      timeLabel: _timeLabel(
+                                        entries[i].plannedAtLocal,
+                                      ),
+                                      statusLabel: _statusLabel(entries[i]),
+                                      statusColor: _statusColor(entries[i]),
+                                    ),
+                                    if (i < entries.length - 1)
+                                      Divider(
+                                        height: 1,
+                                        indent: 16,
+                                        endIndent: 14,
+                                        color: Colors.white.withOpacity(0.18),
+                                      ),
+                                  ],
+                                ],
                               ),
                             ),
-                          )
-                        else
-                          Container(
-                            decoration: BoxDecoration(
-                              color: _card,
-                              borderRadius: BorderRadius.circular(22),
-                            ),
-                            child: Column(
-                              children: [
-                                for (int i = 0; i < entries.length; i++) ...[
-                                  _HistoryRow(
-                                    pillName: entries[i].medicationName,
-                                    timeLabel: _timeLabel(
-                                      entries[i].plannedAtLocal,
-                                    ),
-                                    statusLabel: _statusLabel(entries[i]),
-                                    statusColor: _statusColor(entries[i]),
-                                  ),
-                                  if (i < entries.length - 1)
-                                    Divider(
-                                      height: 1,
-                                      indent: 16,
-                                      endIndent: 14,
-                                      color: Colors.white.withOpacity(0.18),
-                                    ),
-                                ],
-                              ],
-                            ),
-                          ),
-                      ],
+                        ],
+                      ),
                     ),
             ),
           ],
