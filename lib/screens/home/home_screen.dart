@@ -2848,6 +2848,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final weekProgressFillColor = weekProgressComplete
         ? const Color(0xFF59FF56)
         : const Color.fromARGB(255, 36, 251, 255);
+    final iosStreakShiftX = Platform.isIOS ? 10.0 : 0.0;
     final safeCompletedDayIndexes = completedDayIndexes
         .where((day) => day >= 0 && day <= 6)
         .toSet();
@@ -2869,16 +2870,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final hasActiveWeek = safeWeekProgress > 0 && !weekProgressComplete;
 
-    final showStartMarker =
-        streakMarkersVisible &&
-        !weekProgressComplete &&
-        displayStartDay != null;
+    final showStartMarker = !weekProgressComplete && displayStartDay != null;
 
-    final showNextMarker =
-        streakMarkersVisible && hasActiveWeek && safeNextRequiredDay != null;
+    final showNextMarker = hasActiveWeek && safeNextRequiredDay != null;
 
-    final showEndMarker =
-        streakMarkersVisible && hasActiveWeek && displayEndDay != null;
+    final showEndMarker = hasActiveWeek && displayEndDay != null;
 
     Widget markerForDay({
       required int day,
@@ -2886,14 +2882,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       required Color color,
     }) {
       return Positioned(
-        left: s((55.5 * day) + 2.5 + (day * 1.075)),
+        left: s((55.5 * day) + 2.5 + (day * 1.075) + iosStreakShiftX),
         top: s(8),
         child: IgnorePointer(
-          child: _StreakTabMarker(
-            label: label,
-            color: color,
-            width: s(50),
-            height: s(58),
+          child: AnimatedOpacity(
+            duration: const Duration(milliseconds: 420),
+            curve: Curves.easeInOut,
+            opacity: streakMarkersVisible ? 1.0 : 0.0,
+            child: _StreakTabMarker(
+              label: label,
+              color: color,
+              width: s(50),
+              height: s(58),
+            ),
           ),
         ),
       );
@@ -3152,7 +3153,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       337.0,
                     ])
                       Positioned(
-                        left: s(left),
+                        left: s(left + iosStreakShiftX),
                         top: s(8),
                         child: IgnorePointer(
                           child: Container(
@@ -3203,7 +3204,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       for (int day = 0; day < 7; day++)
                         Positioned(
                           key: ValueKey('streak_mini_circle_position_$day'),
-                          left: s((21.25 + (day + (day * 55.085)) - 16.0)),
+                          left: s(
+                            (21.25 + (day + (day * 55.085)) - 16.0) +
+                                iosStreakShiftX,
+                          ),
                           top: s(-50.5),
                           child: IgnorePointer(
                             child: _StreakMiniCompletionCircle(
@@ -7996,7 +8000,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
             // --- STREAKS STORYBOARD SCREEN ---
             Positioned.fill(
-              top: streaksPanelTop,
+              top: streaksPanelTop + (Platform.isIOS ? -s(12) : 0),
               child: IgnorePointer(
                 ignoring: !streaksScreenVisible,
                 child: AnimatedOpacity(
