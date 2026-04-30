@@ -3228,7 +3228,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                           275.0,
                                           330.0,
                                         ][i] +
-                                        (Platform.isAndroid ? (i * 1.5) : 0.0),
+                                        (i * 1.5),
                                   ),
                                   top: s(8),
                                   child: Container(
@@ -4076,6 +4076,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final allDoneToday = _areAllPillsComplete(_checkMapCache);
     final missedRiskToday = _hasMissedStreakRiskForToday();
 
+    final now = DateTime.now();
+    final realTodayKey = now.year * 10000 + now.month * 100 + now.day;
+
     // If all pills are complete, use the stored local completion cycle day.
     // This prevents yesterday's checked state from being counted again
     // before the first 2-hour reset of the new calendar day.
@@ -4083,7 +4086,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ? _completedLocalDailyStateDayKey()
         : null;
 
-    final todayKey = completedLocalDayKey ?? activeCycleDayKey;
+    // Special first-streak edge case:
+    // If a brand-new user adds/checks their first pill more than 2 hours early,
+    // the active cycle can still point to the previous day. For the very first
+    // streak point only, start the streak on the real day they checked it.
+    final isFreshFirstStreakStart =
+        allDoneToday &&
+        state.currentStreak == 0 &&
+        state.weekProgress == 0 &&
+        state.completedDayKeys.isEmpty &&
+        state.lastCompletedDayKey == null;
+
+    final completedDayIsBehindRealToday =
+        completedLocalDayKey != null && completedLocalDayKey < realTodayKey;
+
+    final todayKey = isFreshFirstStreakStart && completedDayIsBehindRealToday
+        ? realTodayKey
+        : completedLocalDayKey ?? activeCycleDayKey;
 
     final completedSet = state.completedDayKeys.toSet();
     final alreadyCountedToday =
@@ -4120,7 +4139,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         // Only a manual Reset Streaks action should clear this later.
         final nextLongestStreak = state.longestStreak;
 
-        final todayDayIndex = _streakDayIndexForNow();
+        final todayDayIndex = _dayIndexFor(_dateFromKey(todayKey));
         final weekly = _weeklyStateAfterUndoingToday(state, todayDayIndex);
 
         await _setStreakState(
@@ -4186,7 +4205,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       completedSet.add(todayKey);
       final completedDays = completedSet.toList()..sort();
 
-      final todayDayIndex = _streakDayIndexForNow();
+      final todayDayIndex = _dayIndexFor(_dateFromKey(todayKey));
 
       final nextCurrentStreak = (state.currentStreak + 1)
           .clamp(0, 999999)
@@ -4241,7 +4260,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // Only a manual Reset Streaks action should clear this later.
       final nextLongestStreak = state.longestStreak;
 
-      final todayDayIndex = _streakDayIndexForNow();
+      final todayDayIndex = _dayIndexFor(_dateFromKey(todayKey));
       final weekly = _weeklyStateAfterUndoingToday(state, todayDayIndex);
 
       await _setStreakState(
