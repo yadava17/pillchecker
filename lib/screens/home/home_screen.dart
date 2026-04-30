@@ -908,15 +908,38 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   DateTime _minusMinutes(DateTime dt, int m) =>
       dt.subtract(Duration(minutes: m));
 
+  DateTime _currentHomePillboxCycleDay() {
+    final now = DateTime.now();
+    final realToday = DateTime(now.year, now.month, now.day);
+    final realTodayKey = _dateKey(realToday);
+
+    // Normal case:
+    // The home pillbox should follow the real calendar day.
+    //
+    // Exception:
+    // Before the 2-hour reset, the daily completion circle may still be
+    // showing yesterday's completed day. If that stored completed day is
+    // different from today's real date, keep the home pillbox on that day too.
+    final completedDayKey = _completedLocalDailyStateDayKey();
+
+    if (completedDayKey != null && completedDayKey != realTodayKey) {
+      return _dateFromKey(completedDayKey);
+    }
+
+    return realToday;
+  }
+
+  int _currentHomePillboxCycleDayKey() {
+    final d = _currentHomePillboxCycleDay();
+    return d.year * 10000 + d.month * 100 + d.day;
+  }
+
   void _coldStartOpenToday() {
-    // DEBUG: set to 0..6 (Sun..Sat). Set to null to use real day.
+    // DEBUG: set to 0..6 (Sun..Sat). Set to null to use real PillChecker cycle day.
     // _debugDayOverride = 5; // example: Friday
 
-    // DateTime.weekday: Mon=1..Sun=7
-    final wd = DateTime.now().weekday;
-
-    // Convert to Sun=0..Sat=6, but allow override for testing
-    final today = _debugDayOverride ?? (wd % 7);
+    final today =
+        _debugDayOverride ?? _dayIndexFor(_currentHomePillboxCycleDay());
 
     _armDailyCircleDelay();
     _startNewDaySequence(today: today);
@@ -1879,6 +1902,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } finally {
       _notifRefreshBusy = false;
     }
+  }
+
+  int? _completedLocalDailyStateDayKey() {
+    // Only report a stored completed day if the daily completion circle
+    // is actually complete for the current active local state.
+    // This prevents stale stored masks from forcing the home pillbox backward.
+    if (!_areAllPillsComplete(_checkMapCache)) return null;
+    if (pillNames.isEmpty) return null;
+
+    int? completedDayKey;
+
+    for (int pillIndex = 0; pillIndex < pillNames.length; pillIndex++) {
+      final doses = _doseTimesForPill(pillIndex);
+      if (doses.isEmpty) return null;
+
+      final stored = _checkMapCache['$pillIndex'] as String?;
+      final parsed = _readCycleAndMask(stored);
+
+      if (parsed.cycleIso.isEmpty) return null;
+
+      final completed = _bitCount(parsed.mask) >= doses.length;
+      if (!completed) return null;
+
+      final cycleStart = DateTime.tryParse(parsed.cycleIso);
+      if (cycleStart == null) return null;
+
+      final local = cycleStart.toLocal();
+      final key = local.year * 10000 + local.month * 100 + local.day;
+
+      if (completedDayKey == null) {
+        completedDayKey = key;
+      } else if (completedDayKey != key) {
+        return null;
+      }
+    }
+
+    return completedDayKey;
   }
 
   int _doneDoseCountForPill(Map<String, dynamic> map, int pillIndex) {
@@ -3679,6 +3739,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// Sun = 0, Mon = 1, ... Sat = 6
   int _dayIndexFor(DateTime d) => d.weekday % 7;
 
+  int _homePillboxDayIndexForNow() {
+    final now = DateTime.now();
+
+    // Home pillbox should follow the same PillChecker cycle as
+    // the daily completion circle, not calendar midnight.
+    final cycleStart = _globalCycleStartForNow(now);
+    final d = cycleStart ?? now;
+
+    return _dayIndexFor(d);
+  }
+
   int _streakDayIndexForNow() {
     final now = DateTime.now();
 
@@ -3896,9 +3967,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _syncStreakFromLocalDailyState() async {
+    // If every pill is gone, active streak progress should reset.
+    // Personal bests stay saved.
+    if (pillNames.isEmpty) {
+      final needsNoPillReset =
+          _streakState.currentStreak != 0 ||
+          _streakState.weeksCompleted != 0 ||
+          _streakState.weekProgress != 0 ||
+          _streakState.weekStartDayIndex != null ||
+          _streakState.nextRequiredDayIndex != null ||
+          _streakState.lastCompletedDayKey != null ||
+          _streakState.pendingLostDayKey != null ||
+          _streakState.pendingLostStreakValue != null ||
+          _streakState.completedDayKeys.isNotEmpty;
+
+      if (needsNoPillReset) {
+        await _setStreakState(
+          _streakState
+              .copyWith(
+                currentStreak: 0,
+                weeksCompleted: 0,
+                weekProgress: 0,
+                weekStartDayIndex: null,
+                nextRequiredDayIndex: null,
+                lastCompletedDayKey: null,
+                pendingLostDayKey: null,
+                pendingLostStreakValue: null,
+                completedDayKeys: <int>[],
+              )
+              .normalized(),
+        );
+      }
+
+      return;
+    }
+
     if (!_streakState.streaksEnabled) return;
 
-    final todayKey = _streakDayKeyForNow();
+    final activeCycleDayKey = _streakDayKeyForNow();
 
     var state = _streakState;
 
@@ -3908,7 +4014,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // ------------------------------------------------------------
     final pendingLostDayKey = state.pendingLostDayKey;
     final hasExpiredPendingLoss =
-        pendingLostDayKey != null && pendingLostDayKey != todayKey;
+        pendingLostDayKey != null && pendingLostDayKey != activeCycleDayKey;
 
     if (hasExpiredPendingLoss) {
       state = state
@@ -3942,7 +4048,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final skippedARequiredDay =
         state.currentStreak > 0 &&
         mostRecentCompletedDayKey != null &&
-        _daysBetweenDateKeys(mostRecentCompletedDayKey, todayKey) > 1;
+        _daysBetweenDateKeys(mostRecentCompletedDayKey, activeCycleDayKey) > 1;
 
     final impossibleStreakState =
         state.currentStreak > 0 && mostRecentCompletedDayKey == null;
@@ -3969,6 +4075,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final allDoneToday = _areAllPillsComplete(_checkMapCache);
     final missedRiskToday = _hasMissedStreakRiskForToday();
+
+    // If all pills are complete, use the stored local completion cycle day.
+    // This prevents yesterday's checked state from being counted again
+    // before the first 2-hour reset of the new calendar day.
+    final completedLocalDayKey = allDoneToday
+        ? _completedLocalDailyStateDayKey()
+        : null;
+
+    final todayKey = completedLocalDayKey ?? activeCycleDayKey;
 
     final completedSet = state.completedDayKeys.toSet();
     final alreadyCountedToday =
@@ -5686,11 +5801,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _refreshForDateJumpIfNeeded() async {
-    final now = DateTime.now();
-    final dayKey = now.year * 10000 + now.month * 100 + now.day;
+    final cycleDayKey = _currentHomePillboxCycleDayKey();
 
-    if (dayKey == _lastSeenDayKey) return;
-    _lastSeenDayKey = dayKey;
+    if (cycleDayKey == _lastSeenDayKey) return;
+    _lastSeenDayKey = cycleDayKey;
 
     await _syncCurrentCycleAnchorOnly();
     await _refreshAdherenceFromDb();
@@ -5699,7 +5813,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _refreshCheckMapFuture();
 
-    final newToday = _debugDayOverride ?? (now.weekday % 7);
+    final newToday =
+        _debugDayOverride ?? _dayIndexFor(_currentHomePillboxCycleDay());
 
     _rearmDailyCircleDelay();
     _armDailyCircleDelay();
@@ -5710,7 +5825,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _scheduleGlobalBoundaryRefresh();
     unawaited(_scheduleGlobalDayBoundaryRefresh());
 
-    // ✅ Do not wipe local masks on date jumps.
+    // Do not wipe local masks on date jumps.
     _publishLocalDailyState();
   }
 
@@ -6716,10 +6831,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ? rawScale.clamp(0.78, 1.12)
         : rawScale.clamp(0.8, 1.3);
 
-    final buildDayKey =
-        DateTime.now().year * 10000 +
-        DateTime.now().month * 100 +
-        DateTime.now().day;
+    final buildDayKey = _currentHomePillboxCycleDayKey();
 
     if (buildDayKey != _lastSeenDayKey) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
