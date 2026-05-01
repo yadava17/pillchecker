@@ -176,6 +176,37 @@ class NotificationService {
     }
   }
 
+  static Future<void> requestAndroidNotificationPermissions() async {
+    if (!Platform.isAndroid) return;
+
+    final androidPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+
+    // Android 13+ notification permission.
+    await androidPlugin?.requestNotificationsPermission();
+
+    // Android 12+ Alarms & reminders / exact alarm permission.
+    // This usually opens the special app access settings page.
+    await androidPlugin?.requestExactAlarmsPermission();
+  }
+
+  static Future<bool> canScheduleExactAlarms() async {
+    if (!Platform.isAndroid) return true;
+
+    final androidPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+
+    final canSchedule = await androidPlugin?.canScheduleExactNotifications();
+
+    // Older Android versions may return null because exact alarm permission
+    // does not apply the same way there. Treat null as okay.
+    return canSchedule ?? true;
+  }
+
   // ============================================================
   // Window primitives
   // ============================================================
@@ -700,7 +731,8 @@ class NotificationService {
       (
         delay: firstDelay + _demoGap + _demoGap,
         kind: _Kind.late,
-        body: 'You have not checked dose $doseNumber of $displayName yet! Check it off before it is too late!',
+        body:
+            'You have not checked dose $doseNumber of $displayName yet! Check it off before it is too late!',
       ),
     ];
 

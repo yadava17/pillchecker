@@ -1,4 +1,4 @@
-package com.example.pillchecker
+package com.jpcavell.pillchecker
 
 import io.flutter.embedding.android.FlutterActivity
 

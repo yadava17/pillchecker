@@ -605,6 +605,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       setState(() => _coldStart = false);
+
+      unawaited(_checkExactAlarmPermissionAndPrompt());
     });
 
     _lastSeenDayKey =
@@ -1820,6 +1822,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }) async {
     if (_notifRefreshBusy) {
       debugPrint('NOTIF: skip rebuild (busy) tag=$tag');
+      return;
+    }
+
+    final canScheduleExact = await NotificationService.canScheduleExactAlarms();
+    if (!canScheduleExact) {
+      unawaited(_checkExactAlarmPermissionAndPrompt());
+      debugPrint('NOTIF: exact alarms not permitted; skip rebuild tag=$tag');
       return;
     }
     _notifRefreshBusy = true;
@@ -4707,6 +4716,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // ---------------- load ----------------
   Future<void> _loadAndMaybeAutoOpen() async {
     final prefs = await SharedPreferences.getInstance();
+
     await _loadStreakState();
 
     await PrefsMigration.runOnceIfNeeded(
@@ -4767,6 +4777,98 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         if (!mounted) return;
         await _showWelcomeTutorialPrompt(prefs);
       });
+    }
+  }
+
+  bool _exactAlarmPromptShowing = false;
+
+  Future<void> _checkExactAlarmPermissionAndPrompt({bool force = false}) async {
+    if (!Platform.isAndroid) return;
+    if (_exactAlarmPromptShowing) return;
+
+    final canSchedule = await NotificationService.canScheduleExactAlarms();
+    if (canSchedule && !force) return;
+
+    if (!mounted) return;
+
+    _exactAlarmPromptShowing = true;
+
+    try {
+      final goToSettings =
+          await showDialog<bool>(
+            context: context,
+            barrierDismissible: true,
+            builder: (dialogContext) {
+              return AlertDialog(
+                backgroundColor: const Color(0xFF98404F),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(22),
+                ),
+                title: const Text(
+                  'Alarms & reminders needed',
+                  style: TextStyle(
+                    fontFamily: 'Amaranth',
+                    fontSize: 24,
+                    fontWeight: FontWeight.w800,
+                    color: Colors.white,
+                  ),
+                ),
+                content: const Text(
+                  'PillChecker needs the Android Alarms & reminders permission so your pill alerts can fire at the right time. '
+                  'If this is off, reminders may be delayed, batched, or not show properly.',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    height: 1.25,
+                  ),
+                ),
+                actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogContext, false),
+                    child: const Text(
+                      'Not now',
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 48,
+                    child: Material(
+                      color: const Color(0xFF59FF56),
+                      borderRadius: BorderRadius.circular(16),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(16),
+                        onTap: () => Navigator.pop(dialogContext, true),
+                        child: const Center(
+                          child: Text(
+                            'Turn it on',
+                            style: TextStyle(
+                              fontFamily: 'Amaranth',
+                              fontSize: 19,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ) ??
+          false;
+
+      if (goToSettings) {
+        await NotificationService.requestAndroidNotificationPermissions();
+      }
+    } finally {
+      _exactAlarmPromptShowing = false;
     }
   }
 
